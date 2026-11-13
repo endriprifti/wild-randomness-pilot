@@ -232,8 +232,9 @@ CONFIG = {
                             "tokenizer": "EleutherAI/pythia-14m", "tokens": 110 * 8 * 64, "seq_len": 64,   # 110 steps: enough for H_grad (>= 100 after warmup)
                             "batch": 8, "lr": 1e-3, "weight_decay": 0.1, "warmup_frac": 0.05,
                             "ood_dataset": ["Salesforce/wikitext", "wikitext-2-raw-v1", "test"], "eval_seqs": 4},
-            "resnet18": {"epochs": 5, "batch": 16, "lr": 0.01, "momentum": 0.9, "weight_decay": 5e-4,
+            "resnet18": {"epochs": 4, "batch": 16, "lr": 0.01, "momentum": 0.9, "weight_decay": 5e-4,
                          "warmup_frac": 0.05, "ood_noise_sigma": 0.1, "limit_train": 256, "limit_test": 64},
+            "stages": [0.5, 1.0],   # H7.1 control at two training stages in smoke (305 s on the laptop with four)
             "calib_steps": 5, "n_hgrad_dirs": 2,
             # the real 50k-token vocabulary makes every HVP and per-example JVP costly: smallest batches that still run
             "measure": {"hessian_batch": 8, "power_iters": 3, "trace_samples": 2, "sharp_rho": 0.05,

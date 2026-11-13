@@ -266,11 +266,11 @@ def main():
         if mode == "injected":
             iqr_std = stable.stable_iqr(a) if a < 2 else 2 * math.sqrt(2) * 0.6744897501960817
             gamma1 = cfg["inject_iqr"] / iqr_std
-        t0 = time.time()
+        t0 = time.perf_counter()
         ex, kk, pc = run_point(mode, P_S, X, Y, cfg, B, eta, gm, a, gamma1, run.seed + gi, dev, act)
         rate = escape.censored_rate(kk, ex)
         grid_rows.append({"mode": mode, "B": B, "eta": eta, "g_max": gm, "alpha_injected": a, "p_clip": pc,
-                          **rate, "wall_s": time.time() - t0})
+                          **rate, "wall_s": time.perf_counter() - t0})
         rest_rows += [{"mode": mode, "B": B, "eta": eta, "g_max": gm, "alpha_injected": a, "restart": r,
                        "k": float(kk[r]), "exited": bool(ex[r])} for r in range(len(ex))]
         run.note(f"{mode} B={B} eta={eta} g_max={gm} alpha={a}: exits {rate['exits']}/{rate['n']}")

@@ -174,7 +174,7 @@ def start_run(test: str, cfg: dict, args: argparse.Namespace) -> Run:
     out = Path(args.out) if args.out else PILOT_ROOT / "results" / test / ("smoke" if args.smoke else "")
     out.mkdir(parents=True, exist_ok=True)
     run = Run(test=test, cfg=cfg, out_dir=out, device=device, seed=seed, smoke=bool(args.smoke),
-              offline_ok=bool(args.smoke or args.offline_ok), t0=time.time(),
+              offline_ok=bool(args.smoke or args.offline_ok), t0=time.perf_counter(),
               require_pins=bool(getattr(args, "require_pins", False)),
               started=_dt.datetime.now(_dt.timezone.utc).isoformat())
     run.note(f"device={device} seed={seed} smoke={run.smoke} out={out}")
@@ -202,7 +202,7 @@ def write_csv(path: Path, rows: Iterable[dict]) -> Path:
 
 
 def finish_run(run: Run, status: str = "ok", extra: dict | None = None) -> Path:
-    elapsed = time.time() - run.t0
+    elapsed = time.perf_counter() - run.t0
     meta = {
         "test": run.test,
         "status": status,
@@ -211,7 +211,8 @@ def finish_run(run: Run, status: str = "ok", extra: dict | None = None) -> Path:
         "device": run.device,
         "started_utc": run.started,
         "finished_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-        "wall_clock_seconds": round(elapsed, 2),
+        "wall_clock_seconds": round(elapsed, 2),   # elapsed time from time.perf_counter (monotonic, so a
+                                                   # clock jump, e.g. WSL resyncing its clock, cannot distort it)
         "git_commit": git_commit(),
         "gpu": gpu_info(),
         "versions": library_versions(),

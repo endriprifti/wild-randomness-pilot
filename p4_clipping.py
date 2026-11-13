@@ -193,7 +193,7 @@ def train(kind, cfg, data, rule, p_clip, seed, lr_scale, device, run, save_stage
     stage_ckpts = {}
     diverged = False
     loss0 = None
-    t0 = time.time()
+    t0 = time.perf_counter()
     for step in range(steps):
         lo = (step * c["batch"]) % n_train
         idx = order[lo:lo + c["batch"]]
@@ -229,7 +229,7 @@ def train(kind, cfg, data, rule, p_clip, seed, lr_scale, device, run, save_stage
     return model, {"steps": steps, "warmup_steps": warm, "diverged": diverged, "p_clip_realized": clip.stats.p_clip,
                    "mean_update_len": float(np.mean(upd)) if upd else float("nan"), "lr": lr,
                    "final_train_loss_ema": float(np.mean(losses[-max(1, len(losses) // 20):])) if losses else float("nan"),
-                   "wall_s": time.time() - t0, "g_max": clip.g_max,
+                   "wall_s": time.perf_counter() - t0, "g_max": clip.g_max,
                    "norms_post_warmup": clip.stats.norms[warm:]}, np.array(proj), stage_ckpts
 
 

@@ -10,12 +10,18 @@ mkdir -p results
 SUMMARY=results/smoke_summary.csv
 echo "job,status,seconds" > "$SUMMARY"
 
+# Seconds since boot from /proc/uptime: monotonic, so a wall-clock jump (WSL2 resyncing its clock after the host
+# sleeps) cannot make a duration negative or inflate it. Falls back to `date` where /proc/uptime is missing.
+now () {
+  if [ -r /proc/uptime ]; then cut -d' ' -f1 /proc/uptime | cut -d. -f1; else date +%s; fi
+}
+
 run_job () {
   local name="$1"; shift
-  local t0=$(date +%s)
+  local t0=$(now)
   echo "=== $name: $*"
   if "$@" > "results/smoke_${name}.log" 2>&1; then status=PASS; else status=FAIL; fi
-  local dt=$(( $(date +%s) - t0 ))
+  local dt=$(( $(now) - t0 ))
   if [ "$status" = PASS ] && [ "$dt" -gt 300 ]; then status=SLOW; fi
   echo "$name,$status,$dt" >> "$SUMMARY"
   echo "    $status in ${dt}s (log: results/smoke_${name}.log)"

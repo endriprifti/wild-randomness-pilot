@@ -187,6 +187,10 @@ pinned when pass (b) runs: run it without `--require-pins` and commit the update
 `run.json` lists the commits it loaded under `pinned_commits`, and `checkpoints.csv` has `commit` and `commit_date`
 columns.
 
+The committed `pins.json` comes from `--pin-only` on 2026-11-13: 1,067 commits for the main grid and pass (a)
+(OLMo 2 7B and pass (b) are not pinned yet). By the Hub's file sizes, pass (a) is 429 checkpoints and 391.0 GB, and
+all 1,067 checkpoints together are 739.9 GB.
+
 This matters for Pythia: on 27 February 2026 the `pythia-14m` and `pythia-31m` names switched from the deduplicated
 to the standard-Pile models (see their model cards). For these two names, `checkpoints.csv` flags
 (`name_switch_check`) any commit dated before 2026-02-27. Confirm such a commit on its model card before using it.

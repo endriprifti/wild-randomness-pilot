@@ -102,7 +102,7 @@ def train_one(arch, task, n_s, H, data, cfg, lr, seed, device):
     g = torch.Generator().manual_seed(seed)
     if device.startswith("cuda"):
         torch.cuda.reset_peak_memory_stats()
-    t0 = time.time()
+    t0 = time.perf_counter()
     diverged = False
     for step in range(steps):
         idx = torch.randint(0, len(Xtr), (cfg["batch"],), generator=g)
@@ -117,7 +117,7 @@ def train_one(arch, task, n_s, H, data, cfg, lr, seed, device):
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         sched.step()
-    wall = time.time() - t0
+    wall = time.perf_counter() - t0
     acc = evaluate(model, Xte, Yte, task, device) if not diverged else float("nan")
     peak = torch.cuda.max_memory_allocated() / 2**20 if device.startswith("cuda") else float("nan")
     return {"acc": acc, "params": ssm.n_params(model), "steps": steps, "wall_s": wall, "peak_mem_mb": peak,

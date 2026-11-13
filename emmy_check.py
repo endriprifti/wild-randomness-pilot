@@ -317,18 +317,18 @@ def _probe(route: str, module, call, x0, backend: str, dev: str, key: dict) -> t
     stats = {"graphs": 0, "fx_ops": 0, "compiled_graphs": 0, "compiled_ops": 0, "errors": []}
     compiled = torch.compile(module, backend=counting_backend(backend, stats), dynamic=False)
     row = {**key, "route": route, **explain}
-    t0 = time.time()
+    t0 = time.perf_counter()
     try:
         with torch.no_grad():
             logits, _ = _split_out(call(compiled, x0))
         _sync(dev)
         finite = bool(torch.isfinite(logits).all())
     except Exception as e:  # noqa: BLE001
-        row.update(status="unsupported", compile_s=time.time() - t0, finite=None,
+        row.update(status="unsupported", compile_s=time.perf_counter() - t0, finite=None,
                    errors=f"{type(e).__name__}: {str(e).strip()[:400]}",
                    **{k: v for k, v in stats.items() if k != "errors"})
         return row, None
-    row.update(compile_s=time.time() - t0, finite=finite, **{k: v for k, v in stats.items() if k != "errors"})
+    row.update(compile_s=time.perf_counter() - t0, finite=finite, **{k: v for k, v in stats.items() if k != "errors"})
     row["op_coverage"] = stats["compiled_ops"] / max(stats["fx_ops"], 1)
     row["errors"] = " | ".join(stats["errors"][:3])
     if stats["compiled_graphs"] == 0:
@@ -392,11 +392,11 @@ def _work(spec: dict, wrun: _WorkerRun) -> dict:
     with torch.no_grad():
         for i in range(len(ids)):
             x = ids[i:i + 1].to(dev)
-            _sync(dev); t = time.time()
+            _sync(dev); t = time.perf_counter()
             le, he = _split_out(wrapper(x))
-            _sync(dev); t_e.append(time.time() - t); t = time.time()
+            _sync(dev); t_e.append(time.perf_counter() - t); t = time.perf_counter()
             lc, hc = _split_out(compiled(x))
-            _sync(dev); t_c.append(time.time() - t)
+            _sync(dev); t_c.append(time.perf_counter() - t)
             lm.append(logit_metrics(le[0].float(), lc[0].float(), x[0]))
             acc.add(he, hc)
             del le, he, lc, hc
