@@ -19,8 +19,12 @@ Suites (config.py): pythia (seed 0, 14M-1.4B); polypythia = pythia-{size}-seed1.
 batch composition vary jointly; run-to-run variance); polypythia_data / polypythia_weight = the 160M
 data-seed1-3 and weight-seed1-3 runs (data order alone, initialization alone); olmo = OLMo 2 1B with its
 stage-1 checkpoints; olmo7b = OLMo 2 7B, OPTIONAL and never run by default (L40S, last job).
-Every model is loaded at a commit pinned in pins.json; checkpoints.csv records commit and commit date, and
-flags pythia-14m/31m commits dated before the 27 February 2026 name switch (deduplicated -> standard Pile).
+Every model is loaded at a commit pinned in pins.json; checkpoints.csv records commit and commit date. For
+pythia-14m/31m (re-created with the standard-Pile models on 24 February 2026; the deduplicated ones moved to
+pythia-14m-deduped / pythia-31m-deduped) two checks: dedup_check flags a commit whose model.safetensors has the
+same LFS sha256 as the same revision of the -deduped repository (Hub API metadata, no download), and
+name_switch_check flags a commit dated before 24 February 2026. --pin-only runs both for every pinned name and
+writes name_switch_check.csv.
 Loss-spike check (PolyPythias 410M seeds 3 and 4 had loss spikes), two passes:
   (a) probe loss only, at every 1,000-step checkpoint, for seeds 3 and 4 and one stable seed; a jump is a
       loss increase, net of the stable seed's change, with robust z > 3.5 over the run's intervals;
@@ -31,7 +35,7 @@ Each checkpoint is deleted from the Hugging Face cache after it is read (--keep-
 
 Outputs (results/p1_checkpoints/[smoke/]): checkpoints.csv, esd_layers.csv, activations_layers.csv,
 h71_per_B.csv, h71_summary.csv, scaling.csv, seed_variance.csv, spike_check.csv, coupling_pairs.csv,
-coupling.json, run.json
+coupling.json, run.json; with --pin-only: name_switch_check.csv and run.json
 
 Commands:
   python p1_checkpoints.py --pin-only            # resolve and record every commit first (CPU is enough);
@@ -46,6 +50,7 @@ Commands:
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import math
 
@@ -147,6 +152,45 @@ def name_switch_flag(cfg, repo: str, commit_date: str | None) -> str:
     if commit_date[:10] < ns["date"]:
         return "CHECK: commit predates the name switch (may be the deduplicated model)"
     return "after switch"
+
+
+def dedup_content_flag(cfg, repo: str, rev: str, commit: str | None, lookup) -> dict:
+    """Content check of the name switch, independent of dates: the LFS sha256 of the weights at the pinned commit
+    against the same revision (step branch) of repo + '-deduped'. lookup(repo, revision) -> (commit,
+    {filename: sha256}) reads Hub metadata only. Flagged ("CHECK") only if the files are identical; files that
+    differ are not byte-identical, which is all a hash can say. {} for repos without a name switch."""
+    ns = cfg.get("name_switch") or {}
+    if repo not in ns.get("repos", []):
+        return {}
+    other = repo + ns.get("deduped_suffix", "-deduped")
+    out = {"dedup_repo": other, "dedup_revision": rev}
+    try:
+        _, mine = lookup(repo, commit or rev)
+        out["dedup_commit"], theirs = lookup(other, rev)
+    except Exception as e:  # noqa: BLE001  a missing branch or no network: report, do not stop the run
+        return {**out, "dedup_check": f"unknown: Hub lookup failed ({type(e).__name__}: {str(e)[:100]})"}
+    fname, same = hf.compare_weights(mine, theirs, ns.get("content_files", hf.WEIGHTS_FILES))
+    if fname is None:
+        return {**out, "dedup_check": f"unknown: no weights file in common (pinned: {sorted(mine) or 'none'}, "
+                                      f"{other}: {sorted(theirs) or 'none'})"}
+    out.update(weights_file=fname, weights_sha256=mine[fname], dedup_sha256=theirs[fname])
+    out["dedup_check"] = (f"CHECK: {fname} identical to {other}@{rev} (the deduplicated model)" if same
+                          else f"differs from {other}@{rev}")
+    return out
+
+
+def content_check(cfg, repo: str, rev: str, pins, lookup) -> dict:
+    """dedup_content_flag with its result cached in the pin entry (pins.json: deduped_check), so a committed
+    pins.json carries the evidence and later runs reuse it. Lookup failures are not cached."""
+    entry = pins.entry(repo, rev)
+    if entry and "deduped_check" in entry:
+        return dict(entry["deduped_check"])
+    res = dedup_content_flag(cfg, repo, rev, (entry or {}).get("commit"), lookup)
+    if res and entry and not res["dedup_check"].startswith("unknown"):
+        res["dedup_checked_utc"] = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+        entry["deduped_check"] = dict(res)
+        pins.save()
+    return res
 
 
 def spike_check(df: pd.DataFrame, sc: dict) -> list[dict]:
@@ -310,8 +354,11 @@ def main():
                                        and seed in sc.get("flagged_seeds", [])),
                "n_params": sum(p.numel() for p in model.parameters()),
                "n_nonembed": lm.non_embedding_params(model)}
-        if row["name_switch_check"].startswith("CHECK"):
-            run.note(f"{repo}@{rev}: {row['name_switch_check']}; confirm on the model card at {row['commit']}")
+        if src == "hub":
+            row.update(content_check(cfg, repo, rev, hf.PINS, hf.hub_lfs))
+        for col in ("dedup_check", "name_switch_check"):
+            if str(row.get(col, "")).startswith("CHECK"):
+                run.note(f"{repo}@{rev} ({row['commit']}): {col} {row[col]}")
         frac = step / final if final else 1.0
         row["probe_loss"] = float(lm.token_losses(model, probe_v, dev).mean())   # locates loss spikes
 
@@ -464,6 +511,29 @@ def main():
     extra = {}
     if args.pin_only:
         failed = [m for m in run.notes if m.startswith("PIN FAILED")]
+        # name switch: content check (cached in pins.json) and date check for every pinned pythia-14m/31m name
+        ns_rows = []
+        for k in dict.fromkeys(k for keys in pinned.values() for k in keys):
+            repo, rev = k.rsplit("@", 1)
+            if repo not in (cfg.get("name_switch") or {}).get("repos", []):
+                continue
+            entry = hf.PINS.data.get(k) or {}
+            r = {"repo": repo, "revision": rev, "commit": entry.get("commit"), "commit_date": entry.get("commit_date"),
+                 "name_switch_check": name_switch_flag(cfg, repo, entry.get("commit_date")),
+                 **content_check(cfg, repo, rev, hf.PINS, hf.hub_lfs)}
+            ns_rows.append(r)
+            for col in ("dedup_check", "name_switch_check"):
+                if str(r.get(col, "")).startswith("CHECK"):
+                    run.note(f"{k} ({r['commit']}): {col} {r[col]}")
+        if ns_rows:
+            runtime.write_csv(run.out_dir / "name_switch_check.csv", ns_rows)
+            def verdict(v):  # CHECK / differs / unknown / after switch
+                v = str(v)
+                return "differs" if v.startswith("differs") else v.split(":")[0]
+            extra["name_switch"] = {col: pd.Series([verdict(r.get(col, "")) for r in ns_rows]).value_counts().to_dict()
+                                    for col in ("dedup_check", "name_switch_check")}
+            run.note(f"name switch, {len(ns_rows)} pinned names: content {extra['name_switch']['dedup_check']}, "
+                     f"date {extra['name_switch']['name_switch_check']}")
         extra["pins_resolved"] = len(run.pins)
         extra["download"] = {}
         for tag, keys in pinned.items():

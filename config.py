@@ -102,10 +102,14 @@ CONFIG = {
                             "window": 5000,
                             "quantities": ["alpha", "alpha_esd", "K"],
                             "robust_z": 3.5},                # OURS: the threshold in both passes
-            # pythia-14m / pythia-31m switched from the deduplicated to the standard-Pile models on 27 February 2026
-            # (their model cards);
-            # commits of these names dated before the switch are flagged in checkpoints.csv
-            "name_switch": {"repos": ["EleutherAI/pythia-14m", "EleutherAI/pythia-31m"], "date": "2026-02-27"},
+            # pythia-14m / pythia-31m: re-created on 24 February 2026 with the standard-Pile models (the step branches'
+            # commits are all from that day; 27 February is when main's model card announced it); the 2023
+            # deduplicated upload moved, with its history, to pythia-14m-deduped / pythia-31m-deduped. Two checks in
+            # checkpoints.csv: content (dedup_check) = the pinned commit's model.safetensors sha256 against the same
+            # revision of repo + deduped_suffix, flagged only if identical (content_files: the first file both
+            # carry); date (name_switch_check) = commits dated before `date` are flagged
+            "name_switch": {"repos": ["EleutherAI/pythia-14m", "EleutherAI/pythia-31m"], "date": "2026-02-24",
+                            "deduped_suffix": "-deduped", "content_files": ["model.safetensors", "pytorch_model.bin"]},
             "final_step": 143000,
             "dtype": "float32",
             "pool_dataset": ["monology/pile-uncopyrighted", None, "train"],  # Pile text without the copyrighted subsets

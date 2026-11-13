@@ -27,8 +27,11 @@ class Pins:
     pins.json maps "repo@revision" (revision = branch such as step1000, or "main") to the commit the
     pilot uses, with the commit's date. The first run that meets a new name resolves it on the Hub
     and writes it here; commit pins.json, and later runs (or --require-pins) reuse exactly those
-    commits. This matters for Pythia: on 27 February 2026 the pythia-14m and pythia-31m names switched
-    from the deduplicated to the standard-Pile models, so a name alone does not fix the weights.
+    commits. This matters for Pythia: on 24 February 2026 the pythia-14m and pythia-31m repositories were
+    re-created with the standard-Pile models (the deduplicated ones moved to pythia-14m-deduped and
+    pythia-31m-deduped), so a name alone does not fix the weights. Each new entry also records the LFS sha256
+    of the weights files at that commit (weights_sha256), and P1 caches its name-switch content check there
+    (deduped_check).
     """
 
     def __init__(self, path: Path = PINS_PATH):
@@ -57,6 +60,7 @@ class Pins:
             sha = info.sha
             entry = {"commit": sha, "resolved_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")}
             entry["weights_bytes"] = weights_bytes(info.siblings or [])
+            entry["weights_sha256"] = {f: h for f, h in lfs_sha256s(info.siblings).items() if f in WEIGHTS_FILES}
             try:  # the revision's last commit; fall back to the commit list if the Hub omits it
                 date = info.last_modified or api.list_repo_commits(repo, revision=sha)[0].created_at
                 entry["commit_date"] = date.isoformat()
@@ -86,6 +90,36 @@ def weights_bytes(siblings) -> int | None:
     st = sum(v for k, v in sizes.items() if k.endswith(".safetensors"))
     bn = sum(v for k, v in sizes.items() if k.endswith(".bin"))
     return (st or bn) or None
+
+
+WEIGHTS_FILES = ("model.safetensors", "pytorch_model.bin")
+
+
+def lfs_sha256s(siblings) -> dict[str, str]:
+    """filename -> sha256 of every Git LFS file in a model_info(..., files_metadata=True) listing."""
+    out = {}
+    for s in siblings or []:
+        lfs = getattr(s, "lfs", None)
+        sha = (lfs.get("sha256") if isinstance(lfs, dict) else getattr(lfs, "sha256", None)) if lfs else None
+        if sha:
+            out[s.rfilename] = sha
+    return out
+
+
+def hub_lfs(repo: str, revision: str | None) -> tuple[str, dict[str, str]]:
+    """(commit, filename -> LFS sha256) at one revision, from the Hub API's file metadata. Nothing is downloaded."""
+    from huggingface_hub import HfApi
+    info = HfApi().model_info(repo, revision=revision, files_metadata=True)
+    return info.sha, lfs_sha256s(info.siblings)
+
+
+def compare_weights(mine: dict, theirs: dict, files=WEIGHTS_FILES) -> tuple[str | None, bool | None]:
+    """The first of `files` that both listings carry, and whether its sha256 is the same on both sides
+    ((None, None) if they share none of them)."""
+    for f in files:
+        if f in mine and f in theirs:
+            return f, mine[f] == theirs[f]
+    return None, None
 
 
 def purge_revision(repo: str, commit: str | None, run=None) -> None:

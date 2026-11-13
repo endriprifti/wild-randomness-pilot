@@ -191,9 +191,25 @@ The committed `pins.json` comes from `--pin-only` on 2026-11-13: 1,067 commits f
 (OLMo 2 7B and pass (b) are not pinned yet). By the Hub's file sizes, pass (a) is 429 checkpoints and 391.0 GB, and
 all 1,067 checkpoints together are 739.9 GB.
 
-This matters for Pythia: on 27 February 2026 the `pythia-14m` and `pythia-31m` names switched from the deduplicated
-to the standard-Pile models (see their model cards). For these two names, `checkpoints.csv` flags
-(`name_switch_check`) any commit dated before 2026-02-27. Confirm such a commit on its model card before using it.
+This matters for Pythia. On 24 February 2026 the `pythia-14m` and `pythia-31m` repositories were re-created with
+the standard-Pile models: `pythia-14m` step143000 has three commits, all from that day ("initial commit",
+"Add model card", "Upload checkpoint step 143000"), `pythia-31m`'s history also starts with an "initial commit"
+that day, and every pinned step commit of both is dated 24 February 2026. The 2023 deduplicated upload moved, with its history, to `pythia-14m-deduped` and `pythia-31m-deduped`. (27 February is
+when main's model card announced the switch.) For these two names P1 runs two checks:
+
+1. Content, independent of dates (`dedup_check`): the LFS sha256 of `model.safetensors` at the pinned commit
+   against the same revision (step branch) of the `-deduped` repository. Both hashes come from the Hub API's file
+   metadata, so nothing is downloaded. Only identical files are flagged ("CHECK: … identical to …-deduped"):
+   those are the deduplicated weights. "differs" means the files are not byte-identical, which is all a hash can
+   say. If either side lacks `model.safetensors`, `pytorch_model.bin` is compared instead when both carry it;
+   otherwise the check reads "unknown". The result is cached in the pin entry (`deduped_check` in `pins.json`,
+   with the `-deduped` commit and both hashes), so the committed file carries the evidence.
+2. Date (`name_switch_check`): any commit dated before 2026-02-24 is flagged.
+
+`checkpoints.csv` carries both columns, and a flag of either kind also goes to the `run.json` notes. `--pin-only`
+runs both checks for every pinned `pythia-14m`/`pythia-31m` name (27 in the committed file, two Hub API calls each)
+and writes `name_switch_check.csv`; `run.json` counts the verdicts under `name_switch`. New pin entries also record
+`weights_sha256`, the sha256 of the weights files at that commit.
 
 ## Emmy
 
@@ -230,7 +246,7 @@ before the run.
 
 ## Unit tests
 
-`python -m pytest -q` (85 tests, about 80 s on a CPU; `-m "not slow"` skips the two slowest). Synthetic data with
+`python -m pytest -q` (89 tests, about 85 s on a CPU; `-m "not slow"` skips the two slowest). Synthetic data with
 known parameters:
 
 - stable density against the Gaussian and Cauchy closed forms and against SciPy; ML fit recovers α ∈ {1.2, 1.5, 1.8},
@@ -250,8 +266,10 @@ known parameters:
 - tail labels: alternatives that cannot be separated read "undecided"; exponential against Weibull uses the
   likelihood-ratio test;
 - P1 bookkeeping: commit pins (reuse, --require-pins, merge on save), the weight bytes counted for the download
-  volume, step choice for the main grid, the 1,000-step scan and OLMo, the pythia-14m/31m name-switch flag
-  (15 February 2026 is flagged), both loss-spike passes (each finds a planted spike at its onset, and only
+  volume, step choice for the main grid, the 1,000-step scan and OLMo, the pythia-14m/31m name-switch checks
+  (date: 23 February 2026 is flagged, 24 February is not; content: identical weights to the `-deduped` revision are
+  flagged, different ones are not, a missing file or branch reads "unknown", and the result is cached in
+  `pins.json`), both loss-spike passes (each finds a planted spike at its onset, and only
   there), window merging, and the seed-variance table;
 - P4's vocabulary: a tokenizer whose added tokens lie above `vocab_size` gets a model with a row for every ID, in
   smoke and full settings; the ID check fails readably; the full model keeps Pythia's 50,304 slots;

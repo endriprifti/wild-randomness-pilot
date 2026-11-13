@@ -1,4 +1,5 @@
-"""P1 bookkeeping: commit pins, step choice, the name-switch flag, the loss-spike check, seed variance."""
+"""P1 bookkeeping: commit pins, step choice, the name-switch checks (date and content), the loss-spike check,
+seed variance."""
 import json
 import types
 
@@ -87,7 +88,9 @@ def test_weights_bytes_prefers_safetensors():
 def test_name_switch_flag():
     cfg = config.get("p1_checkpoints")
     assert p1.name_switch_flag(cfg, "EleutherAI/pythia-14m", "2025-11-01T00:00:00").startswith("CHECK")
-    assert p1.name_switch_flag(cfg, "EleutherAI/pythia-31m", "2026-02-15T00:00:00").startswith("CHECK")  # before 27 Feb
+    assert p1.name_switch_flag(cfg, "EleutherAI/pythia-31m", "2026-02-15T00:00:00").startswith("CHECK")
+    assert p1.name_switch_flag(cfg, "EleutherAI/pythia-14m", "2026-02-23T23:59:59").startswith("CHECK")  # before 24 Feb
+    assert p1.name_switch_flag(cfg, "EleutherAI/pythia-14m", "2026-02-24T10:00:00") == "after switch"  # re-creation day
     assert p1.name_switch_flag(cfg, "EleutherAI/pythia-31m", "2026-02-27T09:00:00") == "after switch"
     assert p1.name_switch_flag(cfg, "EleutherAI/pythia-14m", "2026-03-02T00:00:00") == "after switch"
     assert p1.name_switch_flag(cfg, "EleutherAI/pythia-70m", "2020-01-01") == ""
@@ -132,3 +135,77 @@ def test_seed_variance_compares_variants_at_shared_steps():
     joint_sd = np.std([-1, -0.5, 0, 0.5, 1], ddof=1)
     assert r.loc["weight", "sd"] == pytest.approx(2.0)
     assert r.loc["data", "sd_ratio_to_joint"] == pytest.approx(0.5 / joint_sd)
+
+
+DEDUP = "c" * 64
+
+
+def _lookup(table, calls=None):
+    """Stand-in for hf.hub_lfs: (repo, revision) -> (commit, {file: sha256}); a missing key raises like the Hub."""
+    def lookup(repo, rev):
+        if calls is not None:
+            calls.append((repo, rev))
+        if (repo, rev) not in table:
+            raise FileNotFoundError(f"{repo}@{rev}")
+        return table[(repo, rev)]
+    return lookup
+
+
+def test_dedup_content_flag_flags_only_identical_weights():
+    cfg = config.get("p1_checkpoints")
+    repo, dd = "EleutherAI/pythia-14m", "EleutherAI/pythia-14m-deduped"
+    same = _lookup({(repo, SHA): (SHA, {"model.safetensors": DEDUP, "tokenizer.json": "t"}),
+                    (dd, "step1000"): ("d" * 40, {"model.safetensors": DEDUP})})
+    r = p1.dedup_content_flag(cfg, repo, "step1000", SHA, same)
+    assert r["dedup_check"].startswith("CHECK") and dd in r["dedup_check"]
+    assert r["dedup_commit"] == "d" * 40 and r["weights_sha256"] == r["dedup_sha256"] == DEDUP
+    diff = _lookup({(repo, SHA): (SHA, {"model.safetensors": "e" * 64}),
+                    (dd, "step1000"): ("d" * 40, {"model.safetensors": DEDUP})})
+    assert p1.dedup_content_flag(cfg, repo, "step1000", SHA, diff)["dedup_check"].startswith("differs")
+    # the pinned commit, not the moving branch name, is looked up on our side
+    assert p1.dedup_content_flag(cfg, repo, "step1000", None, diff)["dedup_check"].startswith("unknown")
+
+
+def test_dedup_content_flag_unknown_without_a_common_file_or_branch():
+    cfg = config.get("p1_checkpoints")
+    repo, dd = "EleutherAI/pythia-31m", "EleutherAI/pythia-31m-deduped"
+    bin_only = _lookup({(repo, SHA): (SHA, {"model.safetensors": DEDUP}),
+                        (dd, "step1"): ("d" * 40, {"pytorch_model.bin": DEDUP})})
+    r = p1.dedup_content_flag(cfg, repo, "step1", SHA, bin_only)
+    assert r["dedup_check"].startswith("unknown: no weights file in common")
+    both_bin = _lookup({(repo, SHA): (SHA, {"pytorch_model.bin": DEDUP}),
+                        (dd, "step1"): ("d" * 40, {"pytorch_model.bin": DEDUP})})
+    r = p1.dedup_content_flag(cfg, repo, "step1", SHA, both_bin)      # second file of content_files
+    assert r["dedup_check"].startswith("CHECK") and r["weights_file"] == "pytorch_model.bin"
+    no_branch = _lookup({(repo, SHA): (SHA, {"model.safetensors": DEDUP})})
+    assert p1.dedup_content_flag(cfg, repo, "step1", SHA, no_branch)["dedup_check"].startswith("unknown: Hub lookup")
+    assert p1.dedup_content_flag(cfg, "EleutherAI/pythia-70m", "step1", SHA, no_branch) == {}
+
+
+def test_content_check_is_cached_in_pins(tmp_path):
+    cfg = config.get("p1_checkpoints")
+    repo, dd = "EleutherAI/pythia-14m", "EleutherAI/pythia-14m-deduped"
+    path = tmp_path / "pins.json"
+    path.write_text(json.dumps({f"{repo}@step1000": {"commit": SHA, "commit_date": "2026-02-24T00:00:00+00:00"}}))
+    calls = []
+    lookup = _lookup({(repo, SHA): (SHA, {"model.safetensors": "e" * 64}),
+                      (dd, "step1000"): ("d" * 40, {"model.safetensors": DEDUP})}, calls)
+    first = p1.content_check(cfg, repo, "step1000", hf.Pins(path), lookup)
+    assert first["dedup_check"].startswith("differs") and len(calls) == 2
+    stored = json.loads(path.read_text())[f"{repo}@step1000"]["deduped_check"]
+    assert stored["dedup_check"] == first["dedup_check"] and stored["dedup_sha256"] == DEDUP
+    again = p1.content_check(cfg, repo, "step1000", hf.Pins(path), lookup)
+    assert again == first and len(calls) == 2                       # read from pins.json, no Hub call
+    failing = _lookup({})
+    p1.content_check(cfg, repo, "step2000", hf.Pins(path), failing)  # unpinned and unreachable: not cached
+    assert "EleutherAI/pythia-14m@step2000" not in json.loads(path.read_text())
+
+
+def test_lfs_sha256s_reads_hub_metadata():
+    lfs = types.SimpleNamespace
+    sib = [lfs(rfilename="model.safetensors", lfs={"sha256": DEDUP, "size": 1, "pointer_size": 1}),
+           lfs(rfilename="pytorch_model.bin", lfs=lfs(sha256="f" * 64, size=1, pointer_size=1)),
+           lfs(rfilename="config.json", lfs=None)]
+    assert hf.lfs_sha256s(sib) == {"model.safetensors": DEDUP, "pytorch_model.bin": "f" * 64}
+    assert hf.compare_weights({"model.safetensors": DEDUP}, {"model.safetensors": DEDUP}) == ("model.safetensors", True)
+    assert hf.compare_weights({"model.safetensors": DEDUP}, {}) == (None, None)
