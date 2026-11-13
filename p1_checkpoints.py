@@ -20,19 +20,25 @@ batch composition vary jointly; run-to-run variance); polypythia_data / polypyth
 data-seed1-3 and weight-seed1-3 runs (data order alone, initialization alone); olmo = OLMo 2 1B with its
 stage-1 checkpoints; olmo7b = OLMo 2 7B, OPTIONAL and never run by default (L40S, last job).
 Every model is loaded at a commit pinned in pins.json; checkpoints.csv records commit and commit date, and
-flags pythia-14m/31m commits dated before the February 2026 name switch (deduplicated -> standard Pile).
-Loss-spike check: PolyPythias 410M seeds 3 and 4 had loss spikes; every 410M seed is also read at extra
-early steps, and spike_check.csv asks whether probe loss, alpha, alpha_ESD or K jump at the same steps
-more than in every other seed.
+flags pythia-14m/31m commits dated before the 27 February 2026 name switch (deduplicated -> standard Pile).
+Loss-spike check (PolyPythias 410M seeds 3 and 4 had loss spikes), two passes:
+  (a) probe loss only, at every 1,000-step checkpoint, for seeds 3 and 4 and one stable seed; a jump is a
+      loss increase, net of the stable seed's change, with robust z > 3.5 over the run's intervals;
+  (b) alpha, alpha_ESD and K for all nine 410M seeds at every 1,000-step checkpoint within 5,000 steps
+      either side of each jump; a flagged seed's change counts as a jump if it exceeds every other seed's
+      and is more than 3.5 robust z above them. spike_check.csv holds both passes and the jump steps.
+Each checkpoint is deleted from the Hugging Face cache after it is read (--keep-cache keeps them).
 
 Outputs (results/p1_checkpoints/[smoke/]): checkpoints.csv, esd_layers.csv, activations_layers.csv,
 h71_per_B.csv, h71_summary.csv, scaling.csv, seed_variance.csv, spike_check.csv, coupling_pairs.csv,
 coupling.json, run.json
 
 Commands:
-  python p1_checkpoints.py --pin-only            # resolve and record every commit first (CPU is enough)
+  python p1_checkpoints.py --pin-only            # resolve and record every commit first (CPU is enough);
+                                                 # run.json then gives the download volume of each pass
   python p1_checkpoints.py --suite pythia
-  python p1_checkpoints.py --suite polypythia,polypythia_data,polypythia_weight
+  python p1_checkpoints.py --suite polypythia,polypythia_data,polypythia_weight   # includes both spike passes
+  python p1_checkpoints.py --suite polypythia --spike-only                      # only the spike passes
   python p1_checkpoints.py --suite olmo           # OLMo 2 1B, fits the RTX 5090
   python p1_checkpoints.py --suite olmo7b         # OPTIONAL, last: OLMo 2 7B on the L40S
   python p1_checkpoints.py --smoke
@@ -64,8 +70,8 @@ def default_suites(cfg) -> list[str]:
     return [k for k, v in cfg["suites"].items() if not v.get("optional")]
 
 
-def wanted_steps(cfg, suite: str, size: str, steps_avail: dict) -> tuple[list[int], set[int]]:
-    """Steps to read for one model, and the subset read only for the loss-spike check."""
+def wanted_steps(cfg, suite: str, size: str, steps_avail: dict) -> list[int]:
+    """Steps of the main grid for one model (the loss-spike passes choose their own)."""
     s = cfg["suites"][suite]
     final = max(steps_avail)
     if "step_fracs" in s:   # OLMo: fractions of the last pretraining checkpoint
@@ -75,12 +81,61 @@ def wanted_steps(cfg, suite: str, size: str, steps_avail: dict) -> tuple[list[in
     h71 = cfg["h71"]
     if size in h71["full_res_sizes"] + h71["coarse_sizes"] and suite == "pythia":
         wanted += [int(round(st * final)) for st in h71.get("stages", cfg["stages"])]
-    sc = cfg.get("spike_check") or {}
-    spike_only: set[int] = set()
-    if suite == sc.get("suite") and size == sc.get("size"):
-        spike_only = set(sc["extra_steps"]) - set(wanted)
-        wanted += list(sc["extra_steps"])
-    return sorted(set(wanted)), spike_only
+    return sorted(set(wanted))
+
+
+def scan_grid(sc: dict) -> list[int]:
+    lo, hi = sc["scan_range"]
+    return list(range(lo, hi + 1, sc["scan_every"]))
+
+
+def scan_steps(avail: dict, sc: dict) -> list[int]:
+    """Pass (a) steps: every released checkpoint on the scan grid (multiples of scan_every in scan_range)."""
+    lo, hi = sc["scan_range"]
+    return [s for s in sorted(avail) if lo <= s <= hi and s % sc["scan_every"] == 0]
+
+
+def loss_jumps(df: pd.DataFrame, sc: dict) -> list[dict]:
+    """Pass (a). For each flagged seed, the change in probe loss between consecutive scan checkpoints minus
+    the reference seeds' mean change over the same interval (this removes the common downward trend);
+    robust z = (excess - median) / (1.4826 MAD) over all intervals of that seed. A jump is a loss
+    increase with z > sc['robust_z']."""
+    if not len(df):
+        return []
+    d = df[(df.suite == sc["suite"]) & (df["size"] == sc["size"])]
+    piv = d.pivot_table(index="step", columns="seed", values="probe_loss", aggfunc="first").sort_index()
+    steps = piv.index.to_list()
+    diffs = piv.diff()
+    refs = [r for r in sc["reference_seeds"] if r in diffs.columns]
+    ref = diffs[refs].mean(axis=1) if refs else pd.Series(0.0, index=diffs.index)
+    out = []
+    for s in sc["flagged_seeds"]:
+        if s not in diffs.columns:
+            continue
+        excess = (diffs[s] - ref).iloc[1:]
+        ok = excess.dropna().to_numpy(float)
+        med = float(np.median(ok)) if len(ok) else np.nan
+        mad = float(1.4826 * np.median(np.abs(ok - med))) if len(ok) else np.nan
+        for i in range(1, len(steps)):
+            e = excess.iloc[i - 1]
+            z = (e - med) / mad if np.isfinite(e) and np.isfinite(mad) and mad > 0 else np.nan
+            out.append({"pass": "a", "quantity": "probe_loss", "seed": s, "step_from": steps[i - 1], "step_to": steps[i],
+                        "value_from": float(piv.iloc[i - 1][s]), "value_to": float(piv.iloc[i][s]),
+                        "dq": float(diffs[s].iloc[i]), "reference_dq": float(ref.iloc[i]), "excess_dq": float(e),
+                        "robust_z": float(z), "jump": bool(np.isfinite(z) and z > sc["robust_z"])})
+    return out
+
+
+def merge_windows(jumps: list[tuple[int, int]], half: int) -> list[tuple[int, int, list]]:
+    """[step_from - half, step_to + half] around each jump; overlapping windows merge."""
+    out: list = []
+    for a, b in sorted(jumps):
+        lo, hi = a - half, b + half
+        if out and lo <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], hi), out[-1][2] + [(a, b)])
+        else:
+            out.append((lo, hi, [(a, b)]))
+    return out
 
 
 def name_switch_flag(cfg, repo: str, commit_date: str | None) -> str:
@@ -95,9 +150,9 @@ def name_switch_flag(cfg, repo: str, commit_date: str | None) -> str:
 
 
 def spike_check(df: pd.DataFrame, sc: dict) -> list[dict]:
-    """Per quantity, |change| between consecutive steps of each flagged seed against the other seeds
-    of the same size over the same interval: robust z = (|dq| - median) / (1.4826 MAD); a jump needs
-    |dq| above every other seed and z > sc['robust_z']."""
+    """Pass (b). Per quantity, |change| between consecutive steps of each flagged seed against the other
+    seeds of the same size over the same interval: robust z = (|dq| - median) / (1.4826 MAD) of the
+    other seeds' |dq|; a jump needs |dq| above every other seed and z > sc['robust_z']."""
     d = df[(df.suite == sc["suite"]) & (df["size"] == sc["size"])]
     flagged = list(sc["flagged_seeds"])
     out = []
@@ -198,7 +253,11 @@ def main():
     ap.add_argument("--pin-only", action="store_true", help="resolve and record the commit of every model and "
                                                             "revision in pins.json, then stop (no measurement)")
     ap.add_argument("--sizes", default=None, help="comma-separated subset of sizes")
-    ap.add_argument("--skip", default="", help="comma-separated parts to skip: grad,esd,act,dh,htok,h71,scaling,coupling")
+    ap.add_argument("--spike-only", action="store_true", help="run only the two loss-spike passes")
+    ap.add_argument("--keep-cache", action="store_true", help="keep every checkpoint in the Hugging Face cache "
+                                                              "(default: delete each one after it is read)")
+    ap.add_argument("--skip", default="", help="comma-separated parts to skip: "
+                                               "grad,esd,act,dh,htok,h71,scaling,spike,coupling")
     ap.add_argument("--jvp-batch", type=int, default=32)
     args = ap.parse_args()
     cfg = config.get("p1_checkpoints", args.smoke)
@@ -221,126 +280,198 @@ def main():
     rows, esd_rows, act_rows, h71_rows, h71_summ, scale_rows = [], [], [], [], [], []
     data_cache: dict = {}
 
-    for suite in suites:
-        scfg = cfg["suites"][suite]
-        for size, seed, repo, variant in suite_models(cfg, suite):
-            if args.sizes and size not in args.sizes.split(","):
-                continue
-            # revisions available for this repo (offline stand-in: the configured Pythia-style steps)
-            fallback_steps = list(cfg["steps"]) + (list(sc["extra_steps"]) if suite == sc.get("suite") else [])
-            steps_avail = hf.list_steps(repo, run, fallback_steps,
-                                        branch_regex=scfg.get("branch_regex", r"^step(\d+)$"))
-            final = max(steps_avail)
-            wanted, spike_only_steps = wanted_steps(cfg, suite, size, steps_avail)
-            chosen = hf.nearest_steps(steps_avail, wanted)
-            if args.pin_only:
-                for step, rev in chosen:
-                    try:
-                        hf.PINS.resolve(repo, rev, run)
-                    except Exception as e:  # noqa: BLE001  report every missing name, then fail
-                        run.note(f"PIN FAILED {repo}@{rev}: {type(e).__name__}: {str(e)[:160]}")
-                continue
-            for step, rev in chosen:
-                spike_only = step in spike_only_steps   # read only the spike-check quantities here
-                model, tok, src = hf.load_causal_lm(repo, rev, run, dtype=dtype, device=dev)
-                pin = hf.PINS.entry(repo, rev) or {} if src == "hub" else {}
-                key = type(tok).__name__ + str(getattr(tok, "name_or_path", ""))
-                if key not in data_cache:  # same examples for every checkpoint of a tokenizer
-                    need_pool = cfg["coupling_blocks"] * cfg["coupling_B"]
-                    n_h71 = h71cfg.get("n_blocks", config.H71["n_blocks"]) * max(h71_Bs)
-                    n_pool = max(need_pool, n_h71 if h71cfg["full_res_sizes"] else 0)
-                    pool_texts, _ = hf.load_texts(*cfg["pool_dataset"], n=max(64, n_pool * cfg["example_len"] // 400 + 64),
-                                                  run=run, seed=run.seed)
-                    pool = hf.tokenize_stream(pool_texts, tok, cfg["example_len"], n_pool)
-                    ev_texts, _ = hf.load_texts(*cfg["eval_dataset"], n=max(16, cfg["eval_seqs"] * cfg["eval_len"] // 400 + 16),
-                                                run=run, seed=run.seed + 1)
-                    probe = hf.tokenize_stream(ev_texts, tok, cfg["probe_len"], cfg["probe_seqs"])
-                    evals = hf.tokenize_stream(ev_texts, tok, cfg["eval_len"], cfg["eval_seqs"])
-                    sur = hf.tokenize_stream(ev_texts[::-1], tok, cfg["surprisal_len"], cfg["surprisal_docs"])
-                    data_cache[key] = (pool, probe, evals, sur)
-                pool, probe, evals, sur = data_cache[key]
-                vocab = model.get_output_embeddings().weight.shape[0]
-                pool_v, probe_v, evals_v, sur_v = (t.clamp(max=vocab - 1) for t in (pool, probe, evals, sur))
-                row = {"suite": suite, "variant": variant, "size": size, "seed": seed, "repo": repo, "step": step,
-                       "revision": rev, "commit": pin.get("commit"), "commit_date": pin.get("commit_date"),
-                       "name_switch_check": name_switch_flag(cfg, repo, pin.get("commit_date")) if src == "hub" else "",
-                       "source": src, "spike_grid_only": spike_only,
-                       "loss_spike_seed": bool(suite == sc.get("suite") and size == sc.get("size")
-                                               and seed in sc.get("flagged_seeds", [])),
-                       "n_params": sum(p.numel() for p in model.parameters()),
-                       "n_nonembed": lm.non_embedding_params(model)}
-                if row["name_switch_check"].startswith("CHECK"):
-                    run.note(f"{repo}@{rev}: {row['name_switch_check']}; confirm on the model card at {row['commit']}")
-                frac = step / final if final else 1.0
-                skip_here = skip | ({"dh", "htok", "h71", "scaling"} if spike_only else set())
-                row["probe_loss"] = float(lm.token_losses(model, probe_v, dev).mean())   # locates loss spikes
+    def read_checkpoint(suite, size, seed, repo, variant, step, rev, final, skip_here, tag):
+        """Load one checkpoint, measure everything not in skip_here, append and return its row."""
+        model, tok, src = hf.load_causal_lm(repo, rev, run, dtype=dtype, device=dev)
+        pin = (hf.PINS.entry(repo, rev) or {}) if src == "hub" else {}
+        key = type(tok).__name__ + str(getattr(tok, "name_or_path", ""))
+        if key not in data_cache:  # same examples for every checkpoint of a tokenizer
+            need_pool = cfg["coupling_blocks"] * cfg["coupling_B"]
+            n_h71 = h71cfg.get("n_blocks", config.H71["n_blocks"]) * max(h71_Bs)
+            n_pool = max(need_pool, n_h71 if h71cfg["full_res_sizes"] else 0)
+            pool_texts, _ = hf.load_texts(*cfg["pool_dataset"], n=max(64, n_pool * cfg["example_len"] // 400 + 64),
+                                          run=run, seed=run.seed)
+            pool = hf.tokenize_stream(pool_texts, tok, cfg["example_len"], n_pool)
+            ev_texts, _ = hf.load_texts(*cfg["eval_dataset"], n=max(16, cfg["eval_seqs"] * cfg["eval_len"] // 400 + 16),
+                                        run=run, seed=run.seed + 1)
+            probe = hf.tokenize_stream(ev_texts, tok, cfg["probe_len"], cfg["probe_seqs"])
+            evals = hf.tokenize_stream(ev_texts, tok, cfg["eval_len"], cfg["eval_seqs"])
+            sur = hf.tokenize_stream(ev_texts[::-1], tok, cfg["surprisal_len"], cfg["surprisal_docs"])
+            data_cache[key] = (pool, probe, evals, sur)
+        pool, probe, evals, sur = data_cache[key]
+        vocab = model.get_output_embeddings().weight.shape[0]
+        pool_v, probe_v, evals_v, sur_v = (t.clamp(max=vocab - 1) for t in (pool, probe, evals, sur))
+        row = {"suite": suite, "variant": variant, "size": size, "seed": seed, "repo": repo, "step": step,
+               "revision": rev, "commit": pin.get("commit"), "commit_date": pin.get("commit_date"),
+               "name_switch_check": name_switch_flag(cfg, repo, pin.get("commit_date")) if src == "hub" else "",
+               "source": src, "pass": tag,
+               "loss_spike_seed": bool(suite == sc.get("suite") and size == sc.get("size")
+                                       and seed in sc.get("flagged_seeds", [])),
+               "n_params": sum(p.numel() for p in model.parameters()),
+               "n_nonembed": lm.non_embedding_params(model)}
+        if row["name_switch_check"].startswith("CHECK"):
+            run.note(f"{repo}@{rev}: {row['name_switch_check']}; confirm on the model card at {row['commit']}")
+        frac = step / final if final else 1.0
+        row["probe_loss"] = float(lm.token_losses(model, probe_v, dev).mean())   # locates loss spikes
 
-                if "esd" not in skip_here:
-                    a_esd, lrows = spectra.model_alpha_esd(model, rng=rng)
-                    row["alpha_esd"] = a_esd
-                    esd_rows += [{**r, "repo": repo, "step": step} for r in lrows]
-                if "act" not in skip_here or "dh" not in skip_here:
-                    hs = lm.hidden_states(model, probe_v, dev)
-                    if "act" not in skip_here:
-                        ks = []
-                        for li, H in enumerate(hs):
-                            st = spectra.activation_stats(H)
-                            act_rows.append({**st, "layer": li, "repo": repo, "step": step})
-                            ks.append(st)
-                        row["K"] = float(np.median([s["K"] for s in ks]))
-                        row["K_max"] = float(np.max([s["K"] for s in ks]))
-                        row["Kurt0"] = float(np.median([s["Kurt0"] for s in ks]))
-                        row["n_outlier_channels"] = int(np.sum([s["n_outlier_channels"] for s in ks]))
-                        row["act_zeta"] = float(np.nanmedian([s.get("act_zeta", np.nan) for s in ks]))
-                    if "dh" not in skip_here:
-                        X = hs[-1].numpy()
-                        if len(X) > cfg["dh_points"]:
-                            X = X[rng.choice(len(X), cfg["dh_points"], replace=False)]
-                        d = multifractal.delta_h_rep(X, S["q_lo"], S["q_hi"], rng=rng,
-                                                     n_centres=min(5000, len(X)))
-                        row.update({"dh_rep": d["delta_h_rep"], "dh_scope": d["scope"], "dh_D2": d["D2"],
-                                    "dh_clause_ok": d["clause_ok"], "dh_decades": d["decades_r"]})
-                    del hs
-                if "htok" not in skip_here:
-                    series = lm.token_losses(model, sur_v, dev).reshape(-1).numpy()
-                    m = hurst.memory_claim(series, n_surr=S["n_surr"], rng=rng, wavelet_j1=S["wavelet_j1"])
-                    row.update({f"Htok_{k}": v for k, v in m.items()})
-                    row["H_dep"] = m["H_dep_dfa"]  # exploratory stand-in in the coupling matrix
-                if "grad" not in skip_here:
-                    B = cfg["coupling_B"]
-                    n = cfg["coupling_blocks"] * B
-                    params, dirs = directions(model, pool_v[:cfg["hessian_batch"]], dev, cfg["n_random_dirs"], 0, run.seed)
-                    P = jvp_projections(model, pool_v[:n], params, [d for _, _, d in dirs], dev, args.jvp_batch)
-                    q = noise_quantities(P[:, 0], B, cfg["coupling_blocks"], T, rng)
-                    row.update(q)
-                # H7.1 at the four training stages
-                h71_size = size in h71cfg["full_res_sizes"] or size in h71cfg["coarse_sizes"]
-                stage_hit = any(abs(frac - st) < 0.02 or (st >= 0.999 and step == final) for st in stages)
-                if "h71" not in skip_here and h71_size and stage_hit and suite == "pythia":
-                    nb = h71cfg.get("n_blocks", config.H71["n_blocks"]) if size in h71cfg["full_res_sizes"] else h71cfg["coarse_blocks"]
-                    n_pool = nb * max(h71_Bs)
-                    params, dirs = directions(model, pool_v[:cfg["hessian_batch"]], dev,
-                                              cfg["n_random_dirs"], cfg["n_hessian_dirs"], run.seed)
-                    P = jvp_projections(model, pool_v[:n_pool], params, [d for _, _, d in dirs], dev, args.jvp_batch)
-                    for j, (kind, i, _) in enumerate(dirs):
-                        res = batchmod.h71_test(P[:, j], h71_Bs, nb, n_boot=h71cfg.get("n_boot", config.H71["n_boot"]),
-                                                rng=rng)
-                        meta = {"repo": repo, "commit": row["commit"], "size": size, "step": step, "stage": round(frac, 3),
-                                "direction": f"{kind}{i}"}
-                        h71_rows += [{**meta, **r} for r in res["per_B"]]
-                        h71_summ.append({**meta, **res["summary"]})
-                if step == final and "scaling" not in skip_here:
-                    row["eval_loss"] = float(lm.token_losses(model, evals_v, dev).mean())
-                rows.append(row)
-                run.note(f"{repo}@{rev}: done")
-                del model
-                if dev.startswith("cuda"):
-                    torch.cuda.empty_cache()
+        if "esd" not in skip_here:
+            a_esd, lrows = spectra.model_alpha_esd(model, rng=rng)
+            row["alpha_esd"] = a_esd
+            esd_rows.extend({**r, "repo": repo, "step": step} for r in lrows)
+        if "act" not in skip_here or "dh" not in skip_here:
+            hs = lm.hidden_states(model, probe_v, dev)
+            if "act" not in skip_here:
+                ks = []
+                for li, H in enumerate(hs):
+                    st = spectra.activation_stats(H)
+                    act_rows.append({**st, "layer": li, "repo": repo, "step": step})
+                    ks.append(st)
+                row["K"] = float(np.median([s["K"] for s in ks]))
+                row["K_max"] = float(np.max([s["K"] for s in ks]))
+                row["Kurt0"] = float(np.median([s["Kurt0"] for s in ks]))
+                row["n_outlier_channels"] = int(np.sum([s["n_outlier_channels"] for s in ks]))
+                row["act_zeta"] = float(np.nanmedian([s.get("act_zeta", np.nan) for s in ks]))
+            if "dh" not in skip_here:
+                X = hs[-1].numpy()
+                if len(X) > cfg["dh_points"]:
+                    X = X[rng.choice(len(X), cfg["dh_points"], replace=False)]
+                d = multifractal.delta_h_rep(X, S["q_lo"], S["q_hi"], rng=rng,
+                                             n_centres=min(5000, len(X)))
+                row.update({"dh_rep": d["delta_h_rep"], "dh_scope": d["scope"], "dh_D2": d["D2"],
+                            "dh_clause_ok": d["clause_ok"], "dh_decades": d["decades_r"]})
+            del hs
+        if "htok" not in skip_here:
+            series = lm.token_losses(model, sur_v, dev).reshape(-1).numpy()
+            m = hurst.memory_claim(series, n_surr=S["n_surr"], rng=rng, wavelet_j1=S["wavelet_j1"])
+            row.update({f"Htok_{k}": v for k, v in m.items()})
+            row["H_dep"] = m["H_dep_dfa"]  # exploratory stand-in in the coupling matrix
+        if "grad" not in skip_here:
+            B = cfg["coupling_B"]
+            n = cfg["coupling_blocks"] * B
+            params, dirs = directions(model, pool_v[:cfg["hessian_batch"]], dev, cfg["n_random_dirs"], 0, run.seed)
+            P = jvp_projections(model, pool_v[:n], params, [d for _, _, d in dirs], dev, args.jvp_batch)
+            q = noise_quantities(P[:, 0], B, cfg["coupling_blocks"], T, rng)
+            row.update(q)
+        # H7.1 at the four training stages
+        h71_size = size in h71cfg["full_res_sizes"] or size in h71cfg["coarse_sizes"]
+        stage_hit = any(abs(frac - st) < 0.02 or (st >= 0.999 and step == final) for st in stages)
+        if "h71" not in skip_here and h71_size and stage_hit and suite == "pythia":
+            nb = h71cfg.get("n_blocks", config.H71["n_blocks"]) if size in h71cfg["full_res_sizes"] else h71cfg["coarse_blocks"]
+            n_pool = nb * max(h71_Bs)
+            params, dirs = directions(model, pool_v[:cfg["hessian_batch"]], dev,
+                                      cfg["n_random_dirs"], cfg["n_hessian_dirs"], run.seed)
+            P = jvp_projections(model, pool_v[:n_pool], params, [d for _, _, d in dirs], dev, args.jvp_batch)
+            for j, (kind, i, _) in enumerate(dirs):
+                res = batchmod.h71_test(P[:, j], h71_Bs, nb, n_boot=h71cfg.get("n_boot", config.H71["n_boot"]),
+                                        rng=rng)
+                meta = {"repo": repo, "commit": row["commit"], "size": size, "step": step, "stage": round(frac, 3),
+                        "direction": f"{kind}{i}"}
+                h71_rows.extend({**meta, **r} for r in res["per_B"])
+                h71_summ.append({**meta, **res["summary"]})
+        if step == final and "scaling" not in skip_here:
+            row["eval_loss"] = float(lm.token_losses(model, evals_v, dev).mean())
+        rows.append(row)
+        run.note(f"{repo}@{rev} [{tag}]: done")
+        del model
+        if dev.startswith("cuda"):
+            torch.cuda.empty_cache()
+        if src == "hub" and not args.keep_cache:
+            hf.purge_revision(repo, pin.get("commit"), run)   # disk holds about one checkpoint at a time
+        reads[tag] = reads.get(tag, 0) + 1
+        return row
+
+
+    def available(suite, repo):
+        """step -> branch of one repo (offline stand-in: the configured steps plus the spike scan grid)."""
+        fallback = list(cfg["steps"])
+        if sc and suite == sc["suite"]:
+            fallback += scan_grid(sc)
+        return hf.list_steps(repo, run, fallback, branch_regex=cfg["suites"][suite].get("branch_regex", r"^step(\d+)$"))
+
+    def pin_all(repo, revs, tag):
+        for rev in revs:
+            try:
+                hf.PINS.resolve(repo, rev, run)
+                pinned[tag].append(hf.PINS.key(repo, rev))
+            except Exception as e:  # noqa: BLE001  report every missing name, then fail
+                run.note(f"PIN FAILED {repo}@{rev}: {type(e).__name__}: {str(e)[:160]}")
+
+    pinned: dict = {"grid": [], "spike_a": []}
+    reads: dict = {}
+
+    # ---- main grid
+    if not args.spike_only:
+        for suite in suites:
+            for size, seed, repo, variant in suite_models(cfg, suite):
+                if args.sizes and size not in args.sizes.split(","):
+                    continue
+                steps_avail = available(suite, repo)
+                final = max(steps_avail)
+                chosen = hf.nearest_steps(steps_avail, wanted_steps(cfg, suite, size, steps_avail))
+                if args.pin_only:
+                    pin_all(repo, [rev for _, rev in chosen], "grid")
+                    continue
+                for step, rev in chosen:
+                    read_checkpoint(suite, size, seed, repo, variant, step, rev, final, skip, "grid")
+
+    # ---- loss-spike check, pass (a): probe loss at every scan step, flagged seeds and the stable reference
+    spike_rows, windows = [], []
+    do_spike = bool(sc) and "spike" not in skip and sc["suite"] in suites and (
+        not args.sizes or sc["size"] in args.sizes.split(","))
+    if do_spike:
+        variant = cfg["suites"][sc["suite"]].get("variant", "base")
+        repo_of = {seed: repo for size, seed, repo, _ in suite_models(cfg, sc["suite"]) if size == sc["size"]}
+        skip_a = skip | {"esd", "act", "dh", "htok", "grad", "h71", "scaling"}
+        for seed in list(sc["flagged_seeds"]) + list(sc["reference_seeds"]):
+            repo = repo_of[seed]
+            avail = available(sc["suite"], repo)
+            steps = scan_steps(avail, sc)
+            if args.pin_only:
+                pin_all(repo, [avail[st] for st in steps], "spike_a")
+                continue
+            for st in steps:
+                read_checkpoint(sc["suite"], sc["size"], seed, repo, variant, st, avail[st], max(avail), skip_a, "spike_a")
+        if not args.pin_only:
+            df_a = pd.DataFrame([r for r in rows if r["pass"] == "spike_a"])
+            a_out = loss_jumps(df_a, sc)
+            spike_rows += a_out
+            jumps = [(r["step_from"], r["step_to"]) for r in a_out if r["jump"]]
+            if not jumps and run.smoke and sc.get("smoke_force_top") and a_out:
+                top = max(a_out, key=lambda r: r["robust_z"] if np.isfinite(r["robust_z"]) else -np.inf)
+                jumps = [(top["step_from"], top["step_to"])]
+                run.note(f"smoke: no loss jump found; pass (b) runs around the largest z ({top['step_to']}) to exercise the code")
+            windows = merge_windows(jumps, sc["window"])
+
+            # ---- pass (b): alpha, alpha_ESD and K for every seed of that size around each jump
+            skip_b = skip | {"dh", "htok", "h71", "scaling"}
+            for seed, repo in repo_of.items():
+                avail = available(sc["suite"], repo)
+                for lo, hi, js in windows:
+                    for st in [x for x in scan_steps(avail, sc) if lo <= x <= hi]:
+                        row = read_checkpoint(sc["suite"], sc["size"], seed, repo, variant, st, avail[st], max(avail),
+                                              skip_b, "spike_b")
+                        row["spike_window"] = f"{lo}-{hi}"
+            df_b = pd.DataFrame([r for r in rows if r["pass"] == "spike_b"])
+            for lo, hi, js in windows:
+                w = df_b[df_b.spike_window == f"{lo}-{hi}"] if len(df_b) else df_b
+                if not len(w):
+                    continue
+                for r in spike_check(w, sc):
+                    spike_rows.append({"pass": "b", "window": f"{lo}-{hi}",
+                                       "loss_jump_steps": ";".join(f"{a}-{b}" for a, b in js), **r})
 
     extra = {}
     if args.pin_only:
-        failed = [m for m in run.notes if m.startswith("PIN FAILED")] if hasattr(run, "notes") else []
+        failed = [m for m in run.notes if m.startswith("PIN FAILED")]
         extra["pins_resolved"] = len(run.pins)
+        extra["download"] = {}
+        for tag, keys in pinned.items():
+            sizes = [(hf.PINS.data.get(k) or {}).get("weights_bytes") for k in dict.fromkeys(keys)]
+            known = [b for b in sizes if b]
+            extra["download"][tag] = {"checkpoints": len(sizes), "with_size": len(known),
+                                      "GB": round(sum(known) / 1e9, 1)}
+            run.note(f"download for {tag}: {len(sizes)} checkpoints, {sum(known) / 1e9:.1f} GB "
+                     f"({len(known)} with a known size)")
         runtime.finish_run(run, extra=extra)
         if failed:
             raise SystemExit(f"{len(failed)} name(s) could not be pinned; see run.json notes")
@@ -357,7 +488,7 @@ def main():
         runtime.finish_run(run, extra=extra)
         return
     df["family"] = df["suite"] + ":" + df["seed"].astype(str)
-    full = df[~df.spike_grid_only]   # the spike-only steps enter only the spike check
+    full = df[df["pass"] == "grid"]   # the spike passes enter only spike_check.csv
 
     # a_N per family (suite, seed) from final eval losses; a fit needs at least three sizes
     if "eval_loss" in full:
@@ -373,13 +504,16 @@ def main():
     sv = seed_variance(full)
     runtime.write_csv(run.out_dir / "seed_variance.csv", sv)
 
-    # loss-spike seeds: do alpha, alpha_ESD or K jump where the loss does?
-    if sc and "spike" not in skip:
-        sp = spike_check(df, sc)
-        runtime.write_csv(run.out_dir / "spike_check.csv", sp)
+    # loss-spike seeds: pass (a) loss jumps, pass (b) do alpha, alpha_ESD or K jump around them?
+    if do_spike:
+        runtime.write_csv(run.out_dir / "spike_check.csv", spike_rows)
+        pick = ("pass", "quantity", "seed", "step_from", "step_to", "robust_z")
         extra["spike_check"] = {"suite": sc["suite"], "size": sc["size"], "flagged_seeds": sc["flagged_seeds"],
-                                "jumps": [{k: r[k] for k in ("quantity", "seed", "step_from", "step_to", "robust_z")}
-                                          for r in sp if r["jump"]]}
+                                "reference_seeds": sc["reference_seeds"],
+                                "loss_jumps": [{k: r[k] for k in pick} for r in spike_rows if r["pass"] == "a" and r["jump"]],
+                                "windows": [f"{lo}-{hi}" for lo, hi, _ in windows],
+                                "quantity_jumps": [{k: r[k] for k in pick} for r in spike_rows
+                                                   if r["pass"] == "b" and r["jump"]]}
 
     # exploratory coupling across seeds within (suite, size) cells (final checkpoints); a_N per family
     if "coupling" not in skip:
@@ -400,6 +534,7 @@ def main():
         else:
             run.note("coupling matrix skipped: needs >= 3 seeds in one (suite, size) cell and >= 2 quantities")
     extra["n_checkpoints"] = len(rows)
+    extra["checkpoints_read"] = reads
     runtime.finish_run(run, extra=extra)
 
 

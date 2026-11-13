@@ -80,8 +80,6 @@ CONFIG = {
                                "seeds": [1, 2, 3, 4, 5, 6, 7, 8, 9], "variant": "joint"},
                 "polypythia_data": {"repo": "EleutherAI/pythia-160m-data-seed{seed}", "sizes": ["160m"],
                                     "seeds": [1, 2, 3], "variant": "data"},
-                # [VERIFY] repo name: the PolyPythias collection lists the initialization-only runs as
-                # pythia-160m-weight-seed{n}; confirm on the Hub (hf.Pins fails loudly if the name is wrong)
                 "polypythia_weight": {"repo": "EleutherAI/pythia-160m-weight-seed{seed}", "sizes": ["160m"],
                                       "seeds": [1, 2, 3], "variant": "weight"},
                 # default OLMo: OLMo 2 1B (April 2025) with released pretraining checkpoints, fits the RTX 5090
@@ -94,16 +92,20 @@ CONFIG = {
                            "step_fracs": [0.002, 0.01, 0.1, 0.5, 1.0]},
             },
             "steps": [1, 8, 64, 512, 1000, 4000, 8000, 16000, 32000, 64000, 143000],   # Pythia-style suites
-            # Loss spikes (PolyPythias paper, Fig. 5): 410M seeds 3 and 4. Every 410M PolyPythias seed is read
-            # at the extra steps too, so the flagged seeds are compared with the other seeds at the same steps.
-            # [VERIFY] the extra steps against Fig. 5 (the paper gives no step numbers; the runs deviate early).
+            # Loss spikes (PolyPythias paper, Fig. 5, which gives no step numbers): 410M seeds 3 and 4. Two passes:
+            # (a) probe loss only, at every 1,000-step checkpoint, for the flagged seeds and one stable seed;
+            # (b) alpha, alpha_ESD and K for all nine 410M seeds at every 1,000-step checkpoint from
+            #     window steps before to window steps after each jump that pass (a) finds (same robust-z rule).
             "spike_check": {"suite": "polypythia", "size": "410m", "flagged_seeds": [3, 4],
-                            "extra_steps": [2000, 3000, 5000, 6000, 10000, 12000, 20000, 24000, 48000, 96000, 120000],
-                            "quantities": ["probe_loss", "alpha", "alpha_esd", "K"],
-                            "robust_z": 3.5},   # OURS: a jump is |dq| above every other seed and robust z > 3.5
-            # pythia-14m / pythia-31m switched from the deduplicated to the standard-Pile models in Feb 2026;
+                            "reference_seeds": [1],          # OURS: the stable seed (any seed other than 3 and 4)
+                            "scan_every": 1000, "scan_range": [1000, 143000],
+                            "window": 5000,
+                            "quantities": ["alpha", "alpha_esd", "K"],
+                            "robust_z": 3.5},                # OURS: the threshold in both passes
+            # pythia-14m / pythia-31m switched from the deduplicated to the standard-Pile models on 27 February 2026
+            # (their model cards);
             # commits of these names dated before the switch are flagged in checkpoints.csv
-            "name_switch": {"repos": ["EleutherAI/pythia-14m", "EleutherAI/pythia-31m"], "date": "2026-02-01"},
+            "name_switch": {"repos": ["EleutherAI/pythia-14m", "EleutherAI/pythia-31m"], "date": "2026-02-27"},
             "final_step": 143000,
             "dtype": "float32",
             "pool_dataset": ["monology/pile-uncopyrighted", None, "train"],  # Pile text without the copyrighted subsets
@@ -129,8 +131,10 @@ CONFIG = {
                        "polypythia_data": {"repo": "EleutherAI/pythia-{size}-data-seed{seed}", "sizes": ["14m"],
                                            "seeds": [1], "variant": "data"}},
             "steps": [1000, 143000], "final_step": 143000,
-            "spike_check": {"suite": "polypythia", "size": "14m", "flagged_seeds": [3], "extra_steps": [4000],
-                            "quantities": ["probe_loss", "alpha_esd", "K"], "robust_z": 3.5},
+            # smoke_force_top: if pass (a) finds no jump in the stand-in models, pass (b) runs around the largest z
+            "spike_check": {"suite": "polypythia", "size": "14m", "flagged_seeds": [3], "reference_seeds": [1],
+                            "scan_every": 1000, "scan_range": [1000, 6000], "window": 1000,
+                            "quantities": ["alpha", "alpha_esd", "K"], "robust_z": 3.5, "smoke_force_top": True},
             "example_len": 32, "n_random_dirs": 1, "n_hessian_dirs": 1, "hessian_batch": 8,
             "coupling_blocks": 40, "probe_seqs": 4, "probe_len": 64, "dh_points": 256,
             "surprisal_docs": 2, "surprisal_len": 512,

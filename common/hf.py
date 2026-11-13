@@ -27,7 +27,7 @@ class Pins:
     pins.json maps "repo@revision" (revision = branch such as step1000, or "main") to the commit the
     pilot uses, with the commit's date. The first run that meets a new name resolves it on the Hub
     and writes it here; commit pins.json, and later runs (or --require-pins) reuse exactly those
-    commits. This matters for Pythia: in February 2026 the pythia-14m and pythia-31m names switched
+    commits. This matters for Pythia: on 27 February 2026 the pythia-14m and pythia-31m names switched
     from the deduplicated to the standard-Pile models, so a name alone does not fix the weights.
     """
 
@@ -53,10 +53,13 @@ class Pins:
                 raise KeyError(f"{k} is not pinned in {self.path.name} (run once without --require-pins to pin it)")
             from huggingface_hub import HfApi
             api = HfApi()
-            sha = api.model_info(repo, revision=revision).sha
+            info = api.model_info(repo, revision=revision, files_metadata=True)
+            sha = info.sha
             entry = {"commit": sha, "resolved_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")}
-            try:
-                entry["commit_date"] = api.list_repo_commits(repo, revision=sha)[0].created_at.isoformat()
+            entry["weights_bytes"] = weights_bytes(info.siblings or [])
+            try:  # the revision's last commit; fall back to the commit list if the Hub omits it
+                date = info.last_modified or api.list_repo_commits(repo, revision=sha)[0].created_at
+                entry["commit_date"] = date.isoformat()
             except Exception:  # noqa: BLE001  the date is informative only
                 pass
             self.data[k] = entry
@@ -75,6 +78,31 @@ class Pins:
 
 
 PINS = Pins()
+
+
+def weights_bytes(siblings) -> int | None:
+    """Bytes from_pretrained downloads for the weights: the safetensors files if any, else the .bin files."""
+    sizes = {f.rfilename: f.size for f in siblings if getattr(f, "size", None)}
+    st = sum(v for k, v in sizes.items() if k.endswith(".safetensors"))
+    bn = sum(v for k, v in sizes.items() if k.endswith(".bin"))
+    return (st or bn) or None
+
+
+def purge_revision(repo: str, commit: str | None, run=None) -> None:
+    """Delete one revision of a model from the local Hugging Face cache (the loss-spike scan reads hundreds
+    of checkpoints; keeping them would need hundreds of GB of disk)."""
+    if not commit:
+        return
+    try:
+        from huggingface_hub import scan_cache_dir
+        cache = scan_cache_dir()
+        hashes = [rv.commit_hash for r in cache.repos if r.repo_id == repo for rv in r.revisions
+                  if rv.commit_hash == commit]
+        if hashes:
+            cache.delete_revisions(*hashes).execute()
+    except Exception as e:  # noqa: BLE001  a failed purge costs disk, not correctness
+        if run is not None:
+            run.note(f"cache purge of {repo}@{commit[:10]} failed: {type(e).__name__}: {str(e)[:120]}")
 
 PYTHIA_14M = dict(vocab_size=50304, hidden_size=128, num_hidden_layers=6, num_attention_heads=4,
                   intermediate_size=512, max_position_embeddings=2048, rotary_pct=0.25,

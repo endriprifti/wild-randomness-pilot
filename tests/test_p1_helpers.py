@@ -35,24 +35,61 @@ def test_pins_save_merges_with_file(tmp_path):
     assert set(json.loads(path.read_text())) == {"x@main", "y@main"}
 
 
-def test_wanted_steps_spike_grid_and_olmo_fractions():
+def test_wanted_steps_and_scan_grid():
     cfg = config.get("p1_checkpoints")
-    avail = {s: f"step{s}" for s in range(0, 143001, 1000)}
-    w, only = p1.wanted_steps(cfg, "polypythia", "410m", avail)
-    assert set(cfg["spike_check"]["extra_steps"]) <= set(w)
-    assert 64000 not in only and 3000 in only                                 # regular steps stay full reads
-    w14, only14 = p1.wanted_steps(cfg, "polypythia", "14m", avail)
-    assert not only14 and 3000 not in w14
+    avail = {s: f"step{s}" for s in [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512] + list(range(1000, 143001, 1000))}
+    w = p1.wanted_steps(cfg, "polypythia", "410m", avail)
+    assert w == sorted(cfg["steps"])                                           # no spike steps in the main grid
+    sc = cfg["spike_check"]
+    steps = p1.scan_steps(avail, sc)
+    assert steps[0] == 1000 and steps[-1] == 143000 and len(steps) == 143      # every 1,000-step checkpoint
     olmo = {s: f"stage1-step{s}-tokens{s // 250}B" for s in range(0, 1_900_001, 10_000)}
-    wo, _ = p1.wanted_steps(cfg, "olmo", "1b", olmo)
+    wo = p1.wanted_steps(cfg, "olmo", "1b", olmo)
     assert max(wo) == 1_900_000 and min(wo) >= 1
     assert "olmo7b" not in p1.default_suites(cfg) and "olmo" in p1.default_suites(cfg)
+
+
+def _loss_frame(spike_seed=3, spike_at=23000, size=0.5, seeds=(1, 3, 4)):
+    rng = np.random.default_rng(1)
+    rows = []
+    for seed in seeds:
+        for st in range(1000, 61001, 1000):
+            loss = 2.5 + 8.0 / np.sqrt(st / 1000) + rng.normal(0, 0.005)
+            if seed == spike_seed and spike_at <= st < spike_at + 2000:        # spike, recovered 2,000 steps later
+                loss += size
+            rows.append({"suite": "polypythia", "size": "410m", "seed": seed, "step": st, "probe_loss": loss})
+    return pd.DataFrame(rows)
+
+
+def test_loss_jumps_find_the_spike_onset_net_of_the_stable_seed():
+    sc = {"suite": "polypythia", "size": "410m", "flagged_seeds": [3, 4], "reference_seeds": [1], "robust_z": 3.5}
+    out = pd.DataFrame(p1.loss_jumps(_loss_frame(), sc))
+    hit = out[out.jump]
+    assert list(zip(hit.seed, hit.step_from, hit.step_to)) == [(3, 22000, 23000)]   # the onset, not the recovery
+    assert not out[(out.seed == 4)].jump.any()                                     # the steep early descent is no jump
+    assert not pd.DataFrame(p1.loss_jumps(_loss_frame(size=0.0), sc)).jump.any()
+
+
+def test_merge_windows():
+    assert p1.merge_windows([(22000, 23000)], 5000) == [(17000, 28000, [(22000, 23000)])]
+    w = p1.merge_windows([(30000, 31000), (22000, 23000), (60000, 61000)], 5000)
+    assert w == [(17000, 36000, [(22000, 23000), (30000, 31000)]), (55000, 66000, [(60000, 61000)])]
+    assert p1.merge_windows([], 5000) == []
+
+
+def test_weights_bytes_prefers_safetensors():
+    f = lambda n, b: types.SimpleNamespace(rfilename=n, size=b)  # noqa: E731
+    assert hf.weights_bytes([f("model.safetensors", 911), f("pytorch_model.bin", 911), f("tokenizer.json", 2)]) == 911
+    assert hf.weights_bytes([f("pytorch_model.bin", 500), f("config.json", 1)]) == 500
+    assert hf.weights_bytes([f("config.json", 1)]) is None
 
 
 def test_name_switch_flag():
     cfg = config.get("p1_checkpoints")
     assert p1.name_switch_flag(cfg, "EleutherAI/pythia-14m", "2025-11-01T00:00:00").startswith("CHECK")
-    assert p1.name_switch_flag(cfg, "EleutherAI/pythia-31m", "2026-02-15T00:00:00") == "after switch"
+    assert p1.name_switch_flag(cfg, "EleutherAI/pythia-31m", "2026-02-15T00:00:00").startswith("CHECK")  # before 27 Feb
+    assert p1.name_switch_flag(cfg, "EleutherAI/pythia-31m", "2026-02-27T09:00:00") == "after switch"
+    assert p1.name_switch_flag(cfg, "EleutherAI/pythia-14m", "2026-03-02T00:00:00") == "after switch"
     assert p1.name_switch_flag(cfg, "EleutherAI/pythia-70m", "2020-01-01") == ""
     assert p1.name_switch_flag(cfg, "EleutherAI/pythia-14m", None).startswith("unknown")
 
@@ -71,7 +108,7 @@ def _spike_frame(jump_seed=3, jump_at=5000, size=1.0):
     return pd.DataFrame(rows)
 
 
-def test_spike_check_finds_a_jump_only_where_it_is():
+def test_pass_b_spike_check_finds_a_jump_only_where_it_is():
     sc = {"suite": "polypythia", "size": "410m", "flagged_seeds": [3, 4], "quantities": ["alpha_esd", "K"], "robust_z": 3.5}
     out = pd.DataFrame(p1.spike_check(_spike_frame(), sc))
     hit = out[out.jump]

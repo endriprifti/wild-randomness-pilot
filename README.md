@@ -34,7 +34,7 @@ WSL2, **T4** = Kaggle's 16 GB T4 (not the P100, see below), **5090** = RTX 5090 
 | 2 | Escape grid, H3.3 / H6.1 | 25 | 4 GB, T4, 5090 | `python p5_escape.py` and `python p5_escape.py --part h31` |
 | 3 | W4A4 and weight-only, H6.2 (simulated quantization) | 30 | 5090 (Pythia-6.9B and OLMo-7B in fp16, about 14 GB each); L40S also fine | `python p2_w4a4.py` (one model: `--models EleutherAI/pythia-6.9b`) |
 | 4 | Clipping sweep, H6.1 / H7.1 control | 30 | T4, 5090 | `python p4_clipping.py --model transformer` and `python p4_clipping.py --model resnet18` |
-| 5 | Checkpoint measurements | 45 | Pythia and PolyPythias: T4 (up to 410M), 5090 (up to 1.4B); OLMo 2 1B: 5090 | `python p1_checkpoints.py --pin-only`, then `--suite pythia`, `--suite polypythia,polypythia_data,polypythia_weight`, `--suite olmo` |
+| 5 | Checkpoint measurements, with the 410M loss-spike check (pass (a) downloads about 391 GB, see below) | 45 | Pythia and PolyPythias: T4 (up to 410M), 5090 (up to 1.4B); OLMo 2 1B: 5090 | `python p1_checkpoints.py --pin-only`, then `--suite pythia`, `--suite polypythia,polypythia_data,polypythia_weight`, `--suite olmo` |
 | 6 | Fractional memory, H4.1 | 65 | T4, 5090 | `python p3_fractional_memory.py` (drop LRA first if time runs short: `--tasks powerlaw,exponential`) |
 | 7 | **Optional, last:** OLMo 2 7B checkpoints | not in the 45 (ours: ~10) | **L40S** (fp32 weights plus per-example JVP exceed 32 GB) | `python p1_checkpoints.py --suite olmo7b`, only if credits remain |
 
@@ -130,11 +130,33 @@ No job has to move to the L40S because of a missing Blackwell kernel. The only L
 `seed_variance.csv` gives the spread across seeds for the joint, data-only and initialization-only 160M runs at the
 same steps, with each spread's ratio to the joint one.
 
-**Loss-spike check.** The 410M seeds 3 and 4 had loss spikes in the PolyPythias runs. P1 also reads every 410M seed
-at extra early steps (2,000 to 120,000) and records the probe-set loss at every checkpoint. `spike_check.csv` then
-asks, for probe loss, α, α_ESD and K, whether a flagged seed's change between two consecutive steps is larger than
-every other seed's and more than 3.5 robust z (median and MAD of the other seeds' changes) above them. The extra
-steps measure only these four quantities. `checkpoints.csv` marks the flagged seeds in `loss_spike_seed`.
+**Loss-spike check.** The 410M seeds 3 and 4 had loss spikes in the PolyPythias runs. The paper gives no step
+numbers (Fig. 5 has ticks only at 0, 1k, 3k, 13k, 43k, 93k and 143k), and a spike that recovers between two
+widely spaced reads would be missed. So the check runs in two passes, both part of `--suite polypythia`
+(`--spike-only` runs just these):
+
+- **Pass (a), loss scan.** Probe-set loss only, at every 1,000-step checkpoint (1,000 to 143,000), for seeds 3
+  and 4 and one stable seed (seed 1, ours). For each flagged seed, the loss change between consecutive
+  checkpoints minus the stable seed's change over the same interval removes the common downward trend. A
+  jump is an increase more than 3.5 robust z (median and MAD over all of that seed's intervals) above the rest.
+- **Pass (b), local reads.** α, α_ESD and K for all nine 410M seeds at every 1,000-step checkpoint from 5,000
+  steps before to 5,000 steps after each jump that pass (a) finds (windows that overlap are merged). A flagged
+  seed's change counts as a jump if it is larger than every other seed's change over the same interval and
+  more than 3.5 robust z (median and MAD of the other seeds' changes) above them.
+
+`spike_check.csv` holds both passes: the `pass` column (a or b), the loss-jump steps (`step_from`, `step_to`
+in pass (a); `window` and `loss_jump_steps` in pass (b)) and, per row, the robust z and the `jump` verdict.
+`run.json` lists the jumps under `spike_check`. `checkpoints.csv` marks each row's pass in `pass` and the
+flagged seeds in `loss_spike_seed`. A spike that starts and fully recovers within 1,000 steps is still
+invisible at this resolution.
+
+**Download volume.** Pass (a) reads 3 seeds × 143 checkpoints = 429 checkpoints of 410M. At 911 MB per checkpoint
+(the size of `pythia-410m`'s `model.safetensors` on the Hub; the PolyPythias checkpoints are assumed to be the
+same size), that is about **391 GB** of downloads, roughly 2 hours at 50 MB/s; the compute (one forward pass on
+the probe set per checkpoint) is minutes. Pass (b) adds up to 9 seeds × 12 checkpoints = 108 checkpoints, about
+98 GB, per jump window. Every checkpoint is deleted from the Hugging Face cache right after it is read, so the
+disk holds about one checkpoint at a time (`--keep-cache` turns this off). `--pin-only` reads the exact file sizes
+from the Hub and writes the total for the main grid and for pass (a) to `run.json` (`results.download`).
 
 ### Pinned commits
 
@@ -142,13 +164,16 @@ Every Hub model (Pythia, PolyPythias, OLMo, P2's models and P4's tokenizer) is l
 branch name. `pins.json` maps `repo@revision` to the commit and its date. The first run that meets a new name
 resolves it on the Hub and writes it to `pins.json`; commit that file, and every later run loads exactly those
 commits. `--require-pins` makes a job fail instead of resolving a name that is not pinned yet.
-`python p1_checkpoints.py --pin-only` pins every P1 checkpoint without measuring anything (a CPU is enough). Each
+`python p1_checkpoints.py --pin-only` pins every P1 checkpoint of the main grid and of pass (a) without measuring
+anything (a CPU is enough; set `HF_TOKEN`, since this is about 1,100 names and one Hub API call each; rerun it if
+some fail, already pinned names are skipped). Pass (b)'s checkpoints depend on what pass (a) finds, so they are
+pinned when pass (b) runs: run it without `--require-pins` and commit the updated `pins.json` afterwards. Each
 `run.json` lists the commits it loaded under `pinned_commits`, and `checkpoints.csv` has `commit` and `commit_date`
 columns.
 
-This matters for Pythia: in February 2026 the `pythia-14m` and `pythia-31m` names switched from the deduplicated to
-the standard-Pile models. For these two names, `checkpoints.csv` flags (`name_switch_check`) any commit dated
-before 2026-02-01. Confirm such a commit on its model card before using it.
+This matters for Pythia: on 27 February 2026 the `pythia-14m` and `pythia-31m` names switched from the deduplicated
+to the standard-Pile models (see their model cards). For these two names, `checkpoints.csv` flags
+(`name_switch_check`) any commit dated before 2026-02-27. Confirm such a commit on its model card before using it.
 
 ## Emmy
 
@@ -185,7 +210,7 @@ before the run.
 
 ## Unit tests
 
-`python -m pytest -q` (78 tests, about 80 s on a CPU; `-m "not slow"` skips the two slowest). Synthetic data with
+`python -m pytest -q` (81 tests, about 80 s on a CPU; `-m "not slow"` skips the two slowest). Synthetic data with
 known parameters:
 
 - stable density against the Gaussian and Cauchy closed forms and against SciPy; ML fit recovers α ∈ {1.2, 1.5, 1.8},
@@ -204,9 +229,10 @@ known parameters:
   response t^(ν−1) E_{ν,ν}(−λ t^ν), and parameter matching across SSM arms;
 - tail labels: alternatives that cannot be separated read "undecided"; exponential against Weibull uses the
   likelihood-ratio test;
-- P1 bookkeeping: commit pins (reuse, --require-pins, merge on save), step choice for the spike grid and OLMo,
-  the pythia-14m/31m name-switch flag, the loss-spike check (finds a planted jump, and only that one) and the
-  seed-variance table;
+- P1 bookkeeping: commit pins (reuse, --require-pins, merge on save), the weight bytes counted for the download
+  volume, step choice for the main grid, the 1,000-step scan and OLMo, the pythia-14m/31m name-switch flag
+  (15 February 2026 is flagged), both loss-spike passes (each finds a planted spike at its onset, and only
+  there), window merging, and the seed-variance table;
 - the Emmy check's streaming kurtosis and logit metrics, and the fast-math lanes' environments.
 
 ## Deviations, choices of ours, and items to verify
@@ -233,14 +259,16 @@ known parameters:
 - **Placeholders for the preregistration**, marked OURS in `config.py`:
   - hill_tol 0.15, the q range 0.5 to 4, min_tail 50 and the x_min candidate grid;
   - coupling_B 8, the barrier tolerance, η values and g_max quantiles;
+  - the loss-spike check's stable seed (seed 1), robust-z threshold 3.5 and ±5,000-step windows;
   - the Emmy tolerances.
 - **[VERIFY]** items:
   - `monology/pile-uncopyrighted` stands in for the Pile (P1's gradient pool and evaluation text);
-  - the repository name of the 160M initialization-only runs (`pythia-160m-weight-seed{n}`). A wrong name fails
-    at pinning, not silently;
-  - the extra steps of the 410M loss-spike check, which should cover the spikes in Fig. 5 of the PolyPythias paper
-    (the paper gives no step numbers);
   - the ZClip update rule (`common/clipping.py`).
+
+## License and citation
+
+MIT (see `LICENSE`). To cite this code or the paper it accompanies, use `CITATION.cff` (GitHub's "Cite this
+repository" button reads it).
 
 ## Acknowledgement
 

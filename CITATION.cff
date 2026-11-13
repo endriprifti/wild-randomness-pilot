@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite the paper it accompanies."
+type: software
+title: "Pilot code for: Testing Mandelbrot's States of Randomness in Deep Learning: Mild, Slow or Wild?"
+authors:
+  - family-names: Prifti
+    given-names: Endri
+    affiliation: "Independent researcher, Tirana, Albania"
+license: MIT
+repository-code: "https://github.com/endriprifti/wild-randomness-pilot"
+url: "https://github.com/endriprifti/wild-randomness-pilot"
+date-released: "2026-11-13"
+keywords:
+  - heavy tails
+  - stable distributions
+  - long memory
+  - multifractals
+  - deep learning
+preferred-citation:
+  type: article
+  title: "Testing Mandelbrot's States of Randomness in Deep Learning: Mild, Slow or Wild?"
+  authors:
+    - family-names: Prifti
+      given-names: Endri
+      affiliation: "Independent researcher, Tirana, Albania"
+  year: 2026
+  url: "https://github.com/endriprifti/wild-randomness-pilot"
