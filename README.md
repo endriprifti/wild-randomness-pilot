@@ -188,8 +188,11 @@ pinned when pass (b) runs: run it without `--require-pins` and commit the update
 columns.
 
 The committed `pins.json` comes from `--pin-only` on 2026-11-13: 1,067 commits for the main grid and pass (a)
-(OLMo 2 7B and pass (b) are not pinned yet). By the Hub's file sizes, pass (a) is 429 checkpoints and 391.0 GB, and
-all 1,067 checkpoints together are 739.9 GB.
+(OLMo 2 7B and pass (b) are not pinned yet). By the Hub's file sizes, the main grid is 654 checkpoints and 367.7 GB,
+pass (a) is 429 checkpoints and 391.0 GB, and all 1,067 checkpoints together are 739.9 GB (the two passes share
+some checkpoints). A second `--pin-only` run at a492897 added the name-switch content check (below) for the 26
+pinned `pythia-14m`/`pythia-31m` checkpoints of P1: every one differs from its `-deduped` twin, and every one is
+dated after the switch. The hashes and `-deduped` commits are in each entry's `deduped_check`.
 
 This matters for Pythia. On 24 February 2026 the `pythia-14m` and `pythia-31m` repositories were re-created with
 the standard-Pile models: `pythia-14m` step143000 has three commits, all from that day ("initial commit",

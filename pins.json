@@ -693,79 +693,209 @@
   "commit": "a5a6c6adfd6e48b43682e231c1c30cc674545f0e",
   "resolved_utc": "2026-11-13T15:48:14+00:00",
   "weights_bytes": 28143920,
-  "commit_date": "2026-02-24T21:30:25+00:00"
+  "commit_date": "2026-02-24T21:30:25+00:00",
+  "deduped_check": {
+   "dedup_repo": "EleutherAI/pythia-14m-deduped",
+   "dedup_revision": "step1",
+   "dedup_commit": "bfe6b7ef40120824c5650abd8104e0a59cafe272",
+   "weights_file": "model.safetensors",
+   "weights_sha256": "495e509ae82ddbe9cf39558a13b10973822c7bcedd0c6fd7d3225620b9e2edb5",
+   "dedup_sha256": "4446ea0b726996542b2b5f76534a41267e139c9f240b59b03950c3b0d54ba4fb",
+   "dedup_check": "differs from EleutherAI/pythia-14m-deduped@step1",
+   "dedup_checked_utc": "2026-11-13T17:44:32+00:00"
+  }
  },
  "EleutherAI/pythia-14m@step1000": {
   "commit": "5b020995bfc7aee2931b0f35bd70cf7ee8b1db62",
   "resolved_utc": "2026-11-13T15:48:15+00:00",
   "weights_bytes": 28143920,
-  "commit_date": "2026-02-24T21:32:04+00:00"
+  "commit_date": "2026-02-24T21:32:04+00:00",
+  "deduped_check": {
+   "dedup_repo": "EleutherAI/pythia-14m-deduped",
+   "dedup_revision": "step1000",
+   "dedup_commit": "d014530a4a3c881ea74b5a9177503a9d50e2607d",
+   "weights_file": "model.safetensors",
+   "weights_sha256": "acc2b8045b54b406bcec99962f91e60202d448a00231669ee3674cab234eb244",
+   "dedup_sha256": "2495fd1fdbf50cab0d265ec339c4d8324b5b0f6e3ba2affffffe9f67263e2da0",
+   "dedup_check": "differs from EleutherAI/pythia-14m-deduped@step1000",
+   "dedup_checked_utc": "2026-11-13T17:44:33+00:00"
+  }
  },
  "EleutherAI/pythia-14m@step14000": {
   "commit": "8a7f290c5d8af7f7c1a56ad32b470d9c674b0fab",
   "resolved_utc": "2026-11-13T15:48:16+00:00",
   "weights_bytes": 28143920,
-  "commit_date": "2026-02-24T21:34:21+00:00"
+  "commit_date": "2026-02-24T21:34:21+00:00",
+  "deduped_check": {
+   "dedup_repo": "EleutherAI/pythia-14m-deduped",
+   "dedup_revision": "step14000",
+   "dedup_commit": "8517f536c0a4cb463394da9dc0c25c8716071ffc",
+   "weights_file": "model.safetensors",
+   "weights_sha256": "2add176d72d258fc9dcd7bd131ad24ce68aec6799ca415dd987a6a64e4aeb15c",
+   "dedup_sha256": "d96124a28f14b524bdfd906f4fb96a4955d8176fc951836be12b19d66d7a32a0",
+   "dedup_check": "differs from EleutherAI/pythia-14m-deduped@step14000",
+   "dedup_checked_utc": "2026-11-13T17:44:34+00:00"
+  }
  },
  "EleutherAI/pythia-14m@step143000": {
   "commit": "f1545025bb394553a7f4e547db0874886f05ef9c",
   "resolved_utc": "2026-11-13T15:34:23+00:00",
   "weights_bytes": 28143920,
-  "commit_date": "2026-02-24T21:29:47+00:00"
+  "commit_date": "2026-02-24T21:29:47+00:00",
+  "deduped_check": {
+   "dedup_repo": "EleutherAI/pythia-14m-deduped",
+   "dedup_revision": "step143000",
+   "dedup_commit": "0412c27fd5dcade8d1ff02273769acfb0c71421b",
+   "weights_file": "model.safetensors",
+   "weights_sha256": "116a02532db461f91386a5b20f942ff2c8d4de7341e21b55caafc3d7b25f49a1",
+   "dedup_sha256": "d03d421ac835a0bfb64b5922acd780b84fac65f5ae84c2db59afa77773112d83",
+   "dedup_check": "differs from EleutherAI/pythia-14m-deduped@step143000",
+   "dedup_checked_utc": "2026-11-13T17:44:36+00:00"
+  }
  },
  "EleutherAI/pythia-14m@step16000": {
   "commit": "1832f3521343e1a8f388214152ac72226d7804d5",
   "resolved_utc": "2026-11-13T15:48:16+00:00",
   "weights_bytes": 28143920,
-  "commit_date": "2026-02-24T21:34:44+00:00"
+  "commit_date": "2026-02-24T21:34:44+00:00",
+  "deduped_check": {
+   "dedup_repo": "EleutherAI/pythia-14m-deduped",
+   "dedup_revision": "step16000",
+   "dedup_commit": "f1d442f17a784d46e407f7b37ba13d6751eb2879",
+   "weights_file": "model.safetensors",
+   "weights_sha256": "9a6b6e44eb4bfcd4eeb838ebd6787d29f5d32c7007cdce49c9431355d6a18875",
+   "dedup_sha256": "e0cb40d68aaabe8549b5462e08b9bb1f541cf50e2f67fcf4228f032f92494995",
+   "dedup_check": "differs from EleutherAI/pythia-14m-deduped@step16000",
+   "dedup_checked_utc": "2026-11-13T17:44:35+00:00"
+  }
  },
  "EleutherAI/pythia-14m@step32000": {
   "commit": "33df84a2cb76e6f4e4ff9d51e2fccd636cd7fcad",
   "resolved_utc": "2026-11-13T15:48:16+00:00",
   "weights_bytes": 28143920,
-  "commit_date": "2026-02-24T21:37:50+00:00"
+  "commit_date": "2026-02-24T21:37:50+00:00",
+  "deduped_check": {
+   "dedup_repo": "EleutherAI/pythia-14m-deduped",
+   "dedup_revision": "step32000",
+   "dedup_commit": "db224b550192bb65da2346b6c7706e9dd8998053",
+   "weights_file": "model.safetensors",
+   "weights_sha256": "1623e76922e57ca6a069dd63421d6e5d551f0b3560efab6dfaacdb1e98a8f567",
+   "dedup_sha256": "5fb796ba7ea1b85812a84ab06b45532c117f9f3dd410d14168b2ec8cd96c7f64",
+   "dedup_check": "differs from EleutherAI/pythia-14m-deduped@step32000",
+   "dedup_checked_utc": "2026-11-13T17:44:35+00:00"
+  }
  },
  "EleutherAI/pythia-14m@step4000": {
   "commit": "b60dbd5b25fd86556d353656317f0f9bddd0116a",
   "resolved_utc": "2026-11-13T15:48:15+00:00",
   "weights_bytes": 28143920,
-  "commit_date": "2026-02-24T21:32:38+00:00"
+  "commit_date": "2026-02-24T21:32:38+00:00",
+  "deduped_check": {
+   "dedup_repo": "EleutherAI/pythia-14m-deduped",
+   "dedup_revision": "step4000",
+   "dedup_commit": "4b3729671d8fefd1f35d268c99f6c4345014c4bb",
+   "weights_file": "model.safetensors",
+   "weights_sha256": "80cafd66efcd3c44d192677725b8b0eadd33403a3b3799acc152a43bcdf3e91b",
+   "dedup_sha256": "64b8f99609669d5de45b77d5d3d3104786137b8a64e0e7002d85fedd911b8871",
+   "dedup_check": "differs from EleutherAI/pythia-14m-deduped@step4000",
+   "dedup_checked_utc": "2026-11-13T17:44:34+00:00"
+  }
  },
  "EleutherAI/pythia-14m@step512": {
   "commit": "64c08eedb345bd7766b4283febb672eb04e993ba",
   "resolved_utc": "2026-11-13T15:48:15+00:00",
   "weights_bytes": 28143920,
-  "commit_date": "2026-02-24T21:31:55+00:00"
+  "commit_date": "2026-02-24T21:31:55+00:00",
+  "deduped_check": {
+   "dedup_repo": "EleutherAI/pythia-14m-deduped",
+   "dedup_revision": "step512",
+   "dedup_commit": "982baa8facebd3c35f4219d7dc51e8f977d0ddbb",
+   "weights_file": "model.safetensors",
+   "weights_sha256": "79bc00ca3a953c902efa9fc2a322b6590749af213ca97129e903d1859d655353",
+   "dedup_sha256": "4eccd06e7e2de8c06da27e37a38db4038cd7d2d5dc5f28c9eed4c56b0c4ae17e",
+   "dedup_check": "differs from EleutherAI/pythia-14m-deduped@step512",
+   "dedup_checked_utc": "2026-11-13T17:44:33+00:00"
+  }
  },
  "EleutherAI/pythia-14m@step64": {
   "commit": "34ae3b5dc9c67591eaa0d394440b2c2d3752a143",
   "resolved_utc": "2026-11-13T15:48:15+00:00",
   "weights_bytes": 28143920,
-  "commit_date": "2026-02-24T21:31:26+00:00"
+  "commit_date": "2026-02-24T21:31:26+00:00",
+  "deduped_check": {
+   "dedup_repo": "EleutherAI/pythia-14m-deduped",
+   "dedup_revision": "step64",
+   "dedup_commit": "98483f8b6c50ae140f586edcdc54c5c90529aa43",
+   "weights_file": "model.safetensors",
+   "weights_sha256": "d8d2526f37980c0a8fc402ccd8d9360217a1d5591c1d4f5ba979e443e6c73df1",
+   "dedup_sha256": "0a88bf2de65b0987c06b8bf6b70d91c7b928ac307aa5d838f4bd472cd61eac79",
+   "dedup_check": "differs from EleutherAI/pythia-14m-deduped@step64",
+   "dedup_checked_utc": "2026-11-13T17:44:33+00:00"
+  }
  },
  "EleutherAI/pythia-14m@step64000": {
   "commit": "7bd2eaaf66022cb4ec8d1811704ba939bc4a53c5",
   "resolved_utc": "2026-11-13T15:48:16+00:00",
   "weights_bytes": 28143920,
-  "commit_date": "2026-02-24T21:43:24+00:00"
+  "commit_date": "2026-02-24T21:43:24+00:00",
+  "deduped_check": {
+   "dedup_repo": "EleutherAI/pythia-14m-deduped",
+   "dedup_revision": "step64000",
+   "dedup_commit": "54e31b2afcf208e2cf15baa5772e775e08a3778d",
+   "weights_file": "model.safetensors",
+   "weights_sha256": "b0a3043c5439763023203afb86a4c1edc1ed2cca3a4b32f165361baaaf9c9880",
+   "dedup_sha256": "1be68d0441c6d0e288e70da90a051b2865036cd21eed244eb94b881e01b18904",
+   "dedup_check": "differs from EleutherAI/pythia-14m-deduped@step64000",
+   "dedup_checked_utc": "2026-11-13T17:44:36+00:00"
+  }
  },
  "EleutherAI/pythia-14m@step71000": {
   "commit": "6a9156279d41c80dea69f043e25818cb3e596f56",
   "resolved_utc": "2026-11-13T15:48:16+00:00",
   "weights_bytes": 28143920,
-  "commit_date": "2026-02-24T21:44:33+00:00"
+  "commit_date": "2026-02-24T21:44:33+00:00",
+  "deduped_check": {
+   "dedup_repo": "EleutherAI/pythia-14m-deduped",
+   "dedup_revision": "step71000",
+   "dedup_commit": "56876d2f579c16585683ffb826b5e02c2304ef05",
+   "weights_file": "model.safetensors",
+   "weights_sha256": "a34b0ccc6306f5ba49c27932e0f81bd7a5cdf24be3c159d6c4b5c79693e032ac",
+   "dedup_sha256": "f9993a8f6f4b31ff4f21495c6d70dd92c97a3c05892ca974232b9271fdd4f52d",
+   "dedup_check": "differs from EleutherAI/pythia-14m-deduped@step71000",
+   "dedup_checked_utc": "2026-11-13T17:44:36+00:00"
+  }
  },
  "EleutherAI/pythia-14m@step8": {
   "commit": "fbd7af0e00c2ded2d0812b65b95842a65fdbc9d8",
   "resolved_utc": "2026-11-13T15:48:14+00:00",
   "weights_bytes": 28143920,
-  "commit_date": "2026-02-24T21:30:55+00:00"
+  "commit_date": "2026-02-24T21:30:55+00:00",
+  "deduped_check": {
+   "dedup_repo": "EleutherAI/pythia-14m-deduped",
+   "dedup_revision": "step8",
+   "dedup_commit": "72237b9e4cb32d104d8a830df6673b8c2ef0f843",
+   "weights_file": "model.safetensors",
+   "weights_sha256": "96647c0e6154a26c52f8b7c3875b7067b7f957b5c8f134a2d53029023164e79f",
+   "dedup_sha256": "40690032121444b423cd729af664037ac80fd018999284c9264b8e49563b8a28",
+   "dedup_check": "differs from EleutherAI/pythia-14m-deduped@step8",
+   "dedup_checked_utc": "2026-11-13T17:44:32+00:00"
+  }
  },
  "EleutherAI/pythia-14m@step8000": {
   "commit": "7eaf1fcd5df4240021dad46cf103e58d53ed5f9e",
   "resolved_utc": "2026-11-13T15:48:15+00:00",
   "weights_bytes": 28143920,
-  "commit_date": "2026-02-24T21:33:19+00:00"
+  "commit_date": "2026-02-24T21:33:19+00:00",
+  "deduped_check": {
+   "dedup_repo": "EleutherAI/pythia-14m-deduped",
+   "dedup_revision": "step8000",
+   "dedup_commit": "b0b10abf2ff041dc80733787f622a957e4c0898d",
+   "weights_file": "model.safetensors",
+   "weights_sha256": "69635c20add8f9482b8f3778fef6b1c299b2ed93a5461b462b062a155f84756d",
+   "dedup_sha256": "3b549332aed81cca4eb28e8eb07f6d49adb8666c985580eeb64841c34a9d7e08",
+   "dedup_check": "differs from EleutherAI/pythia-14m-deduped@step8000",
+   "dedup_checked_utc": "2026-11-13T17:44:34+00:00"
+  }
  },
  "EleutherAI/pythia-160m-data-seed1@step1": {
   "commit": "dcbaa0067323e1e8816fbf5cc47be37fab9f5e7e",
@@ -2499,79 +2629,209 @@
   "commit": "236b77f14e32ad3431ad1ea2c166d9a929484ef5",
   "resolved_utc": "2026-11-13T15:48:17+00:00",
   "weights_bytes": 60997960,
-  "commit_date": "2026-02-24T21:32:35+00:00"
+  "commit_date": "2026-02-24T21:32:35+00:00",
+  "deduped_check": {
+   "dedup_repo": "EleutherAI/pythia-31m-deduped",
+   "dedup_revision": "step1",
+   "dedup_commit": "bff08a0949d04c0823e508fcc817acfcc85e0dc8",
+   "weights_file": "model.safetensors",
+   "weights_sha256": "8452d06d1ffacee79edf0830b835fdcb1a9bfe77c97c61e6ca49be320a87aba7",
+   "dedup_sha256": "0487eb1ee1d67f148f231edf3012909e4d8c95d47ef5c52c567b71608d191304",
+   "dedup_check": "differs from EleutherAI/pythia-31m-deduped@step1",
+   "dedup_checked_utc": "2026-11-13T17:44:37+00:00"
+  }
  },
  "EleutherAI/pythia-31m@step1000": {
   "commit": "19fc7af4937db4f375e7d2bdaed1703cc8d7b48c",
   "resolved_utc": "2026-11-13T15:48:17+00:00",
   "weights_bytes": 60997960,
-  "commit_date": "2026-02-24T21:34:41+00:00"
+  "commit_date": "2026-02-24T21:34:41+00:00",
+  "deduped_check": {
+   "dedup_repo": "EleutherAI/pythia-31m-deduped",
+   "dedup_revision": "step1000",
+   "dedup_commit": "dd4d3eab2b004272fee4a3d321064fa65e5e1ee6",
+   "weights_file": "model.safetensors",
+   "weights_sha256": "cbcef31e715195092c81ae9c5617301c2709ef035cbe4081ac7e35691accafc3",
+   "dedup_sha256": "075758a764ccb5c09aba7a4438af4c8901d5f3f84889bbeb8fc71f961e078f9a",
+   "dedup_check": "differs from EleutherAI/pythia-31m-deduped@step1000",
+   "dedup_checked_utc": "2026-11-13T17:44:38+00:00"
+  }
  },
  "EleutherAI/pythia-31m@step14000": {
   "commit": "2adacba15afb819665d339d4d57672c122a6fa3e",
   "resolved_utc": "2026-11-13T15:48:18+00:00",
   "weights_bytes": 60997960,
-  "commit_date": "2026-02-24T21:37:27+00:00"
+  "commit_date": "2026-02-24T21:37:27+00:00",
+  "deduped_check": {
+   "dedup_repo": "EleutherAI/pythia-31m-deduped",
+   "dedup_revision": "step14000",
+   "dedup_commit": "e4a16e21529829d9f697c79407c6632dbfd2b16f",
+   "weights_file": "model.safetensors",
+   "weights_sha256": "ea5fb234f02e939c6026efb07801863ad07e40bae5c69de9c338017ee9e87cbc",
+   "dedup_sha256": "ff8de3792f1a97c38b0b2013c8de6facffd93feda525987f841077ba065fe0d8",
+   "dedup_check": "differs from EleutherAI/pythia-31m-deduped@step14000",
+   "dedup_checked_utc": "2026-11-13T17:44:39+00:00"
+  }
  },
  "EleutherAI/pythia-31m@step143000": {
   "commit": "64a34c7c2df1205e54774d9802b753ece2f6d697",
   "resolved_utc": "2026-11-13T15:48:19+00:00",
   "weights_bytes": 60997960,
-  "commit_date": "2026-02-24T22:14:49+00:00"
+  "commit_date": "2026-02-24T22:14:49+00:00",
+  "deduped_check": {
+   "dedup_repo": "EleutherAI/pythia-31m-deduped",
+   "dedup_revision": "step143000",
+   "dedup_commit": "de2999ae7375ed5ab92752c521ec71f9435fbfda",
+   "weights_file": "model.safetensors",
+   "weights_sha256": "02ddadd516061264cd44b47c84ae49c6641f869e6d3f06c7d0e4855f31e34059",
+   "dedup_sha256": "b1a010863cc33e6c73065944ad21582438dcd1b1e2d59800b11aac8e704dec26",
+   "dedup_check": "differs from EleutherAI/pythia-31m-deduped@step143000",
+   "dedup_checked_utc": "2026-11-13T17:44:42+00:00"
+  }
  },
  "EleutherAI/pythia-31m@step16000": {
   "commit": "833809a9886fc07bb29bf8758041c41a084613bc",
   "resolved_utc": "2026-11-13T15:48:18+00:00",
   "weights_bytes": 60997960,
-  "commit_date": "2026-02-24T21:37:51+00:00"
+  "commit_date": "2026-02-24T21:37:51+00:00",
+  "deduped_check": {
+   "dedup_repo": "EleutherAI/pythia-31m-deduped",
+   "dedup_revision": "step16000",
+   "dedup_commit": "57b22c26f8298f890aed4e751f58029bb66af263",
+   "weights_file": "model.safetensors",
+   "weights_sha256": "e7d1748e2b09cae1ecb2cfff9838ffe87f71cd1be3aee5027303946cb0106940",
+   "dedup_sha256": "4a6e783efeee66cd39bf0a3ccf643789f133605c392fe185b284e7e6c4c9f871",
+   "dedup_check": "differs from EleutherAI/pythia-31m-deduped@step16000",
+   "dedup_checked_utc": "2026-11-13T17:44:40+00:00"
+  }
  },
  "EleutherAI/pythia-31m@step32000": {
   "commit": "c42e022e9e8007ce289d58e8b54593dc3a7615b3",
   "resolved_utc": "2026-11-13T15:48:18+00:00",
   "weights_bytes": 60997960,
-  "commit_date": "2026-02-24T21:41:25+00:00"
+  "commit_date": "2026-02-24T21:41:25+00:00",
+  "deduped_check": {
+   "dedup_repo": "EleutherAI/pythia-31m-deduped",
+   "dedup_revision": "step32000",
+   "dedup_commit": "b9b451f6c927e2264331cc41311f58f688129620",
+   "weights_file": "model.safetensors",
+   "weights_sha256": "9474bd6ec84db37111d5c274df07c4100016cda77e2b692598b6e6aad0a05058",
+   "dedup_sha256": "5c335a4525847d8c98bb8b27fa1b05613f080b4bd592cf878431ab39ff50d872",
+   "dedup_check": "differs from EleutherAI/pythia-31m-deduped@step32000",
+   "dedup_checked_utc": "2026-11-13T17:44:40+00:00"
+  }
  },
  "EleutherAI/pythia-31m@step4000": {
   "commit": "bbfa2881d8e598ad6dde840d85003daa42a72ef0",
   "resolved_utc": "2026-11-13T15:48:18+00:00",
   "weights_bytes": 60997960,
-  "commit_date": "2026-02-24T21:35:22+00:00"
+  "commit_date": "2026-02-24T21:35:22+00:00",
+  "deduped_check": {
+   "dedup_repo": "EleutherAI/pythia-31m-deduped",
+   "dedup_revision": "step4000",
+   "dedup_commit": "a707e4b3a59d7b3c7a3d85fcefcaee20dd5f5560",
+   "weights_file": "model.safetensors",
+   "weights_sha256": "a52c72040f26905c150840bdc3523d76ff019172eae069e4559f0839492134dc",
+   "dedup_sha256": "49a7a77f446ff6ff324ce96dd4af9b488739b6e5b5aa4875767c78394e872506",
+   "dedup_check": "differs from EleutherAI/pythia-31m-deduped@step4000",
+   "dedup_checked_utc": "2026-11-13T17:44:39+00:00"
+  }
  },
  "EleutherAI/pythia-31m@step512": {
   "commit": "592753ea46063c0ecf5b55a08a69ca8b5720f4fc",
   "resolved_utc": "2026-11-13T15:48:17+00:00",
   "weights_bytes": 60997960,
-  "commit_date": "2026-02-24T21:34:29+00:00"
+  "commit_date": "2026-02-24T21:34:29+00:00",
+  "deduped_check": {
+   "dedup_repo": "EleutherAI/pythia-31m-deduped",
+   "dedup_revision": "step512",
+   "dedup_commit": "66ca79a50c526ef18c0b79c1c3a473fdd163b5dc",
+   "weights_file": "model.safetensors",
+   "weights_sha256": "ed9f31aea14f15a3ed009a88a17faa51ad85256a8482323447a241f32cf1d0cc",
+   "dedup_sha256": "1441f2631a5700219741dafa01b6b7f20af7102bc0e525ae0664eb9828aac0a4",
+   "dedup_check": "differs from EleutherAI/pythia-31m-deduped@step512",
+   "dedup_checked_utc": "2026-11-13T17:44:38+00:00"
+  }
  },
  "EleutherAI/pythia-31m@step64": {
   "commit": "c24dc9a0c2c3c0e0b13b9f235c868df5351fbfe5",
   "resolved_utc": "2026-11-13T15:48:17+00:00",
   "weights_bytes": 60997960,
-  "commit_date": "2026-02-24T21:33:51+00:00"
+  "commit_date": "2026-02-24T21:33:51+00:00",
+  "deduped_check": {
+   "dedup_repo": "EleutherAI/pythia-31m-deduped",
+   "dedup_revision": "step64",
+   "dedup_commit": "c00c51210ce44051b4ef0bf4738b056e92ad0b5d",
+   "weights_file": "model.safetensors",
+   "weights_sha256": "f13cc616a47fb8fc51971af46a5599099d90541630b3231b7c1f7f6c1dfd2444",
+   "dedup_sha256": "66fe4be7fef6e3782e479e4ddbb4cc65a9787e1b6fc58c21cefc638d545e95e8",
+   "dedup_check": "differs from EleutherAI/pythia-31m-deduped@step64",
+   "dedup_checked_utc": "2026-11-13T17:44:38+00:00"
+  }
  },
  "EleutherAI/pythia-31m@step64000": {
   "commit": "217f29914f9800191e29ca647beb34d46166f896",
   "resolved_utc": "2026-11-13T15:48:19+00:00",
   "weights_bytes": 60997960,
-  "commit_date": "2026-02-24T21:58:46+00:00"
+  "commit_date": "2026-02-24T21:58:46+00:00",
+  "deduped_check": {
+   "dedup_repo": "EleutherAI/pythia-31m-deduped",
+   "dedup_revision": "step64000",
+   "dedup_commit": "aa5003ec996be049603ed123bda4b1ac47dfc6b2",
+   "weights_file": "model.safetensors",
+   "weights_sha256": "8fef9f2632727422105627b1f6f1a0f7c025dbdc69b0c2f249985a2b50bb6c1d",
+   "dedup_sha256": "36c8864667277458d1d09f3b91039cc6aae7ed8bf1ccb71e6b6e061253e9c349",
+   "dedup_check": "differs from EleutherAI/pythia-31m-deduped@step64000",
+   "dedup_checked_utc": "2026-11-13T17:44:41+00:00"
+  }
  },
  "EleutherAI/pythia-31m@step71000": {
   "commit": "001bd874c76c25764324d02e9b188cd64078fd36",
   "resolved_utc": "2026-11-13T15:48:19+00:00",
   "weights_bytes": 60997960,
-  "commit_date": "2026-02-24T22:00:06+00:00"
+  "commit_date": "2026-02-24T22:00:06+00:00",
+  "deduped_check": {
+   "dedup_repo": "EleutherAI/pythia-31m-deduped",
+   "dedup_revision": "step71000",
+   "dedup_commit": "aeafbd5e62a3e5cd6e9f4106167f31e7fec47b41",
+   "weights_file": "model.safetensors",
+   "weights_sha256": "efc9175361dc0e2c556a3f6ed4fb0f9a062c128fcb483d281574ab8aae9bb769",
+   "dedup_sha256": "429979f4e35e6a1821813486d5192401ca756ea224c305e774f724113110b2ca",
+   "dedup_check": "differs from EleutherAI/pythia-31m-deduped@step71000",
+   "dedup_checked_utc": "2026-11-13T17:44:41+00:00"
+  }
  },
  "EleutherAI/pythia-31m@step8": {
   "commit": "5a713ae739c62af3638128d429c46341c627d859",
   "resolved_utc": "2026-11-13T15:48:17+00:00",
   "weights_bytes": 60997960,
-  "commit_date": "2026-02-24T21:33:14+00:00"
+  "commit_date": "2026-02-24T21:33:14+00:00",
+  "deduped_check": {
+   "dedup_repo": "EleutherAI/pythia-31m-deduped",
+   "dedup_revision": "step8",
+   "dedup_commit": "ea81940ff6730cf6c27cd867c73bfebf4b9b11a9",
+   "weights_file": "model.safetensors",
+   "weights_sha256": "e5673f2e825427ff9dfda6ff525e654176cbf6154b21273ca918200c24b3869d",
+   "dedup_sha256": "5f85d49bb85303981f0525a2b53c9b4e8049b543d8fb4a43a0e73b53a27473e5",
+   "dedup_check": "differs from EleutherAI/pythia-31m-deduped@step8",
+   "dedup_checked_utc": "2026-11-13T17:44:37+00:00"
+  }
  },
  "EleutherAI/pythia-31m@step8000": {
   "commit": "dd882b8e530f447d32dc8a0ee94a30552f49fc75",
   "resolved_utc": "2026-11-13T15:48:18+00:00",
   "weights_bytes": 60997960,
-  "commit_date": "2026-02-24T21:36:13+00:00"
+  "commit_date": "2026-02-24T21:36:13+00:00",
+  "deduped_check": {
+   "dedup_repo": "EleutherAI/pythia-31m-deduped",
+   "dedup_revision": "step8000",
+   "dedup_commit": "95004c539429ac4c38dbb3803db3229e9108b1f1",
+   "weights_file": "model.safetensors",
+   "weights_sha256": "a1ade3c64e6d231dc699069ccd78309163c989e1257b9ef85f1f5a91ff668365",
+   "dedup_sha256": "b036a2ba1074d643800bf02d88e902af6e78e66b9057a9a628d1b695a22bb62a",
+   "dedup_check": "differs from EleutherAI/pythia-31m-deduped@step8000",
+   "dedup_checked_utc": "2026-11-13T17:44:39+00:00"
+  }
  },
  "EleutherAI/pythia-410m-seed1@step1": {
   "commit": "1bae1d6b538312de3555a8d21566da2925d019e5",
