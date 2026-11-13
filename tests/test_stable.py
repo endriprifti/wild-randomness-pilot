@@ -70,3 +70,18 @@ def test_block_noise():
     b = stable.block_noise(v, 4)
     assert np.allclose(b, [1.5 - 5.5, 5.5 - 5.5, 9.5 - 5.5])
     assert len(stable.block_noise(v, 4, max_blocks=2)) == 2
+
+
+@pytest.mark.parametrize("alpha,beta", [(1.2, 0.0), (1.5, 0.0), (1.8, 0.0), (2.0, 0.0), (1.5, 0.5), (1.0, 0.3)])
+def test_torch_sampler_matches_numpy_sampler(alpha, beta):
+    """rvs_stable_torch (P5's injected noise, drawn on the GPU) has the distribution of rvs_stable."""
+    import torch
+    from scipy.stats import ks_2samp
+    x_np = stable.rvs_stable(alpha, beta, 0.05, 0.1, 200_000, np.random.default_rng(1))
+    g = torch.Generator().manual_seed(2)
+    x_t = stable.rvs_stable_torch(alpha, beta, 0.05, 0.1, (400, 500), g, "cpu", torch.float32)
+    assert x_t.shape == (400, 500) and x_t.dtype == torch.float32
+    assert ks_2samp(x_np, x_t.reshape(-1).double().numpy()).pvalue > 1e-3
+    again = stable.rvs_stable_torch(alpha, beta, 0.05, 0.1, (400, 500), torch.Generator().manual_seed(2), "cpu",
+                                    torch.float32)
+    assert torch.equal(x_t, again)                                    # reproducible from the generator's seed

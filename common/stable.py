@@ -43,6 +43,30 @@ def rvs_stable(alpha: float, beta: float = 0.0, gamma: float = 1.0, delta: float
     return gamma * X + (2 / np.pi) * beta * gamma * math.log(gamma) + delta
 
 
+def rvs_stable_torch(alpha: float, beta: float = 0.0, gamma: float = 1.0, delta: float = 0.0, shape=(1,),
+                     generator=None, device="cpu", dtype=None):
+    """rvs_stable (same Chambers-Mallows-Stuck formula, same S(alpha, beta, gamma, delta; 1) form) drawn with
+    torch on `device`, so that noise injected into GPU training does not wait for the CPU (P5 draws about
+    six million variates per step: about 0.35 s with NumPy on 4 CPU cores). Computed in float64 so the far tail
+    is not cut off, then cast to `dtype`."""
+    import torch
+    f64 = torch.float64
+    V = (torch.rand(shape, generator=generator, device=device, dtype=f64) - 0.5) * math.pi
+    W = torch.empty(shape, device=device, dtype=f64).exponential_(1.0, generator=generator)
+    if abs(alpha - 1.0) > 1e-9:
+        t = beta * math.tan(math.pi * alpha / 2)
+        B = math.atan(t) / alpha
+        S = (1 + t * t) ** (1 / (2 * alpha))
+        X = (S * torch.sin(alpha * (V + B)) / torch.cos(V) ** (1 / alpha)
+             * (torch.cos(V - alpha * (V + B)) / W) ** ((1 - alpha) / alpha))
+        out = gamma * X + delta
+    else:
+        X = (2 / math.pi) * ((math.pi / 2 + beta * V) * torch.tan(V)
+                             - beta * torch.log((math.pi / 2) * W * torch.cos(V) / (math.pi / 2 + beta * V)))
+        out = gamma * X + (2 / math.pi) * beta * gamma * math.log(gamma) + delta
+    return out.to(dtype) if dtype is not None else out
+
+
 def s1_to_s0_delta(alpha, beta, gamma, delta1):
     if abs(alpha - 1) < 1e-9:
         return delta1 + beta * (2 / np.pi) * gamma * math.log(gamma)

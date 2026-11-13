@@ -12,6 +12,7 @@ import datetime as _dt
 import json
 import os
 import re
+import time
 from pathlib import Path
 from typing import Iterable
 
@@ -19,6 +20,37 @@ import numpy as np
 import torch
 
 PINS_PATH = Path(__file__).resolve().parent.parent / "pins.json"
+HUB_RETRIES = (10, 30, 90, 270)   # seconds between attempts at a Hub call in a real run (smoke: no retry)
+
+
+def _permanent(e: Exception) -> bool:
+    """Errors a retry cannot fix: unpinned under --require-pins, missing repository, revision or file."""
+    if isinstance(e, KeyError):
+        return True
+    try:
+        from huggingface_hub.errors import EntryNotFoundError, RepositoryNotFoundError, RevisionNotFoundError
+        return isinstance(e, (RepositoryNotFoundError, RevisionNotFoundError, EntryNotFoundError))
+    except ImportError:
+        return False
+
+
+def hub_retry(fn, run=None, what: str = "Hub call"):
+    """fn() with retries after transient failures (network, rate limit, 5xx), so that one dropped connection
+    in a run of hundreds of downloads does not end the job. No retry in smoke or --offline-ok runs, which
+    fall back to stand-ins instead, or for errors a retry cannot fix."""
+    waits = () if (run is not None and getattr(run, "offline_ok", False)) else HUB_RETRIES
+    for i in range(len(waits) + 1):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001
+            if i == len(waits) or _permanent(e):
+                raise
+            msg = f"{what} failed ({type(e).__name__}: {str(e)[:120]}); retry {i + 1}/{len(waits)} in {waits[i]} s"
+            if run is not None:
+                run.note(msg)
+            else:
+                print(msg, flush=True)
+            time.sleep(waits[i])
 
 
 class Pins:
@@ -56,7 +88,8 @@ class Pins:
                 raise KeyError(f"{k} is not pinned in {self.path.name} (run once without --require-pins to pin it)")
             from huggingface_hub import HfApi
             api = HfApi()
-            info = api.model_info(repo, revision=revision, files_metadata=True)
+            info = hub_retry(lambda: api.model_info(repo, revision=revision, files_metadata=True), run,
+                             f"pinning {k}")
             sha = info.sha
             entry = {"commit": sha, "resolved_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")}
             entry["weights_bytes"] = weights_bytes(info.siblings or [])
@@ -195,9 +228,10 @@ def load_causal_lm(name: str, revision: str | None, run, dtype=torch.float32, de
     try:
         from transformers import AutoModelForCausalLM, AutoTokenizer
         sha = PINS.resolve(name, revision, run)   # load the pinned commit, never the moving name
-        model = AutoModelForCausalLM.from_pretrained(name, revision=sha, dtype=dtype,
-                                                     attn_implementation="eager")
-        tok = AutoTokenizer.from_pretrained(name, revision=sha)
+        model = hub_retry(lambda: AutoModelForCausalLM.from_pretrained(name, revision=sha, dtype=dtype,
+                                                                       attn_implementation="eager"),
+                          run, f"download of {name}@{revision}")
+        tok = hub_retry(lambda: AutoTokenizer.from_pretrained(name, revision=sha), run, f"tokenizer of {name}@{revision}")
         if tok.pad_token_id is None:
             tok.pad_token = tok.eos_token
         return model.to(device).eval(), tok, "hub"
@@ -218,7 +252,7 @@ def list_steps(repo: str, run, default_steps: Iterable[int], branch_regex: str =
     (r'^stage1-step(\d+)-tokens'); OLMo 2 'stage2-ingredient...' soup branches never match."""
     try:
         from huggingface_hub import list_repo_refs
-        refs = list_repo_refs(repo)
+        refs = hub_retry(lambda: list_repo_refs(repo), run, f"branch list of {repo}")
         out = {}
         for br in refs.branches:
             m = re.match(branch_regex, br.name)
@@ -254,8 +288,9 @@ def zipf_text(n_docs: int, words_per_doc: int, seed: int, vocab: int = 5000, phi
 
 def load_texts(dataset: str, config: str | None, split: str, n: int, run, field: str = "text",
                min_chars: int = 200, seed: int = 0) -> tuple[list[str], str]:
-    """First n documents (streaming) with at least min_chars characters."""
-    try:
+    """First n documents (streaming) with at least min_chars characters. A stream that breaks off is restarted
+    from the beginning (same documents) in a real run."""
+    def stream():
         from datasets import load_dataset
         ds = load_dataset(dataset, config, split=split, streaming=True)
         out = []
@@ -267,7 +302,9 @@ def load_texts(dataset: str, config: str | None, split: str, n: int, run, field:
                 break
         if not out:
             raise RuntimeError("empty stream")
-        return out, "hub"
+        return out
+    try:
+        return hub_retry(stream, run, f"stream of {dataset}:{split}"), "hub"
     except Exception as e:
         if not run.offline_ok:
             raise

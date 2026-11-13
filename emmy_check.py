@@ -443,9 +443,13 @@ def model_list(cfg: dict, args, run) -> list[tuple[str, str]]:
         return [tuple(m.split("@", 1)) if "@" in m else (m, "main") for m in args.models.split(",")]
     models = [tuple(m) for m in cfg["models"]]
     k = cfg.get("from_p1_top_k", 0)
-    p1 = runtime.PILOT_ROOT / "results" / "p1_checkpoints" / "checkpoints.csv"
-    if k and p1.exists():
-        df = pd.read_csv(p1)
+    # P1 results: results/p1_checkpoints/ (one P1 run) or results/p1_<suite>/ (run_all.sh, one folder per suite)
+    res = runtime.PILOT_ROOT / "results"
+    p1 = [f for f in sorted(res.glob("p1_*/checkpoints.csv")) if f.stat().st_size]
+    if k and p1:
+        df = pd.concat([pd.read_csv(f) for f in p1], ignore_index=True)
+        if "K" not in df:
+            df["K"] = np.nan
         df = df[(df.source == "hub") & df.repo.str.contains("pythia", case=False) & df.K.notna()]
         added = 0
         for _, r in df.sort_values("K", ascending=False).iterrows():

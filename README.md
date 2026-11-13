@@ -39,10 +39,75 @@ WSL2, **T4** = Kaggle's 16 GB T4 (not the P100, see below), **5090** = RTX 5090 
 | 7 | **Optional, last:** OLMo 2 7B checkpoints | not in the 45 (ours: ~10) | **L40S** (fp32 weights plus per-example JVP exceed 32 GB) | `python p1_checkpoints.py --suite olmo7b`, only if credits remain |
 
 Jobs 0 to 6 all fit the RTX 5090. Job 7 is the only one that needs the L40S, and nothing else depends on it.
+Stage 1 runs on an L40S with `run_all.sh` (below).
 
 Every script takes `--smoke`, `--seed N`, `--device cuda|cpu`, `--out DIR` and `--offline-ok` (allow the recorded
 stand-ins outside smoke mode; off by default, so a real run fails loudly if a download fails). Run the Emmy check
-after P1 if you want it to add the three checkpoints with the largest K from `results/p1_checkpoints/checkpoints.csv`.
+after P1 if you want it to add the three checkpoints with the largest K from P1's `checkpoints.csv` (it reads
+`results/p1_checkpoints/` and the `results/p1_<suite>/` folders that `run_all.sh` writes).
+
+## Full run on one L40S: `run_all.sh`
+
+No RTX 5090 was available, so stage 1 runs on a CloudRift L40S (48 GB; the smoke run there passed all 9 jobs,
+P1 in 264 s and P4 in 157 s). `run_all.sh` runs the GPU jobs one after another in the order of the table above:
+
+p5 (escape, then h31) → p2 → p4 (transformer, then resnet18) → p1 (pythia, then polypythia with the data and weight
+seeds and both spike passes, then olmo) → p3 → p1 olmo7b last.
+
+P0 needs only a CPU, so it does not hold up the GPU: it starts in the background at the beginning and runs next to
+the GPU jobs, pinned to 4 CPUs (`taskset`) with every thread pool capped at 4 (`OMP_NUM_THREADS` and the like).
+While it runs, the GPU jobs are kept on the other CPUs; once it ends they get all of them. `P0_THREADS=6 bash
+run_all.sh` changes the split. The script finishes when both the GPU jobs and P0 are done. The Emmy check is not
+part of it (it needs nvcc and the Emmy environment; run it separately on a 5090).
+
+```bash
+cd ~/pilot && source ~/.venv-pilot/bin/activate
+export HF_TOKEN=...                                    # avoids Hub rate limits over ~1,300 downloads
+export PILOT_SSH=riftuser@<host> PILOT_SSH_PORT=<port>  # only for the scp line the script prints
+bash run_all.sh --dry-run                              # list the jobs and the CPUs each gets, run nothing
+nohup bash run_all.sh > logs/run_all.out 2>&1 &         # or inside tmux; survives a dropped SSH session
+tail -f logs/progress.txt
+```
+
+- **Logs.** Each job writes `logs/<job>.log`. `logs/progress.txt` gets one line when a job starts and one when it
+  ends, with the UTC time, the exit code, the elapsed hours and the running total over all runs of the script.
+  Elapsed hours come from a monotonic clock. The total adds up job hours; P0 overlaps the GPU jobs, so it is not
+  wall time.
+- **Failures and resume.** A failed job does not stop the rest. A job that exits with 0 leaves `logs/<job>.done`,
+  and a rerun of `run_all.sh` skips it, so after an interruption you simply start the script again. Failed or
+  interrupted jobs run again from their start (a job has no checkpoints of its own). Delete `logs/<job>.done` to
+  rerun a finished job. `--only job1,job2` and `--skip job1,job2` select jobs, and only one `run_all.sh` can run at
+  a time. Stopping the script (Ctrl-C, `kill`) stops the running GPU job and P0 and records both as interrupted.
+- **Archives.** After each job (also after a failure) `results_archive/<job>.tar.gz` holds `results/<job>/` and
+  the job's log, and `results_archive/pins.json` is refreshed. At the end the script prints the `scp` line to run
+  on the laptop, `scp -P <port> '<user>@<host>:<path>/results_archive/*' .`, built from `PILOT_SSH` and
+  `PILOT_SSH_PORT` (kept out of the repository).
+- **Pins.** The jobs run without `--require-pins`: a name that is not pinned yet (pass (b)'s checkpoints, OLMo 2
+  7B) is resolved on first use and written to `pins.json`, so no job fails for that. At the end the script says
+  how many names were added; upload `results_archive/pins.json` so it can be committed.
+- **Network.** In a real run, a Hub call or download that fails for a transient reason (dropped connection, rate
+  limit, server error) is retried four times, 10 s to 270 s apart, before the job gives up. A missing repository,
+  revision or file fails at once.
+- **Output folders.** Each job writes to `results/<job>/` (`--out`), so the three P1 suites and the two P4 models do
+  not overwrite each other.
+
+### Hours on the L40S
+
+To be measured: the hours will be filled in from `logs/progress.txt` (and each job's `run.json`) after the run.
+
+| Job | Runs on | Hours |
+|---|---|---|
+| `p0_calibration` | CPU, 4 threads, alongside the GPU jobs | to be measured |
+| `p5_escape` | GPU | to be measured |
+| `p5_escape_h31` | GPU | to be measured |
+| `p2_w4a4` | GPU | to be measured |
+| `p4_transformer` | GPU | to be measured |
+| `p4_resnet18` | GPU | to be measured |
+| `p1_pythia` | GPU | to be measured |
+| `p1_polypythia` | GPU | to be measured |
+| `p1_olmo` | GPU | to be measured |
+| `p3_fractional` | GPU | to be measured |
+| `p1_olmo7b` | GPU | to be measured |
 
 ## Setup on the Windows 11 laptop (RTX 2050, 4 GB) under WSL2
 
@@ -249,7 +314,7 @@ before the run.
 
 ## Unit tests
 
-`python -m pytest -q` (89 tests, about 85 s on a CPU; `-m "not slow"` skips the two slowest). Synthetic data with
+`python -m pytest -q` (95 tests, about 90 s on a CPU; `-m "not slow"` skips the two slowest). Synthetic data with
 known parameters:
 
 - stable density against the Gaussian and Cauchy closed forms and against SciPy; ML fit recovers α ∈ {1.2, 1.5, 1.8},
@@ -276,6 +341,8 @@ known parameters:
   there), window merging, and the seed-variance table;
 - P4's vocabulary: a tokenizer whose added tokens lie above `vocab_size` gets a model with a row for every ID, in
   smoke and full settings; the ID check fails readably; the full model keeps Pythia's 50,304 slots;
+- the GPU stable sampler against the NumPy one (same distribution for α from 1 to 2, skewed or not; reproducible
+  from its seed);
 - the Emmy check's streaming kurtosis and logit metrics, and the fast-math lanes' environments.
 
 ## Deviations, choices of ours, and items to verify
@@ -287,6 +354,10 @@ known parameters:
 - **Two-decade rule.** A Pareto ζ = 3 sample needs n well above 10^5 to span two decades in x, so smaller samples read
   "undecided".
 - **Δh_rep** is usually "local" for high-dimensional representations, because D_q exceeds log10 n (open question 2).
+- **P5's injected noise is drawn on the GPU** (`stable.rvs_stable_torch`, the same Chambers-Mallows-Stuck formula as
+  the NumPy sampler, computed in float64). Drawing it with NumPy took about 0.35 s per step on 4 CPU cores (six
+  million variates for 50 batched restarts), which would have made the CPU, not the GPU, set the pace of the
+  injected arm. A unit test checks that both samplers give the same distribution.
 - **QuaRot** is simulated with RTN (no GPTQ). Dimensions that are not powers of two (OLMo's 11008) use a Haar rotation.
 - **SSM arms.** S4 uses a dense LegS-initialized A instead of the NPLR form. Mamba is a pure-PyTorch scan.
   The fractional kernel spans r ∈ [1/(4L), 2]. It matches the Mittag-Leffler impulse response within 1% from t = 10

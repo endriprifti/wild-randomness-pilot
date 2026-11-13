@@ -136,15 +136,14 @@ def run_point(mode, P_S, X, Y, cfg, B, eta, g_max, alpha_inj, gamma1, seed, devi
     exited = torch.zeros(R, dtype=torch.bool, device=device)
     k_exit = torch.full((R,), float(cfg["k_cens"]), device=device)
     g = torch.Generator(device="cpu").manual_seed(seed)
-    rngn = np.random.default_rng(seed)
+    gn = torch.Generator(device=device).manual_seed(seed)   # injected noise, drawn on the device
     n = len(X)
     clipped = 0
     for k in range(1, cfg["k_cens"] + 1):
         if mode == "injected":
             gr, _ = grads(P, X, Y, act)
             gamma_B = gamma1 * B ** (1 / alpha_inj - 1)
-            noise = [torch.tensor(stable.rvs_stable(alpha_inj, 0.0, gamma_B, 0.0, t.numel(), rngn).reshape(t.shape),
-                                  dtype=t.dtype, device=device) for t in gr]
+            noise = [stable.rvs_stable_torch(alpha_inj, 0.0, gamma_B, 0.0, t.shape, gn, device, t.dtype) for t in gr]
             gr = [a + b for a, b in zip(gr, noise)]
         else:
             idx = torch.randint(0, n, (R, B), generator=g).to(device)
@@ -227,11 +226,10 @@ def main():
             gamma = h["iqr"] / iqr_std
             for seed in h["seeds"]:
                 P = init_params(1, X.shape[1], cfg["hidden"], 10, seed, dev)
-                rngn = np.random.default_rng(seed)
+                gn = torch.Generator(device=dev).manual_seed(seed)   # noise drawn on the device
                 for _ in range(h["steps"]):
                     gr, _ = grads(P, X, Y, act)
-                    gr = [t + torch.tensor(stable.rvs_stable(a, 0, gamma, 0, t.numel(), rngn).reshape(t.shape),
-                                           dtype=t.dtype, device=dev) for t in gr]
+                    gr = [t + stable.rvs_stable_torch(a, 0, gamma, 0, t.shape, gn, dev, t.dtype) for t in gr]
                     P = [p - h["lr"] * g for p, g in zip(P, gr)]
                 P = full_descent(P, X, Y, act, 200, h["lr"])  # settle without noise before measuring
                 with torch.no_grad():
