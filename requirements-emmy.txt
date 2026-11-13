@@ -1,0 +1,13 @@
+# Separate environment for emmy_check.py only (Emmy pins transformers to 5.19.x, which conflicts with
+# requirements.txt). Emmy needs Python >= 3.12, Linux x86-64 (glibc >= 2.34), an NVIDIA GPU and the
+# CUDA toolkit (nvcc on PATH) to build and run its kernels.
+emmy-ml[compile]==0.3.25
+transformers==5.19.0
+torch==2.15.0
+numpy==2.5.4
+scipy==1.18.1
+pandas==3.1.1
+datasets==5.2.0
+huggingface_hub==2.4.0
+safetensors==0.8.0
+PyWavelets==1.10.0

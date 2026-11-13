@@ -1,0 +1,280 @@
+"""Shared configuration for every pilot job (stage 1, Appendix sec:app-pilot).
+
+`get(test, smoke)` returns the full settings, or the full settings overridden by the smoke
+settings. Values marked OURS are choices the paper does not fix; change them here, before
+the preregistration, never after seeing data. GPU-hour figures are the appendix estimates
+(A100-class, 6ND training FLOPs, 2N per token inference, ~30% bf16 utilization), not
+measurements.
+"""
+
+from __future__ import annotations
+
+import copy
+
+SEED = 20261105  # base seed; every job derives its seeds from it
+
+BATCH_SIZES = [8, 16, 32, 64, 128, 256, 512, 1024]          # sec. 7.5
+TRAINING_STAGES = [0.01, 0.10, 0.50, 1.00]                    # sec. 7.5: 1, 10, 50, 100% of training
+
+TAILS = {                                                     # sec. 7.1
+    "n_boot": 2500,           # bootstrap replicates for p_KS (accuracy about 0.01)
+    "level": 0.10,            # p_KS <= 0.1 rejects; alternatives preferred at the 10% level
+    "min_tail": 50,           # OURS: smallest tail used in the x_min search
+    "max_candidates": 200,    # OURS: x_min candidates (quantile-spaced distinct values)
+    "hill_eps": 0.1,          # OURS: n1 = n^(1 - eps) in the Danielsson et al. double bootstrap
+    "hill_reps": 500,         # OURS: replicates per double-bootstrap stage
+    "hill_tol": 0.15,         # OURS: |zeta_DB - zeta_CSN| <= 0.15 zeta_CSN counts as agreement
+    "n_jobs": 4,              # processes for the p_KS bootstrap
+}
+
+SCALE = {                                                     # sec. 7.2
+    "n_surr": 99,             # shuffled / phase / IAAFT surrogates per test
+    "q_lo": 0.5, "q_hi": 4.0,  # OURS (placeholder for the preregistration): q range of Delta h
+    "wavelet": "db3", "wavelet_j1": 3,
+    "dfa_s_min": 10,          # DFA scales from 10 to n/10 (two decades need n >= 10^4)
+}
+
+H71 = {"inv_tol": 0.03, "drift_tol": 0.05, "level": 0.90, "n_blocks": 1600, "n_boot": 200}
+
+CONFIG = {
+    # ------------------------------------------------------------------ P0: calibration (CPU)
+    "p0_calibration": {
+        "full": {
+            "n_values": [1000, 10000, 100000],
+            "replicates": 200,
+            "tail_laws": {  # true state for the confusion matrix
+                "sas_1.2": "wild", "sas_1.5": "wild", "sas_1.8": "wild",
+                "pareto_1.5": "wild", "pareto_3": "pre-wild",
+                "lognormal_1": "slow", "weibull_0.5": "slow", "weibull_1.5": "mild",
+                "trunclevy_1.5": "truncated",
+            },
+            "trunc_levy_cutoff": 20.0,    # OURS: abrupt cutoff x_c in scale units (Mantegna-Stanley)
+            "n_boot": 250,                # OURS: fewer replicates than sec. 7.1 to keep P0 on a CPU
+            "hurst_series": {"fgn_0.3": 0.3, "fgn_0.5": 0.5, "fgn_0.7": 0.7,
+                             "levy_1.2": None, "levy_1.5": None, "levy_1.8": None},
+            "cascade_p": [0.5, 0.7, 0.8],  # p = 0.5 is monofractal (uniform)
+            "cascade_depth": 20,
+            "block_check": {"alpha": 1.5, "n_blocks": 1600, "replicates": 200, "bootstrap_reps": 3},
+        },
+        "smoke": {
+            "n_values": [1000], "replicates": 2, "n_boot": 20,
+            "tail_laws": {"sas_1.5": "wild", "pareto_1.5": "wild", "lognormal_1": "slow",
+                          "weibull_1.5": "mild", "trunclevy_1.5": "truncated"},
+            "hurst_series": {"fgn_0.7": 0.7, "levy_1.5": None},
+            "cascade_p": [0.7], "cascade_depth": 14,
+            "block_check": {"alpha": 1.5, "n_blocks": 100, "replicates": 3, "bootstrap_reps": 1},
+            "tails": {"hill_reps": 30, "n_jobs": 1}, "scale": {"n_surr": 9},
+        },
+    },
+    # ------------------------------------------------------------------ P1: checkpoints (no training)
+    "p1_checkpoints": {
+        "full": {
+            "suites": {
+                "pythia": {"repo": "EleutherAI/pythia-{size}", "sizes": ["14m", "31m", "70m", "160m", "410m", "1b", "1.4b"], "seeds": [0]},
+                # [VERIFY] PolyPythias also has -weight-seed{seed} and -data-seed{seed} repos (one source of
+                # randomness each); -seed{seed} varies both. Pick the variant the coupling test needs.
+                "polypythia": {"repo": "EleutherAI/pythia-{size}-seed{seed}", "sizes": ["14m", "31m", "70m", "160m", "410m"], "seeds": [1, 2, 3, 4, 5, 6, 7, 8, 9]},
+                "olmo": {"repo": "allenai/OLMo-{size}-hf", "sizes": ["1B", "7B"], "seeds": [0]},
+            },
+            "steps": [1, 8, 64, 512, 1000, 4000, 8000, 16000, 32000, 64000, 143000],
+            "final_step": 143000,
+            "dtype": "float32",
+            "pool_dataset": ["monology/pile-uncopyrighted", None, "train"],  # Pile text without the copyrighted subsets
+            "eval_dataset": ["monology/pile-uncopyrighted", None, "validation"],
+            "example_len": 128,         # OURS: tokens per example for per-example gradients
+            "grad_layers": ["layers.{last}.attention.query_key_value.weight", "layers.{last}.mlp.dense_4h_to_h.weight"],
+            "n_random_dirs": 2, "n_hessian_dirs": 1, "hessian_batch": 64,
+            "coupling_B": 8,            # OURS: fixed B for the alpha that enters the coupling matrix
+            "coupling_blocks": 1600,
+            "probe_seqs": 64, "probe_len": 512,   # probe set for K, outliers and Delta h_rep
+            "dh_points": 10000,
+            "surprisal_docs": 16, "surprisal_len": 2048,  # H_tok series (exploratory, not H_grad)
+            "h71": {"full_res_sizes": ["14m"], "coarse_sizes": ["31m", "70m", "160m"], "coarse_blocks": 200},
+            "eval_seqs": 256, "eval_len": 2048,
+            "tails": {"n_boot": 2500},
+        },
+        "smoke": {
+            "suites": {"pythia": {"repo": "EleutherAI/pythia-{size}", "sizes": ["14m"], "seeds": [0]},
+                       "polypythia": {"repo": "EleutherAI/pythia-{size}-seed{seed}", "sizes": ["14m"], "seeds": [1]}},
+            "steps": [1000, 143000], "final_step": 143000,
+            "example_len": 32, "n_random_dirs": 1, "n_hessian_dirs": 1, "hessian_batch": 8,
+            "coupling_blocks": 40, "probe_seqs": 4, "probe_len": 64, "dh_points": 256,
+            "surprisal_docs": 2, "surprisal_len": 512,
+            "h71": {"full_res_sizes": ["14m"], "coarse_sizes": [], "coarse_blocks": 20, "n_blocks": 30,
+                    "batch_sizes": [8, 16, 32], "n_boot": 3, "stages": [0.5, 1.0]},
+            "eval_seqs": 2, "eval_len": 128,
+            "tails": {"n_boot": 10, "hill_reps": 20, "n_jobs": 1}, "scale": {"n_surr": 9},
+        },
+    },
+    # ------------------------------------------------------------------ P2: W4A4 (inference only)
+    "p2_w4a4": {
+        "full": {
+            "models": ["EleutherAI/pythia-6.9b", "allenai/OLMo-7B-hf"],
+            "dtype": "float16",
+            "arms": {
+                "w4a4": [{"name": "uniform", "a_bits": 4, "group": 128},
+                         {"name": "outlier", "a_bits": 4, "group": 256, "outlier_frac": 0.005},
+                         {"name": "rotation", "a_bits": 4, "group": 128}],
+                "weight_only": [{"name": "uniform", "a_bits": None, "group": 128},
+                                {"name": "outlier", "a_bits": None, "group": 256, "outlier_frac": 0.005},
+                                {"name": "rotation", "a_bits": None, "group": 128},
+                                {"name": "nf4", "a_bits": None, "group": 128}],
+            },
+            "bits_tolerance": 0.05,
+            "popqa": {"dataset": "akariasai/PopQA", "split": "test", "limit": None, "shots": 4,
+                      "max_new_tokens": 16, "batch": 16, "deciles": 10},
+            "doc_counts_csv": None,      # optional: subject -> pretraining document count (see README)
+            "ppl": {"dataset": ["Salesforce/wikitext", "wikitext-2-raw-v1", "test"], "ctx": 2048, "max_windows": None},
+            "calib": {"dataset": ["Salesforce/wikitext", "wikitext-2-raw-v1", "train"], "n_seqs": 32, "len": 512},
+            "probe": {"n_seqs": 16, "len": 512},
+            "isotropic": {"bisect_steps": 8, "ppl_rel_tol": 0.02},
+        },
+        "smoke": {
+            "models": ["EleutherAI/pythia-14m"], "dtype": "float32",
+            "popqa": {"dataset": "akariasai/PopQA", "split": "test", "limit": 40, "shots": 2,
+                      "max_new_tokens": 6, "batch": 8, "deciles": 2},
+            "ppl": {"dataset": ["Salesforce/wikitext", "wikitext-2-raw-v1", "test"], "ctx": 128, "max_windows": 2},
+            "calib": {"dataset": ["Salesforce/wikitext", "wikitext-2-raw-v1", "train"], "n_seqs": 2, "len": 64},
+            "probe": {"n_seqs": 2, "len": 64},
+            "isotropic": {"bisect_steps": 3, "ppl_rel_tol": 0.1},
+        },
+    },
+    # ------------------------------------------------------------------ P3: fractional memory (H4.1)
+    "p3_fractional_memory": {
+        "full": {
+            "archs": ["frac", "s4_legs", "s4d", "mamba"],   # add "legs" for frozen HiPPO-LegS
+            "n_states": [2, 4, 8, 16, 32, 64],
+            "seeds": [0, 1, 2, 3, 4],
+            "tasks": {
+                "powerlaw": {"L": 1024, "nu_star": 0.3, "n_train": 8192, "n_test": 1024},
+                "exponential": {"L": 1024, "tau_frac": 0.125, "n_train": 8192, "n_test": 1024},
+                "lra_image": {"L": 1024},
+            },
+            "H_ref": 64, "ref_arch": "s4d", "n_layers": 2,
+            "steps": 3000, "lra_epochs": 20, "batch": 32,
+            "lr_grid": [1e-3, 3e-3, 1e-2], "tune_seed": 0, "tune_n_states": 16,   # equal tuning budget
+            "weight_decay": 0.01, "target_accuracy": {"powerlaw": 0.9, "exponential": 0.9, "lra_image": 0.6},
+        },
+        "smoke": {
+            "archs": ["frac", "s4_legs", "s4d", "mamba"], "n_states": [2, 8], "seeds": [0],
+            "tasks": {"powerlaw": {"L": 128, "nu_star": 0.3, "n_train": 256, "n_test": 64},
+                      "exponential": {"L": 128, "tau_frac": 0.125, "n_train": 256, "n_test": 64},
+                      "lra_image": {"L": 1024, "limit_train": 256, "limit_test": 64}},
+            "H_ref": 16, "steps": 20, "lra_epochs": 1, "batch": 16, "lr_grid": [3e-3], "tune_n_states": 2,
+        },
+    },
+    # ------------------------------------------------------------------ P4: clipping sweep (H6.1, H7.1 control, H_grad)
+    "p4_clipping": {
+        "full": {
+            "models": ["transformer", "resnet18"],
+            "p_clip": [0.0, 1e-4, 1e-3, 1e-2, 1e-1, 0.5, 1.0],
+            "adaptive": ["autoclip", "zclip", "agc"],
+            "matched_update_length": True,
+            "seeds": [0, 1, 2, 3, 4],
+            "transformer": {"neox": "PYTHIA_14M", "dataset": ["HuggingFaceFW/fineweb-edu", "sample-10BT", "train"],
+                            "tokenizer": "EleutherAI/pythia-14m", "tokens": 300_000_000, "seq_len": 512,
+                            "batch": 64, "lr": 1e-3, "weight_decay": 0.1, "warmup_frac": 0.01,
+                            "ood_dataset": ["Salesforce/wikitext", "wikitext-2-raw-v1", "test"], "eval_seqs": 256},
+            "resnet18": {"epochs": 30, "batch": 128, "lr": 0.1, "momentum": 0.9, "weight_decay": 5e-4,
+                         "warmup_frac": 0.02, "ood_noise_sigma": 0.1},
+            "calib_steps": 200, "diverge_factor": 3.0, "autoclip_pct": 10.0, "zclip_z": 2.5, "zclip_beta": 0.97, "agc_lambda": 0.01,
+            "n_hgrad_dirs": 8,
+            "measure": {"hessian_batch": 512, "power_iters": 20, "trace_samples": 20, "sharp_rho": 0.05,
+                        "sharp_steps": 5, "alpha_pool_blocks": 1600, "probe_points": 5000},
+            "h71": {"run": {"model": "resnet18", "rule": "none", "seed": 0}, "n_blocks": 1600,
+                    "batch_sizes": BATCH_SIZES, "n_random_dirs": 2, "n_hessian_dirs": 1,
+                    "layer": "layer4.1.conv2.weight", "n_boot": 200},
+        },
+        "smoke": {
+            "models": ["transformer", "resnet18"], "p_clip": [0.0, 0.1], "adaptive": ["autoclip"],
+            "matched_update_length": True, "seeds": [0],
+            "transformer": {"neox": "TINY_NEOX", "dataset": ["HuggingFaceFW/fineweb-edu", "sample-10BT", "train"],
+                            "tokenizer": "EleutherAI/pythia-14m", "tokens": 160 * 8 * 64, "seq_len": 64,
+                            "batch": 8, "lr": 1e-3, "weight_decay": 0.1, "warmup_frac": 0.05,
+                            "ood_dataset": ["Salesforce/wikitext", "wikitext-2-raw-v1", "test"], "eval_seqs": 4},
+            "resnet18": {"epochs": 5, "batch": 16, "lr": 0.01, "momentum": 0.9, "weight_decay": 5e-4,
+                         "warmup_frac": 0.05, "ood_noise_sigma": 0.1, "limit_train": 256, "limit_test": 64},
+            "calib_steps": 5, "n_hgrad_dirs": 2,
+            "measure": {"hessian_batch": 16, "power_iters": 3, "trace_samples": 2, "sharp_rho": 0.05,
+                        "sharp_steps": 1, "alpha_pool_blocks": 40, "probe_points": 200},
+            "h71": {"run": {"model": "resnet18", "rule": "none", "seed": 0}, "n_blocks": 20,
+                    "batch_sizes": [8, 16, 32], "n_random_dirs": 1, "n_hessian_dirs": 0,
+                    "layer": "layer4.1.conv2.weight", "n_boot": 3},
+            "tails": {"n_boot": 10, "hill_reps": 20, "n_jobs": 1}, "scale": {"n_surr": 9, "dfa_s_min": 4},
+        },
+    },
+    # ------------------------------------------------------------------ P5: escape (H3.3, H6.1 clause, H3.1 injected)
+    "p5_escape": {
+        "full": {
+            "n_train": 10000, "hidden": 128, "act": "tanh",
+            "batch_sizes": BATCH_SIZES,
+            "etas": [0.05, 0.1, 0.2],              # OURS; the middle rate is used for clipping and injection
+            "g_max_quantiles": [0.5, 0.9, 0.99],   # OURS: g_max = these quantiles of minibatch norms at W_S (B = 64)
+            "inject_alphas": [1.2, 1.5, 1.8, 2.0],
+            "inject_iqr": 0.05,                    # OURS: matched interquartile range of the injected noise at B = 1
+            "restarts": 50, "k_cens": 50_000, "check_every": 250,
+            "descent_steps": 200, "descent_lr": 0.1, "segment_points": 11,
+            "barrier_tol": 0.01,                   # OURS (preregister): loss barrier above both ends, nats
+            "converge_steps": 20000, "converge_lr": 0.1,
+            "h31": {"alphas": [1.2, 1.5, 1.8, 2.0], "seeds": [0, 1, 2, 3, 4], "steps": 20000, "lr": 0.1, "iqr": 0.05},
+        },
+        "smoke": {
+            "n_train": 512, "hidden": 32, "batch_sizes": [8, 32], "etas": [0.1], "g_max_quantiles": [0.9],
+            "inject_alphas": [1.5], "restarts": 4, "k_cens": 200, "check_every": 50, "descent_steps": 20,
+            "converge_steps": 300,
+            "h31": {"alphas": [1.5, 2.0], "seeds": [0], "steps": 100, "lr": 0.1, "iqr": 0.05},
+        },
+    },
+    # ------------------------------------------------------------------ Emmy check
+    "emmy_check": {
+        "full": {
+            "models": [["EleutherAI/pythia-410m", "step143000"], ["EleutherAI/pythia-1b", "step143000"],
+                       ["EleutherAI/pythia-1.4b", "step143000"]],
+            "from_p1_top_k": 3,      # add the three checkpoints with the largest K in P1 results, if present
+            # 500, not 512: emmy-ml 0.3.25 mis-shapes the fused QKV reshape when seq_len equals a model
+            # dimension (seen with seq_len = hidden_size); emmy_check.py also shifts seq_len off any model dimension
+            "seq_len": 500, "n_seqs": 16, "dtypes": ["float16", "float32"], "fast_math": [1, 0],
+            "dataset": ["Salesforce/wikitext", "wikitext-2-raw-v1", "test"],
+            "outlier_threshold": 6.0,   # same absolute threshold as P1's activation statistics
+            # agreement reading (OURS, placeholders until preregistration): compiled vs eager at the same dtype
+            "tolerances": {"top1_min": 0.99, "abs_d_nll_max": 0.01, "outlier_jaccard_min": 0.9},
+            "worker_timeout_s": 3600,
+        },
+        "smoke": {"models": [["EleutherAI/pythia-14m", "step143000"]], "from_p1_top_k": 0,
+                  "seq_len": 60, "n_seqs": 2, "dtypes": ["float32"], "fast_math": [0]},
+    },
+}
+
+HARDWARE = {
+    # job -> (estimated GPU-h from the appendix, smallest GPU class that fits the full job)
+    "p0_calibration": ("CPU", "CPU (multi-core)"),
+    "emmy_check": ("~1 (OURS)", "RTX 5090 or L40S; needs nvcc"),
+    "p5_escape": (25, "4 GB laptop / Kaggle T4"),
+    "p2_w4a4": (30, "RTX 5090 (32 GB)"),
+    "p4_clipping": (30, "Kaggle T4 (16 GB) / RTX 5090"),
+    "p1_checkpoints": (45, "Pythia/PolyPythia: Kaggle T4 or RTX 5090; OLMo-7B: L40S (48 GB)"),
+    "p3_fractional_memory": (65, "Kaggle T4 (16 GB) / RTX 5090"),
+}
+
+
+def _merge(base: dict, over: dict) -> dict:
+    out = copy.deepcopy(base)
+    for k, v in over.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict) and k not in ("suites", "tasks", "tail_laws", "hurst_series", "arms"):
+            out[k] = _merge(out[k], v)
+        else:
+            out[k] = copy.deepcopy(v)
+    return out
+
+
+def get(test: str, smoke: bool = False) -> dict:
+    full = CONFIG[test]["full"]
+    cfg = _merge(full, CONFIG[test]["smoke"]) if smoke else copy.deepcopy(full)
+    cfg["tails"] = _merge(TAILS, cfg.get("tails", {}))
+    cfg["scale"] = _merge(SCALE, cfg.get("scale", {}))
+    cfg["h71_tolerances"] = copy.deepcopy(H71)
+    cfg.setdefault("batch_sizes_h71", BATCH_SIZES)
+    cfg.setdefault("stages", TRAINING_STAGES)
+    cfg["seed"] = SEED
+    cfg["hardware"] = HARDWARE.get(test)
+    return cfg
