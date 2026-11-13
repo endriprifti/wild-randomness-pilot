@@ -18,6 +18,10 @@ plus `run.json` (config, git commit, GPU type and memory, library versions, wall
 
 Notation follows the paper: ζ is the fitted Pareto (survival) exponent, α = min(ζ, 2) only for the stable index.
 
+**Quantization is simulated.** P2 (and the Emmy check's comparison) quantizes and dequantizes weights and
+activations in plain PyTorch and then runs the ordinary floating-point kernels. No INT4 kernel runs, so the results
+concern accuracy (perplexity, PopQA, activation statistics) and say nothing about speed or memory savings.
+
 ## Jobs, cheapest first
 
 GPU-hours are the appendix estimates (A100-class), not measurements. Marks: **4 GB** = the RTX 2050 laptop under
@@ -28,10 +32,13 @@ WSL2, **T4** = Kaggle's 16 GB T4 (not the P100, see below), **5090** = RTX 5090 
 | 0 | Calibration | CPU | CPU only | `python p0_calibration.py` |
 | 1 | Emmy check | ~1 (ours) | 5090 (Emmy's own benchmark GPU); needs nvcc and the Emmy env | `python emmy_check.py --frontend-only` (CPU), then `python emmy_check.py --probe-only`, then `python emmy_check.py` |
 | 2 | Escape grid, H3.3 / H6.1 | 25 | 4 GB, T4, 5090 | `python p5_escape.py` and `python p5_escape.py --part h31` |
-| 3 | W4A4 and weight-only, H6.2 | 30 | 5090 (Pythia-6.9B and OLMo-7B in fp16, about 14 GB each); L40S also fine | `python p2_w4a4.py` (one model: `--models EleutherAI/pythia-6.9b`) |
+| 3 | W4A4 and weight-only, H6.2 (simulated quantization) | 30 | 5090 (Pythia-6.9B and OLMo-7B in fp16, about 14 GB each); L40S also fine | `python p2_w4a4.py` (one model: `--models EleutherAI/pythia-6.9b`) |
 | 4 | Clipping sweep, H6.1 / H7.1 control | 30 | T4, 5090 | `python p4_clipping.py --model transformer` and `python p4_clipping.py --model resnet18` |
-| 5 | Checkpoint measurements | 45 | Pythia and PolyPythias: T4 (up to 410M), 5090 (up to 1.4B); **OLMo-7B: L40S** (fp32 weights plus per-example JVP exceed 32 GB) | `python p1_checkpoints.py --suite pythia`, `--suite polypythia`, `--suite olmo` |
+| 5 | Checkpoint measurements | 45 | Pythia and PolyPythias: T4 (up to 410M), 5090 (up to 1.4B); OLMo 2 1B: 5090 | `python p1_checkpoints.py --pin-only`, then `--suite pythia`, `--suite polypythia,polypythia_data,polypythia_weight`, `--suite olmo` |
 | 6 | Fractional memory, H4.1 | 65 | T4, 5090 | `python p3_fractional_memory.py` (drop LRA first if time runs short: `--tasks powerlaw,exponential`) |
+| 7 | **Optional, last:** OLMo 2 7B checkpoints | not in the 45 (ours: ~10) | **L40S** (fp32 weights plus per-example JVP exceed 32 GB) | `python p1_checkpoints.py --suite olmo7b`, only if credits remain |
+
+Jobs 0 to 6 all fit the RTX 5090. Job 7 is the only one that needs the L40S, and nothing else depends on it.
 
 Every script takes `--smoke`, `--seed N`, `--device cuda|cpu`, `--out DIR` and `--offline-ok` (allow the recorded
 stand-ins outside smoke mode; off by default, so a real run fails loudly if a download fails). Run the Emmy check
@@ -51,9 +58,9 @@ wsl --update
 
 ```bash
 # Ubuntu (WSL2)
-sudo apt update && sudo apt install -y python3-venv python3-pip git unzip
+sudo apt update && sudo apt install -y python3-venv python3-pip git
 nvidia-smi                                   # must list the RTX 2050 and a driver >= 580
-unzip pilot.zip -d ~ && cd ~/pilot
+git clone https://github.com/endriprifti/wild-randomness-pilot.git ~/pilot && cd ~/pilot
 python3 -m venv ~/.venv-pilot && source ~/.venv-pilot/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt              # requirements-lock.txt pins every transitive package too
@@ -106,8 +113,42 @@ job's `run.json`. See `SMOKE_RESULTS.md` for the table from the last run.
 | transformers 5.22.2, datasets, PyWavelets, SciPy | all | pure Python on torch, or CPU | |
 | emmy-ml 0.3.25 | Emmy check | RTX 5090 is its benchmark target; also needs nvcc | [PyPI](https://pypi.org/project/emmy-ml/), [RiftStack release](https://www.ai-infra-summit.com/press-releases/riftstack-s-emmy-compiler-generates-cuda-kernels-that-beat-hand-tuned-libraries-on-nvidia-rtx-5090) |
 
-No job has to move to the L40S because of a missing Blackwell kernel. The only L40S job is P1's OLMo-7B suite, for
-memory. The L40S (Ada, sm_89) runs torch 2.15 through its sm_86 binaries; Emmy names no Ada results.
+No job has to move to the L40S because of a missing Blackwell kernel. The only L40S job is the optional last one
+(P1's OLMo 2 7B suite), for memory. The L40S (Ada, sm_89) runs torch 2.15 through its sm_86 binaries; Emmy names no Ada results.
+
+## Checkpoint suites (P1)
+
+| Suite | Models | Purpose |
+|---|---|---|
+| `pythia` | `EleutherAI/pythia-{14m … 1.4b}` (seed 0) | sizes for a_N, H7.1 at the training stages |
+| `polypythia` | `EleutherAI/pythia-{14m … 410m}-seed1` to `-seed9` | run-to-run variance; initialization and batch composition vary together |
+| `polypythia_data` | `EleutherAI/pythia-160m-data-seed1` to `-seed3` | data order alone |
+| `polypythia_weight` | `EleutherAI/pythia-160m-weight-seed1` to `-seed3` | initialization alone |
+| `olmo` | `allenai/OLMo-2-0425-1B`, stage-1 checkpoints | a second model family with released checkpoints (default) |
+| `olmo7b` | `allenai/OLMo-2-1124-7B` | optional, last job, L40S; never run unless named |
+
+`seed_variance.csv` gives the spread across seeds for the joint, data-only and initialization-only 160M runs at the
+same steps, with each spread's ratio to the joint one.
+
+**Loss-spike check.** The 410M seeds 3 and 4 had loss spikes in the PolyPythias runs. P1 also reads every 410M seed
+at extra early steps (2,000 to 120,000) and records the probe-set loss at every checkpoint. `spike_check.csv` then
+asks, for probe loss, α, α_ESD and K, whether a flagged seed's change between two consecutive steps is larger than
+every other seed's and more than 3.5 robust z (median and MAD of the other seeds' changes) above them. The extra
+steps measure only these four quantities. `checkpoints.csv` marks the flagged seeds in `loss_spike_seed`.
+
+### Pinned commits
+
+Every Hub model (Pythia, PolyPythias, OLMo, P2's models and P4's tokenizer) is loaded at a commit hash, never at a
+branch name. `pins.json` maps `repo@revision` to the commit and its date. The first run that meets a new name
+resolves it on the Hub and writes it to `pins.json`; commit that file, and every later run loads exactly those
+commits. `--require-pins` makes a job fail instead of resolving a name that is not pinned yet.
+`python p1_checkpoints.py --pin-only` pins every P1 checkpoint without measuring anything (a CPU is enough). Each
+`run.json` lists the commits it loaded under `pinned_commits`, and `checkpoints.csv` has `commit` and `commit_date`
+columns.
+
+This matters for Pythia: in February 2026 the `pythia-14m` and `pythia-31m` names switched from the deduplicated to
+the standard-Pile models. For these two names, `checkpoints.csv` flags (`name_switch_check`) any commit dated
+before 2026-02-01. Confirm such a commit on its model card before using it.
 
 ## Emmy
 
@@ -124,8 +165,17 @@ What is confirmed:
   - Through a static wrapper (Emmy's own full-model wrapper adapted to GPT-NeoX: precomputed causal mask, position
     ids and rotary cos/sin), the whole forward traces into Emmy's IR. Running that IR through Emmy's torch
     reference reproduces the eager logits exactly.
-  - Bug found: when `seq_len` equals `hidden_size`, the IR's fused-QKV reshape gets an input of the wrong size.
-    The script keeps `seq_len` off every model dimension (500 in the config).
+  - Bug found: when `seq_len` equals `hidden_size`, Emmy's CPU evaluators (`GatherOp.forward`, `torch_ref`)
+    evaluate the embedding lookup as `torch.gather`, so the output has the wrong shape and the fused-QKV view after
+    it fails. The script keeps `seq_len` off every model dimension (500 in the config). A draft issue with a
+    standalone reproduction is in [`docs/emmy-issue-seq-len-hidden-size.md`](docs/emmy-issue-seq-len-hidden-size.md)
+    (script: `docs/emmy_seq_eq_hidden_repro.py`, CPU only, run it in the Emmy environment). Emmy's GPU lowering
+    decides by output rank and is probably not affected, but that is untested.
+
+The comparison runs twice per model and dtype, with Emmy's fast math on (its default: `EMMY_FAST_MATH` unset)
+and off (`EMMY_FAST_MATH=0`). Emmy lets single precision knobs (`EMMY_FAST_EXP`, `EMMY_FAST_DIV`, …) override
+fast math, so the script removes any such variable inherited from the shell and records the lane in the
+`EMMY_FAST_MATH` column of `compare.csv` and `support.csv`.
 
 Still unconfirmed: kernel lowering and numerical agreement on a GPU. Lowering the whole model on a CPU did not
 finish here. So whether Emmy supports GPT-NeoX end to end is open until `python emmy_check.py --probe-only` runs on
@@ -135,7 +185,7 @@ before the run.
 
 ## Unit tests
 
-`python -m pytest -q` (69 tests, about 80 s on a CPU; `-m "not slow"` skips the two slowest). Synthetic data with
+`python -m pytest -q` (78 tests, about 80 s on a CPU; `-m "not slow"` skips the two slowest). Synthetic data with
 known parameters:
 
 - stable density against the Gaussian and Cauchy closed forms and against SciPy; ML fit recovers α ∈ {1.2, 1.5, 1.8},
@@ -152,7 +202,12 @@ known parameters:
 - NF4 code book, FWHT, rotation invariance, RTN error bound, matched bits, fixed-rate clipping;
 - chunked selective scan against the naive scan, the fractional kernel against the Mittag-Leffler impulse
   response t^(ν−1) E_{ν,ν}(−λ t^ν), and parameter matching across SSM arms;
-- the Emmy check's streaming kurtosis and logit metrics.
+- tail labels: alternatives that cannot be separated read "undecided"; exponential against Weibull uses the
+  likelihood-ratio test;
+- P1 bookkeeping: commit pins (reuse, --require-pins, merge on save), step choice for the spike grid and OLMo,
+  the pythia-14m/31m name-switch flag, the loss-spike check (finds a planted jump, and only that one) and the
+  seed-variance table;
+- the Emmy check's streaming kurtosis and logit metrics, and the fast-math lanes' environments.
 
 ## Deviations, choices of ours, and items to verify
 
@@ -167,9 +222,13 @@ known parameters:
 - **SSM arms.** S4 uses a dense LegS-initialized A instead of the NPLR form. Mamba is a pure-PyTorch scan.
   The fractional kernel spans r ∈ [1/(4L), 2]. It matches the Mittag-Leffler impulse response within 1% from t = 10
   time units, but is 10 to 25% low at t = 1 because modes above r = 2 are cut.
-- **Tail labels.** When several alternatives beat the power law, the one with the smallest AIC wins (ours; §7.1
-  does not rank them). Exponential and Weibull samples still sometimes read "truncated" instead of "mild" or "slow".
-  Every such label is non-wild.
+- **Tail labels.** When more than one alternative beats the power law, they are tested against each other: Vuong
+  for the non-nested pairs, and the likelihood-ratio test (χ², 1 df) for exponential inside Weibull. A label is
+  assigned only when the tests single out one model, or when every surviving model carries the same label (for
+  example lognormal and Weibull with w < 1, both "slow"). Otherwise the reading is "undecided", following Clauset,
+  Shalizi and Newman, and `tail_reason` says which models could not be separated. No information criterion picks
+  a winner. Exponential and Weibull samples still sometimes read "truncated" instead of "mild" or "slow"; every
+  such label is non-wild.
 - **P0** uses 250 bootstrap replicates instead of 2,500, to stay on a CPU.
 - **Placeholders for the preregistration**, marked OURS in `config.py`:
   - hill_tol 0.15, the q range 0.5 to 4, min_tail 50 and the x_min candidate grid;
@@ -177,6 +236,12 @@ known parameters:
   - the Emmy tolerances.
 - **[VERIFY]** items:
   - `monology/pile-uncopyrighted` stands in for the Pile (P1's gradient pool and evaluation text);
-  - the PolyPythias variant: `-seed{n}` varies weights and data order together; `-weight-seed{n}` and
-    `-data-seed{n}` vary one each (`config.py`);
+  - the repository name of the 160M initialization-only runs (`pythia-160m-weight-seed{n}`). A wrong name fails
+    at pinning, not silently;
+  - the extra steps of the 410M loss-spike check, which should cover the spikes in Fig. 5 of the PolyPythias paper
+    (the paper gives no step numbers);
   - the ZClip update rule (`common/clipping.py`).
+
+## Acknowledgement
+
+Compute for this pilot is provided by a compute grant from [CloudRift](https://www.cloudrift.ai).

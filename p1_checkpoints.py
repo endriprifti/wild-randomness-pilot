@@ -13,15 +13,28 @@ Per checkpoint (log-spaced steps):
 At the final step: eval loss for a_N (one fit per suite and seed = one family).
 H7.1 transformer arm: at 1, 10, 50, 100% of training, pools of n_blocks * max(B) examples for
 Pythia-14M (1,600 blocks) and coarse sizes (200 blocks), random and Hessian-block directions.
-Finally an exploratory coupling matrix across seeds within each size (PolyPythias).
+Finally an exploratory coupling matrix across seeds within each (suite, size) cell.
+
+Suites (config.py): pythia (seed 0, 14M-1.4B); polypythia = pythia-{size}-seed1..9 (initialization and
+batch composition vary jointly; run-to-run variance); polypythia_data / polypythia_weight = the 160M
+data-seed1-3 and weight-seed1-3 runs (data order alone, initialization alone); olmo = OLMo 2 1B with its
+stage-1 checkpoints; olmo7b = OLMo 2 7B, OPTIONAL and never run by default (L40S, last job).
+Every model is loaded at a commit pinned in pins.json; checkpoints.csv records commit and commit date, and
+flags pythia-14m/31m commits dated before the February 2026 name switch (deduplicated -> standard Pile).
+Loss-spike check: PolyPythias 410M seeds 3 and 4 had loss spikes; every 410M seed is also read at extra
+early steps, and spike_check.csv asks whether probe loss, alpha, alpha_ESD or K jump at the same steps
+more than in every other seed.
 
 Outputs (results/p1_checkpoints/[smoke/]): checkpoints.csv, esd_layers.csv, activations_layers.csv,
-h71_per_B.csv, h71_summary.csv, scaling.csv, coupling_pairs.csv, coupling.json, run.json
+h71_per_B.csv, h71_summary.csv, scaling.csv, seed_variance.csv, spike_check.csv, coupling_pairs.csv,
+coupling.json, run.json
 
 Commands:
+  python p1_checkpoints.py --pin-only            # resolve and record every commit first (CPU is enough)
   python p1_checkpoints.py --suite pythia
-  python p1_checkpoints.py --suite polypythia
-  python p1_checkpoints.py --suite olmo           # needs ~48 GB for OLMo-7B
+  python p1_checkpoints.py --suite polypythia,polypythia_data,polypythia_weight
+  python p1_checkpoints.py --suite olmo           # OLMo 2 1B, fits the RTX 5090
+  python p1_checkpoints.py --suite olmo7b         # OPTIONAL, last: OLMo 2 7B on the L40S
   python p1_checkpoints.py --smoke
 """
 
@@ -44,7 +57,97 @@ def suite_models(cfg, suite):
     for size in s["sizes"]:
         for seed in s["seeds"]:
             repo = s["repo"].format(size=size, seed=seed)
-            yield size, seed, repo
+            yield size, seed, repo, s.get("variant", "base")
+
+
+def default_suites(cfg) -> list[str]:
+    return [k for k, v in cfg["suites"].items() if not v.get("optional")]
+
+
+def wanted_steps(cfg, suite: str, size: str, steps_avail: dict) -> tuple[list[int], set[int]]:
+    """Steps to read for one model, and the subset read only for the loss-spike check."""
+    s = cfg["suites"][suite]
+    final = max(steps_avail)
+    if "step_fracs" in s:   # OLMo: fractions of the last pretraining checkpoint
+        wanted = [max(1, int(round(f * final))) for f in s["step_fracs"]]
+    else:
+        wanted = list(cfg["steps"])
+    h71 = cfg["h71"]
+    if size in h71["full_res_sizes"] + h71["coarse_sizes"] and suite == "pythia":
+        wanted += [int(round(st * final)) for st in h71.get("stages", cfg["stages"])]
+    sc = cfg.get("spike_check") or {}
+    spike_only: set[int] = set()
+    if suite == sc.get("suite") and size == sc.get("size"):
+        spike_only = set(sc["extra_steps"]) - set(wanted)
+        wanted += list(sc["extra_steps"])
+    return sorted(set(wanted)), spike_only
+
+
+def name_switch_flag(cfg, repo: str, commit_date: str | None) -> str:
+    ns = cfg.get("name_switch") or {}
+    if repo not in ns.get("repos", []):
+        return ""
+    if not commit_date:
+        return "unknown: no commit date"
+    if commit_date[:10] < ns["date"]:
+        return "CHECK: commit predates the name switch (may be the deduplicated model)"
+    return "after switch"
+
+
+def spike_check(df: pd.DataFrame, sc: dict) -> list[dict]:
+    """Per quantity, |change| between consecutive steps of each flagged seed against the other seeds
+    of the same size over the same interval: robust z = (|dq| - median) / (1.4826 MAD); a jump needs
+    |dq| above every other seed and z > sc['robust_z']."""
+    d = df[(df.suite == sc["suite"]) & (df["size"] == sc["size"])]
+    flagged = list(sc["flagged_seeds"])
+    out = []
+    for q in sc["quantities"]:
+        if q not in d or d[q].notna().sum() == 0:
+            continue
+        piv = d.pivot_table(index="step", columns="seed", values=q, aggfunc="first").sort_index()
+        steps = piv.index.to_list()
+        diffs = piv.diff()
+        for i in range(1, len(steps)):
+            r = diffs.iloc[i]
+            others = np.abs(r.drop(labels=flagged, errors="ignore").dropna().to_numpy(float))
+            med = float(np.median(others)) if len(others) else np.nan
+            mad = float(1.4826 * np.median(np.abs(others - med))) if len(others) else np.nan
+            for s in flagged:
+                if s not in r.index or not np.isfinite(r[s]):
+                    continue
+                a = abs(float(r[s]))
+                z = (a - med) / mad if np.isfinite(mad) and mad > 0 else np.nan
+                jump = bool(len(others) >= 3 and a > others.max() and np.isfinite(z) and z > sc["robust_z"])
+                out.append({"quantity": q, "seed": s, "step_from": steps[i - 1], "step_to": steps[i],
+                            "value_from": float(piv.iloc[i - 1][s]), "value_to": float(piv.iloc[i][s]),
+                            "dq": float(r[s]), "others_n": int(len(others)), "others_median_abs_dq": med,
+                            "others_max_abs_dq": float(others.max()) if len(others) else np.nan,
+                            "robust_z": z, "jump": jump})
+    return out
+
+
+SEED_VAR_QS = ["probe_loss", "alpha", "zeta_right", "zeta_left", "alpha_esd", "K", "Kurt0", "H_dep", "dh_rep", "eval_loss"]
+
+
+def seed_variance(df: pd.DataFrame) -> list[dict]:
+    """Spread across seeds per (variant, size, step): joint (init and batch composition), data order
+    alone, initialization alone. Only (size, step) pairs that more than one variant reached."""
+    d = df[df.variant.isin(["joint", "data", "weight"])]
+    out = []
+    for (size, step), g in d.groupby(["size", "step"]):
+        if g.variant.nunique() < 2:
+            continue
+        for q in [q for q in SEED_VAR_QS if q in g]:
+            sds = {}
+            for var, h in g.groupby("variant"):
+                v = h[q].dropna().to_numpy(float)
+                sds[var] = (len(v), float(np.mean(v)) if len(v) else np.nan,
+                            float(np.std(v, ddof=1)) if len(v) >= 2 else np.nan)
+            ref = sds.get("joint", (0, np.nan, np.nan))[2]
+            for var, (n, m, sd) in sds.items():
+                out.append({"size": size, "step": step, "quantity": q, "variant": var, "n_seeds": n,
+                            "mean": m, "sd": sd, "sd_ratio_to_joint": sd / ref if ref and np.isfinite(ref) else np.nan})
+    return out
 
 
 def jvp_projections(model, ids, params, dirs, device, batch):
@@ -81,6 +184,7 @@ def noise_quantities(values: np.ndarray, B: int, n_blocks: int, T: dict, rng) ->
                                  hill_tol=T["hill_tol"], hill_eps=T["hill_eps"], n_jobs=T["n_jobs"], rng=rng)
             out[f"zeta_{side}"] = rd.fit.zeta
             out[f"tail_label_{side}"] = rd.label
+            out[f"tail_reason_{side}"] = rd.reason
             out[f"p_ks_{side}"] = rd.p_ks
         except ValueError:
             pass
@@ -89,7 +193,10 @@ def noise_quantities(values: np.ndarray, B: int, n_blocks: int, T: dict, rng) ->
 
 def main():
     ap = runtime.base_parser(__doc__)
-    ap.add_argument("--suite", default=None, help="pythia | polypythia | olmo (default: all in config)")
+    ap.add_argument("--suite", default=None, help="comma-separated suites from config.py (default: every suite "
+                                                  "not marked optional, so olmo7b runs only when named)")
+    ap.add_argument("--pin-only", action="store_true", help="resolve and record the commit of every model and "
+                                                            "revision in pins.json, then stop (no measurement)")
     ap.add_argument("--sizes", default=None, help="comma-separated subset of sizes")
     ap.add_argument("--skip", default="", help="comma-separated parts to skip: grad,esd,act,dh,htok,h71,scaling,coupling")
     ap.add_argument("--jvp-batch", type=int, default=32)
@@ -102,8 +209,12 @@ def main():
     skip = set(filter(None, args.skip.split(",")))
     T = cfg["tails"]
     S = cfg["scale"]
-    suites = [args.suite] if args.suite else list(cfg["suites"])
+    suites = args.suite.split(",") if args.suite else default_suites(cfg)
+    unknown = [x for x in suites if x not in cfg["suites"]]
+    if unknown:
+        raise SystemExit(f"unknown suite(s) {unknown}; config.py has {list(cfg['suites'])}")
     h71cfg = cfg["h71"]
+    sc = cfg.get("spike_check") or {}
     h71_Bs = h71cfg.get("batch_sizes", cfg["batch_sizes_h71"])
     stages = h71cfg.get("stages", cfg["stages"])
 
@@ -111,18 +222,28 @@ def main():
     data_cache: dict = {}
 
     for suite in suites:
-        for size, seed, repo in suite_models(cfg, suite):
+        scfg = cfg["suites"][suite]
+        for size, seed, repo, variant in suite_models(cfg, suite):
             if args.sizes and size not in args.sizes.split(","):
                 continue
-            # revisions available for this repo
-            steps_avail = hf.list_steps(repo, run, cfg["steps"])
+            # revisions available for this repo (offline stand-in: the configured Pythia-style steps)
+            fallback_steps = list(cfg["steps"]) + (list(sc["extra_steps"]) if suite == sc.get("suite") else [])
+            steps_avail = hf.list_steps(repo, run, fallback_steps,
+                                        branch_regex=scfg.get("branch_regex", r"^step(\d+)$"))
             final = max(steps_avail)
-            wanted = list(cfg["steps"])
-            if size in h71cfg["full_res_sizes"] + h71cfg["coarse_sizes"]:
-                wanted += [int(round(st * final)) for st in stages]
-            chosen = hf.nearest_steps(steps_avail, sorted(set(wanted)))
+            wanted, spike_only_steps = wanted_steps(cfg, suite, size, steps_avail)
+            chosen = hf.nearest_steps(steps_avail, wanted)
+            if args.pin_only:
+                for step, rev in chosen:
+                    try:
+                        hf.PINS.resolve(repo, rev, run)
+                    except Exception as e:  # noqa: BLE001  report every missing name, then fail
+                        run.note(f"PIN FAILED {repo}@{rev}: {type(e).__name__}: {str(e)[:160]}")
+                continue
             for step, rev in chosen:
+                spike_only = step in spike_only_steps   # read only the spike-check quantities here
                 model, tok, src = hf.load_causal_lm(repo, rev, run, dtype=dtype, device=dev)
+                pin = hf.PINS.entry(repo, rev) or {} if src == "hub" else {}
                 key = type(tok).__name__ + str(getattr(tok, "name_or_path", ""))
                 if key not in data_cache:  # same examples for every checkpoint of a tokenizer
                     need_pool = cfg["coupling_blocks"] * cfg["coupling_B"]
@@ -140,18 +261,27 @@ def main():
                 pool, probe, evals, sur = data_cache[key]
                 vocab = model.get_output_embeddings().weight.shape[0]
                 pool_v, probe_v, evals_v, sur_v = (t.clamp(max=vocab - 1) for t in (pool, probe, evals, sur))
-                row = {"suite": suite, "size": size, "seed": seed, "repo": repo, "step": step, "revision": rev,
-                       "source": src, "n_params": sum(p.numel() for p in model.parameters()),
+                row = {"suite": suite, "variant": variant, "size": size, "seed": seed, "repo": repo, "step": step,
+                       "revision": rev, "commit": pin.get("commit"), "commit_date": pin.get("commit_date"),
+                       "name_switch_check": name_switch_flag(cfg, repo, pin.get("commit_date")) if src == "hub" else "",
+                       "source": src, "spike_grid_only": spike_only,
+                       "loss_spike_seed": bool(suite == sc.get("suite") and size == sc.get("size")
+                                               and seed in sc.get("flagged_seeds", [])),
+                       "n_params": sum(p.numel() for p in model.parameters()),
                        "n_nonembed": lm.non_embedding_params(model)}
+                if row["name_switch_check"].startswith("CHECK"):
+                    run.note(f"{repo}@{rev}: {row['name_switch_check']}; confirm on the model card at {row['commit']}")
                 frac = step / final if final else 1.0
+                skip_here = skip | ({"dh", "htok", "h71", "scaling"} if spike_only else set())
+                row["probe_loss"] = float(lm.token_losses(model, probe_v, dev).mean())   # locates loss spikes
 
-                if "esd" not in skip:
+                if "esd" not in skip_here:
                     a_esd, lrows = spectra.model_alpha_esd(model, rng=rng)
                     row["alpha_esd"] = a_esd
                     esd_rows += [{**r, "repo": repo, "step": step} for r in lrows]
-                if "act" not in skip or "dh" not in skip:
+                if "act" not in skip_here or "dh" not in skip_here:
                     hs = lm.hidden_states(model, probe_v, dev)
-                    if "act" not in skip:
+                    if "act" not in skip_here:
                         ks = []
                         for li, H in enumerate(hs):
                             st = spectra.activation_stats(H)
@@ -162,7 +292,7 @@ def main():
                         row["Kurt0"] = float(np.median([s["Kurt0"] for s in ks]))
                         row["n_outlier_channels"] = int(np.sum([s["n_outlier_channels"] for s in ks]))
                         row["act_zeta"] = float(np.nanmedian([s.get("act_zeta", np.nan) for s in ks]))
-                    if "dh" not in skip:
+                    if "dh" not in skip_here:
                         X = hs[-1].numpy()
                         if len(X) > cfg["dh_points"]:
                             X = X[rng.choice(len(X), cfg["dh_points"], replace=False)]
@@ -171,12 +301,12 @@ def main():
                         row.update({"dh_rep": d["delta_h_rep"], "dh_scope": d["scope"], "dh_D2": d["D2"],
                                     "dh_clause_ok": d["clause_ok"], "dh_decades": d["decades_r"]})
                     del hs
-                if "htok" not in skip:
+                if "htok" not in skip_here:
                     series = lm.token_losses(model, sur_v, dev).reshape(-1).numpy()
                     m = hurst.memory_claim(series, n_surr=S["n_surr"], rng=rng, wavelet_j1=S["wavelet_j1"])
                     row.update({f"Htok_{k}": v for k, v in m.items()})
                     row["H_dep"] = m["H_dep_dfa"]  # exploratory stand-in in the coupling matrix
-                if "grad" not in skip:
+                if "grad" not in skip_here:
                     B = cfg["coupling_B"]
                     n = cfg["coupling_blocks"] * B
                     params, dirs = directions(model, pool_v[:cfg["hessian_batch"]], dev, cfg["n_random_dirs"], 0, run.seed)
@@ -186,7 +316,7 @@ def main():
                 # H7.1 at the four training stages
                 h71_size = size in h71cfg["full_res_sizes"] or size in h71cfg["coarse_sizes"]
                 stage_hit = any(abs(frac - st) < 0.02 or (st >= 0.999 and step == final) for st in stages)
-                if "h71" not in skip and h71_size and stage_hit and seed in (0, 1) and suite in ("pythia",):
+                if "h71" not in skip_here and h71_size and stage_hit and suite == "pythia":
                     nb = h71cfg.get("n_blocks", config.H71["n_blocks"]) if size in h71cfg["full_res_sizes"] else h71cfg["coarse_blocks"]
                     n_pool = nb * max(h71_Bs)
                     params, dirs = directions(model, pool_v[:cfg["hessian_batch"]], dev,
@@ -195,11 +325,11 @@ def main():
                     for j, (kind, i, _) in enumerate(dirs):
                         res = batchmod.h71_test(P[:, j], h71_Bs, nb, n_boot=h71cfg.get("n_boot", config.H71["n_boot"]),
                                                 rng=rng)
-                        meta = {"repo": repo, "size": size, "step": step, "stage": round(frac, 3),
+                        meta = {"repo": repo, "commit": row["commit"], "size": size, "step": step, "stage": round(frac, 3),
                                 "direction": f"{kind}{i}"}
                         h71_rows += [{**meta, **r} for r in res["per_B"]]
                         h71_summ.append({**meta, **res["summary"]})
-                if step == final and "scaling" not in skip:
+                if step == final and "scaling" not in skip_here:
                     row["eval_loss"] = float(lm.token_losses(model, evals_v, dev).mean())
                 rows.append(row)
                 run.note(f"{repo}@{rev}: done")
@@ -207,39 +337,68 @@ def main():
                 if dev.startswith("cuda"):
                     torch.cuda.empty_cache()
 
+    extra = {}
+    if args.pin_only:
+        failed = [m for m in run.notes if m.startswith("PIN FAILED")] if hasattr(run, "notes") else []
+        extra["pins_resolved"] = len(run.pins)
+        runtime.finish_run(run, extra=extra)
+        if failed:
+            raise SystemExit(f"{len(failed)} name(s) could not be pinned; see run.json notes")
+        return
+
     df = pd.DataFrame(rows)
     runtime.write_csv(run.out_dir / "checkpoints.csv", rows)
     runtime.write_csv(run.out_dir / "esd_layers.csv", esd_rows)
     runtime.write_csv(run.out_dir / "activations_layers.csv", act_rows)
     runtime.write_csv(run.out_dir / "h71_per_B.csv", h71_rows)
     runtime.write_csv(run.out_dir / "h71_summary.csv", h71_summ)
+    if not len(df):
+        extra["n_checkpoints"] = 0
+        runtime.finish_run(run, extra=extra)
+        return
+    df["family"] = df["suite"] + ":" + df["seed"].astype(str)
+    full = df[~df.spike_grid_only]   # the spike-only steps enter only the spike check
 
-    # a_N per family (suite, seed) from final eval losses
-    extra = {}
-    if "eval_loss" in df:
-        fin = df.dropna(subset=["eval_loss"])
+    # a_N per family (suite, seed) from final eval losses; a fit needs at least three sizes
+    if "eval_loss" in full:
+        fin = full.dropna(subset=["eval_loss"])
         for (suite, seed), g in fin.groupby(["suite", "seed"]):
+            if g["size"].nunique() < 3:
+                continue
             fit = lm.fit_scaling(g["n_nonembed"].to_numpy(), g["eval_loss"].to_numpy())
-            scale_rows.append({"suite": suite, "seed": seed, "n_sizes": len(g), **fit})
+            scale_rows.append({"suite": suite, "seed": seed, "family": f"{suite}:{seed}", "n_sizes": len(g), **fit})
         runtime.write_csv(run.out_dir / "scaling.csv", scale_rows)
 
-    # exploratory coupling across seeds within sizes (final checkpoints)
-    if "coupling" not in skip and len(df):
-        fin = df[df.step == df.groupby("repo").step.transform("max")].copy()
-        sc = pd.DataFrame(scale_rows)
-        if len(sc):
-            fin = fin.merge(sc[["suite", "seed", "a_N"]], on=["suite", "seed"], how="left")
+    # spread across seeds: joint vs data order alone vs initialization alone (160M)
+    sv = seed_variance(full)
+    runtime.write_csv(run.out_dir / "seed_variance.csv", sv)
+
+    # loss-spike seeds: do alpha, alpha_ESD or K jump where the loss does?
+    if sc and "spike" not in skip:
+        sp = spike_check(df, sc)
+        runtime.write_csv(run.out_dir / "spike_check.csv", sp)
+        extra["spike_check"] = {"suite": sc["suite"], "size": sc["size"], "flagged_seeds": sc["flagged_seeds"],
+                                "jumps": [{k: r[k] for k in ("quantity", "seed", "step_from", "step_to", "robust_z")}
+                                          for r in sp if r["jump"]]}
+
+    # exploratory coupling across seeds within (suite, size) cells (final checkpoints); a_N per family
+    if "coupling" not in skip:
+        fin = full[full.step == full.groupby("repo").step.transform("max")].copy()
+        sc_df = pd.DataFrame(scale_rows)
+        if len(sc_df):
+            fin = fin.merge(sc_df[["family", "a_N"]], on="family", how="left")
+        fin = fin[fin.groupby(["suite", "size"]).repo.transform("size") >= 2]   # a one-run cell adds nothing
         qs = [q for q in ["alpha", "alpha_esd", "K", "H_dep", "dh_rep"] if q in fin and fin[q].notna().sum() >= 4]
-        if len(qs) >= 2 and fin.groupby("size").size().max() >= 3:
-            res = coupling.coupling_test(fin, qs, ["size"], n_perm=200 if run.smoke else 5000,
-                                         family_col="seed", family_quantity="a_N" if "a_N" in fin else None, rng=rng)
+        if len(qs) >= 2 and len(fin) and fin.groupby(["suite", "size"]).size().max() >= 3:
+            res = coupling.coupling_test(fin, qs, ["suite", "size"], n_perm=200 if run.smoke else 5000,
+                                         family_col="family", family_quantity="a_N" if "a_N" in fin else None, rng=rng)
             pair_rows = [{"q1": k[0], "q2": k[1], **v} for k, v in res["pairs"].items()]
             runtime.write_csv(run.out_dir / "coupling_pairs.csv", pair_rows)
             (run.out_dir / "coupling.json").write_text(json.dumps(runtime.to_jsonable(
                 {k: v for k, v in res.items() if k != "pairs"}), indent=2))
             extra["coupling_primary"] = res["primary"]
         else:
-            run.note("coupling matrix skipped: needs >= 3 seeds of one size and >= 2 quantities")
+            run.note("coupling matrix skipped: needs >= 3 seeds in one (suite, size) cell and >= 2 quantities")
     extra["n_checkpoints"] = len(rows)
     runtime.finish_run(run, extra=extra)
 

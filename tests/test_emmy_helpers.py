@@ -28,3 +28,12 @@ def test_layer_accumulator_and_logit_metrics():
     assert same["kl_sum"] == 0 and same["top1"] == 16 and same["nll_e"] == same["nll_c"]
     other = emmy_check.logit_metrics(le, le + 0.5 * torch.randn(16, 50), ids)
     assert other["kl_sum"] > 0 and other["max_abs"] > 0
+
+
+def test_fast_math_lanes_environment():
+    base = {"PATH": "/bin", "EMMY_FAST_MATH": "1", "EMMY_FAST_EXP": "1", "EMMY_OTHER": "x"}
+    on = emmy_check.fast_math_env(base, 1)
+    off = emmy_check.fast_math_env(base, 0)
+    assert "EMMY_FAST_MATH" not in on and "EMMY_FAST_EXP" not in on          # default lane: nothing pinned
+    assert off["EMMY_FAST_MATH"] == "0" and "EMMY_FAST_EXP" not in off
+    assert on["EMMY_OTHER"] == off["EMMY_OTHER"] == "x" and on["PATH"] == "/bin"

@@ -69,14 +69,41 @@ CONFIG = {
     # ------------------------------------------------------------------ P1: checkpoints (no training)
     "p1_checkpoints": {
         "full": {
+            # Every model is loaded at the commit recorded in pins.json (see README, "Pinned commits").
+            # variant: base = one run per size; joint = init and batch composition vary together
+            # (PolyPythias -seed{n}); data = only the data order varies; weight = only the initialization.
+            # Suites marked optional run only when named (--suite olmo7b), never by default.
             "suites": {
-                "pythia": {"repo": "EleutherAI/pythia-{size}", "sizes": ["14m", "31m", "70m", "160m", "410m", "1b", "1.4b"], "seeds": [0]},
-                # [VERIFY] PolyPythias also has -weight-seed{seed} and -data-seed{seed} repos (one source of
-                # randomness each); -seed{seed} varies both. Pick the variant the coupling test needs.
-                "polypythia": {"repo": "EleutherAI/pythia-{size}-seed{seed}", "sizes": ["14m", "31m", "70m", "160m", "410m"], "seeds": [1, 2, 3, 4, 5, 6, 7, 8, 9]},
-                "olmo": {"repo": "allenai/OLMo-{size}-hf", "sizes": ["1B", "7B"], "seeds": [0]},
+                "pythia": {"repo": "EleutherAI/pythia-{size}", "sizes": ["14m", "31m", "70m", "160m", "410m", "1b", "1.4b"],
+                           "seeds": [0], "variant": "base"},
+                "polypythia": {"repo": "EleutherAI/pythia-{size}-seed{seed}", "sizes": ["14m", "31m", "70m", "160m", "410m"],
+                               "seeds": [1, 2, 3, 4, 5, 6, 7, 8, 9], "variant": "joint"},
+                "polypythia_data": {"repo": "EleutherAI/pythia-160m-data-seed{seed}", "sizes": ["160m"],
+                                    "seeds": [1, 2, 3], "variant": "data"},
+                # [VERIFY] repo name: the PolyPythias collection lists the initialization-only runs as
+                # pythia-160m-weight-seed{n}; confirm on the Hub (hf.Pins fails loudly if the name is wrong)
+                "polypythia_weight": {"repo": "EleutherAI/pythia-160m-weight-seed{seed}", "sizes": ["160m"],
+                                      "seeds": [1, 2, 3], "variant": "weight"},
+                # default OLMo: OLMo 2 1B (April 2025) with released pretraining checkpoints, fits the RTX 5090
+                "olmo": {"repo": "allenai/OLMo-2-0425-1B", "sizes": ["1b"], "seeds": [0], "variant": "base",
+                         "branch_regex": r"^stage1-step(\d+)-tokens",
+                         "step_fracs": [0.0005, 0.002, 0.01, 0.03, 0.1, 0.25, 0.5, 0.75, 1.0]},
+                # OPTIONAL, last job, only if credits remain: needs the L40S (48 GB)
+                "olmo7b": {"repo": "allenai/OLMo-2-1124-7B", "sizes": ["7b"], "seeds": [0], "variant": "base",
+                           "branch_regex": r"^step(\d+)-tokens", "optional": True,
+                           "step_fracs": [0.002, 0.01, 0.1, 0.5, 1.0]},
             },
-            "steps": [1, 8, 64, 512, 1000, 4000, 8000, 16000, 32000, 64000, 143000],
+            "steps": [1, 8, 64, 512, 1000, 4000, 8000, 16000, 32000, 64000, 143000],   # Pythia-style suites
+            # Loss spikes (PolyPythias paper, Fig. 5): 410M seeds 3 and 4. Every 410M PolyPythias seed is read
+            # at the extra steps too, so the flagged seeds are compared with the other seeds at the same steps.
+            # [VERIFY] the extra steps against Fig. 5 (the paper gives no step numbers; the runs deviate early).
+            "spike_check": {"suite": "polypythia", "size": "410m", "flagged_seeds": [3, 4],
+                            "extra_steps": [2000, 3000, 5000, 6000, 10000, 12000, 20000, 24000, 48000, 96000, 120000],
+                            "quantities": ["probe_loss", "alpha", "alpha_esd", "K"],
+                            "robust_z": 3.5},   # OURS: a jump is |dq| above every other seed and robust z > 3.5
+            # pythia-14m / pythia-31m switched from the deduplicated to the standard-Pile models in Feb 2026;
+            # commits of these names dated before the switch are flagged in checkpoints.csv
+            "name_switch": {"repos": ["EleutherAI/pythia-14m", "EleutherAI/pythia-31m"], "date": "2026-02-01"},
             "final_step": 143000,
             "dtype": "float32",
             "pool_dataset": ["monology/pile-uncopyrighted", None, "train"],  # Pile text without the copyrighted subsets
@@ -94,9 +121,16 @@ CONFIG = {
             "tails": {"n_boot": 2500},
         },
         "smoke": {
-            "suites": {"pythia": {"repo": "EleutherAI/pythia-{size}", "sizes": ["14m"], "seeds": [0]},
-                       "polypythia": {"repo": "EleutherAI/pythia-{size}-seed{seed}", "sizes": ["14m"], "seeds": [1]}},
+            "suites": {"pythia": {"repo": "EleutherAI/pythia-{size}", "sizes": ["14m"], "seeds": [0], "variant": "base"},
+                       "polypythia": {"repo": "EleutherAI/pythia-{size}-seed{seed}", "sizes": ["14m"], "seeds": [1, 3],
+                                      "variant": "joint"},
+                       # smoke only: no 14M data-seed run exists, so this name falls back to a stand-in and
+                       # only exercises the per-variant code (seed_variance.csv)
+                       "polypythia_data": {"repo": "EleutherAI/pythia-{size}-data-seed{seed}", "sizes": ["14m"],
+                                           "seeds": [1], "variant": "data"}},
             "steps": [1000, 143000], "final_step": 143000,
+            "spike_check": {"suite": "polypythia", "size": "14m", "flagged_seeds": [3], "extra_steps": [4000],
+                            "quantities": ["probe_loss", "alpha_esd", "K"], "robust_z": 3.5},
             "example_len": 32, "n_random_dirs": 1, "n_hessian_dirs": 1, "hessian_batch": 8,
             "coupling_blocks": 40, "probe_seqs": 4, "probe_len": 64, "dh_points": 256,
             "surprisal_docs": 2, "surprisal_len": 512,
@@ -231,9 +265,10 @@ CONFIG = {
             "models": [["EleutherAI/pythia-410m", "step143000"], ["EleutherAI/pythia-1b", "step143000"],
                        ["EleutherAI/pythia-1.4b", "step143000"]],
             "from_p1_top_k": 3,      # add the three checkpoints with the largest K in P1 results, if present
-            # 500, not 512: emmy-ml 0.3.25 mis-shapes the fused QKV reshape when seq_len equals a model
-            # dimension (seen with seq_len = hidden_size); emmy_check.py also shifts seq_len off any model dimension
-            "seq_len": 500, "n_seqs": 16, "dtypes": ["float16", "float32"], "fast_math": [1, 0],
+            # 500, not 512: emmy-ml 0.3.25 evaluates the embedding lookup as torch.gather when seq_len equals
+            # hidden_size (docs/emmy-issue-seq-len-hidden-size.md); emmy_check.py also shifts seq_len off any model dimension
+            "seq_len": 500, "n_seqs": 16, "dtypes": ["float16", "float32"],
+            "fast_math": [1, 0],     # 1 = Emmy's default (EMMY_FAST_MATH unset), 0 = EMMY_FAST_MATH=0
             "dataset": ["Salesforce/wikitext", "wikitext-2-raw-v1", "test"],
             "outlier_threshold": 6.0,   # same absolute threshold as P1's activation statistics
             # agreement reading (OURS, placeholders until preregistration): compiled vs eager at the same dtype
@@ -241,7 +276,7 @@ CONFIG = {
             "worker_timeout_s": 3600,
         },
         "smoke": {"models": [["EleutherAI/pythia-14m", "step143000"]], "from_p1_top_k": 0,
-                  "seq_len": 60, "n_seqs": 2, "dtypes": ["float32"], "fast_math": [0]},
+                  "seq_len": 60, "n_seqs": 2, "dtypes": ["float32"], "fast_math": [1, 0]},
     },
 }
 
@@ -252,7 +287,7 @@ HARDWARE = {
     "p5_escape": (25, "4 GB laptop / Kaggle T4"),
     "p2_w4a4": (30, "RTX 5090 (32 GB)"),
     "p4_clipping": (30, "Kaggle T4 (16 GB) / RTX 5090"),
-    "p1_checkpoints": (45, "Pythia/PolyPythia: Kaggle T4 or RTX 5090; OLMo-7B: L40S (48 GB)"),
+    "p1_checkpoints": (45, "RTX 5090 for every default suite (OLMo 2 1B included); optional OLMo 2 7B: L40S (48 GB)"),
     "p3_fractional_memory": (65, "Kaggle T4 (16 GB) / RTX 5090"),
 }
 

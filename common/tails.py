@@ -17,6 +17,7 @@ shifts every log-likelihood by the same constant and leaves the ratios unchanged
 from __future__ import annotations
 
 import math
+import itertools
 from dataclasses import dataclass, asdict, field
 
 import numpy as np
@@ -315,9 +316,10 @@ class TailReading:
     tests: dict = field(default_factory=dict)
     hill_db: dict = field(default_factory=dict)
     hill_agrees: bool | None = None
+    reason: str = ""
 
     def as_row(self, prefix=""):
-        row = {prefix + "label": self.label, prefix + "p_ks": self.p_ks,
+        row = {prefix + "label": self.label, prefix + "reason": self.reason, prefix + "p_ks": self.p_ks,
                prefix + "hill_agrees": self.hill_agrees}
         row.update(self.fit.as_dict(prefix))
         for name, t in self.tests.items():
@@ -326,6 +328,41 @@ class TailReading:
         for k, v in self.hill_db.items():
             row[prefix + k] = v
         return row
+
+
+def _separate_alternatives(preferred, label_of, ll, tests, level):
+    """Label when one or more alternatives beat the power law (sec. 7.1).
+
+    If the preferred alternatives all carry one label, that label stands. Otherwise the competing
+    alternatives are tested against each other, and a label is given only if a model with that label
+    beats every model with another label at the same level: by Vuong's test for non-nested pairs, by
+    the likelihood-ratio test for the nested pair exponential / Weibull. When the tests cannot separate
+    them, the reading is "undecided" (CSN sec. 5.1: an inconclusive test picks no winner).
+    """
+    labels = {label_of[n] for n in preferred}
+    if len(labels) == 1:
+        return labels.pop(), "preferred over the power law: " + ", ".join(preferred)
+    beats = {}
+    for a, b in itertools.combinations(preferred, 2):
+        if label_of[a] == label_of[b]:
+            continue
+        if {a, b} == {"exp", "weibull"}:  # nested: Weibull with w = 1 is the exponential
+            lr = 2 * (float(np.sum(ll["weibull"])) - float(np.sum(ll["exp"])))
+            p = float(stats.chi2.sf(max(lr, 0.0), 1))
+            tests["weibull_vs_exp"] = {"lr": lr, "p": p}
+            winner = "weibull" if p <= level and lr > 0 else None
+        else:
+            v = vuong(ll[a], ll[b])
+            tests[f"{a}_vs_{b}"] = v
+            winner = (a if v["R"] > 0 else b) if v["p"] <= level else None
+        beats[(a, b)] = winner
+    for lab in labels:
+        mine = [n for n in preferred if label_of[n] == lab]
+        others = [n for n in preferred if label_of[n] != lab]
+        if all(any(beats.get((m, o), beats.get((o, m))) == m for m in mine) for o in others):
+            return lab, "separated from the other preferred alternatives: " + ", ".join(preferred)
+    return "undecided", "alternatives with different labels not separable: " + ", ".join(
+        f"{n} ({label_of[n]})" for n in preferred)
 
 
 def read_tail(x, n_boot: int = 2500, level: float = 0.1, min_tail: int = 50,
@@ -351,34 +388,24 @@ def read_tail(x, n_boot: int = 2500, level: float = 0.1, min_tail: int = 50,
     lr = 2 * (float(np.sum(ll_t)) - float(np.sum(llpl)))
     tests["truncated"] = {"lr": lr, "p": float(stats.chi2.sf(max(lr, 0.0), 1)), **par_t}
 
-    # an alternative is preferred if its Vuong (or LR) test is significant against the power law.
-    # When several are, the one with the smallest AIC wins (OUR tie-break; sec. 7.1 does not rank them):
-    # score = log-likelihood gain over the power law minus the alternative's number of parameters,
-    # so an exponential is not relabelled "truncated" or "slow" by a two-parameter law that nests it.
-    n_par = {"exp": 1, "lognormal": 2, "weibull": 2, "truncated": 2}
-    preferred = []
-    for name in ("lognormal", "weibull", "exp"):
-        t = tests[name]
-        if t["p"] <= level and t["R"] < 0:
-            preferred.append((name, -t["R"] - n_par[name]))
+    # an alternative is preferred if its Vuong (or LR) test is significant against the power law
+    ll = {"exp": ll_e, "lognormal": ll_ln, "weibull": ll_w, "truncated": ll_t}
+    label_of = {"lognormal": "slow", "weibull": "slow" if tests["weibull"]["w"] < 1 else "mild",
+                "exp": "mild", "truncated": "truncated"}
+    preferred = [n for n in ("lognormal", "weibull", "exp") if tests[n]["p"] <= level and tests[n]["R"] < 0]
     if tests["truncated"]["p"] <= level and lr > 0:
-        preferred.append(("truncated", lr / 2 - n_par["truncated"]))
+        preferred.append("truncated")
+    reason = ""
     if preferred:
-        name = max(preferred, key=lambda v: v[1])[0]
-        if name == "lognormal":
-            label = "slow"
-        elif name == "weibull":
-            label = "slow" if tests["weibull"]["w"] < 1 else "mild"
-        elif name == "exp":
-            label = "mild"
-        else:
-            label = "truncated"
+        label, reason = _separate_alternatives(preferred, label_of, ll, tests, level)
     elif (np.isnan(p_ks) or p_ks > level) and fit.decades_x >= 2 and fit.decades_y >= 2:
         label = "wild" if fit.zeta < 2 else "pre-wild"
+        reason = "power law kept by p_KS; no alternative preferred; two decades"
     else:
         label = "undecided"
+        reason = "power law rejected by p_KS" if p_ks <= level else "tail spans fewer than two decades"
 
-    reading = TailReading(label=label, fit=fit, p_ks=p_ks, tests=tests)
+    reading = TailReading(label=label, fit=fit, p_ks=p_ks, tests=tests, reason=reason)
     if hill_db:
         reading.hill_db = hill_double_bootstrap(x, eps=hill_eps, n_rep=hill_reps, rng=rng)
         zdb = reading.hill_db["zeta_db"]
@@ -386,6 +413,7 @@ def read_tail(x, n_boot: int = 2500, level: float = 0.1, min_tail: int = 50,
         # sec. 7.1: zeta-hat is accepted only where the double bootstrap agrees with it
         if label in ("wild", "pre-wild") and not reading.hill_agrees:
             reading.label = "undecided"
+            reading.reason = "Hill double bootstrap disagrees with zeta-hat"
     return reading
 
 

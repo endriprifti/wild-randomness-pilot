@@ -8,11 +8,73 @@ Zipfian text or random images); every replacement is written to run.json under "
 
 from __future__ import annotations
 
+import datetime as _dt
+import json
+import os
 import re
+from pathlib import Path
 from typing import Iterable
 
 import numpy as np
 import torch
+
+PINS_PATH = Path(__file__).resolve().parent.parent / "pins.json"
+
+
+class Pins:
+    """Every Hub model is loaded at a commit hash, never at a moving name.
+
+    pins.json maps "repo@revision" (revision = branch such as step1000, or "main") to the commit the
+    pilot uses, with the commit's date. The first run that meets a new name resolves it on the Hub
+    and writes it here; commit pins.json, and later runs (or --require-pins) reuse exactly those
+    commits. This matters for Pythia: in February 2026 the pythia-14m and pythia-31m names switched
+    from the deduplicated to the standard-Pile models, so a name alone does not fix the weights.
+    """
+
+    def __init__(self, path: Path = PINS_PATH):
+        self.path = Path(path)
+        self.data = json.loads(self.path.read_text()) if self.path.exists() else {}
+
+    @staticmethod
+    def key(repo: str, revision: str | None) -> str:
+        return f"{repo}@{revision or 'main'}"
+
+    def entry(self, repo: str, revision: str | None) -> dict | None:
+        return self.data.get(self.key(repo, revision))
+
+    def resolve(self, repo: str, revision: str | None, run=None) -> str:
+        k = self.key(repo, revision)
+        if re.fullmatch(r"[0-9a-f]{40}", revision or ""):
+            sha = revision                       # already a commit
+        elif k in self.data:
+            sha = self.data[k]["commit"]
+        else:
+            if run is not None and getattr(run, "require_pins", False):
+                raise KeyError(f"{k} is not pinned in {self.path.name} (run once without --require-pins to pin it)")
+            from huggingface_hub import HfApi
+            api = HfApi()
+            sha = api.model_info(repo, revision=revision).sha
+            entry = {"commit": sha, "resolved_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")}
+            try:
+                entry["commit_date"] = api.list_repo_commits(repo, revision=sha)[0].created_at.isoformat()
+            except Exception:  # noqa: BLE001  the date is informative only
+                pass
+            self.data[k] = entry
+            self.save()
+        if run is not None:
+            run.pins[k] = sha
+        return sha
+
+    def save(self):
+        on_disk = json.loads(self.path.read_text()) if self.path.exists() else {}
+        on_disk.update(self.data)                # merge: another job may have pinned other names
+        self.data = on_disk
+        tmp = self.path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(dict(sorted(on_disk.items())), indent=1) + "\n")
+        os.replace(tmp, self.path)
+
+
+PINS = Pins()
 
 PYTHIA_14M = dict(vocab_size=50304, hidden_size=128, num_hidden_layers=6, num_attention_heads=4,
                   intermediate_size=512, max_position_embeddings=2048, rotary_pct=0.25,
@@ -67,14 +129,15 @@ def load_causal_lm(name: str, revision: str | None, run, dtype=torch.float32, de
     """Returns (model, tokenizer, source) with source 'hub' or 'fallback'."""
     try:
         from transformers import AutoModelForCausalLM, AutoTokenizer
-        model = AutoModelForCausalLM.from_pretrained(name, revision=revision, dtype=dtype,
+        sha = PINS.resolve(name, revision, run)   # load the pinned commit, never the moving name
+        model = AutoModelForCausalLM.from_pretrained(name, revision=sha, dtype=dtype,
                                                      attn_implementation="eager")
-        tok = AutoTokenizer.from_pretrained(name, revision=revision)
+        tok = AutoTokenizer.from_pretrained(name, revision=sha)
         if tok.pad_token_id is None:
             tok.pad_token = tok.eos_token
         return model.to(device).eval(), tok, "hub"
     except Exception as e:  # network, auth, missing revision
-        if not run.offline_ok:
+        if not run.offline_ok or isinstance(e, KeyError):
             raise
         run.fallback(f"model {name}@{revision}: random-init GPT-NeoX stand-in ({type(e).__name__}: {str(e)[:120]})")
         cfg = dict(fallback_cfg or TINY_NEOX)
@@ -84,14 +147,16 @@ def load_causal_lm(name: str, revision: str | None, run, dtype=torch.float32, de
         return model, ByteTokenizer(cfg["vocab_size"]), "fallback"
 
 
-def list_steps(repo: str, run, default_steps: Iterable[int]) -> dict[int, str]:
-    """step -> revision name, from the repo's branches (Pythia 'step1000', OLMo 'step1000-tokens4B')."""
+def list_steps(repo: str, run, default_steps: Iterable[int], branch_regex: str = r"^step(\d+)") -> dict[int, str]:
+    r"""step -> branch name, from the repo's branches. branch_regex picks the pretraining branches:
+    Pythia 'step1000' and OLMo 2 7B 'step1000-tokens5B' (default), OLMo 2 1B 'stage1-step1000-tokens2B'
+    (r'^stage1-step(\d+)-tokens'); OLMo 2 'stage2-ingredient...' soup branches never match."""
     try:
         from huggingface_hub import list_repo_refs
         refs = list_repo_refs(repo)
         out = {}
         for br in refs.branches:
-            m = re.match(r"step(\d+)", br.name)
+            m = re.match(branch_regex, br.name)
             if m:
                 out[int(m.group(1))] = br.name
         if out:

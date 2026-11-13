@@ -6,6 +6,8 @@ style) schemes; weight-only W4 with the same three plus NF4; bits per weight mat
 Gaussian noise (to weights, and to activations under W4A4) scaled to give the same perplexity
 increase. Measured: WikiText-2 perplexity, PopQA accuracy by subject-popularity decile (and by
 pretraining document count if a CSV is given), and K, Kurt0 and zeta of activations.
+Quantization is simulated: weights and activations are quantized and dequantized in PyTorch and the
+ordinary floating-point kernels run, so the results concern accuracy, not speed or memory.
 
 H6.2 reading (register): (a) uniform W4A4 loses more on rare than frequent facts; (b) outlier
 preservation recovers most of it; (c) rotation recovers mean accuracy but leaves a rare-fact gap;

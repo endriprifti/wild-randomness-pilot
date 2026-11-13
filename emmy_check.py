@@ -18,8 +18,10 @@ the script confirms support before it compares anything:
        logits         max |diff|, relative L2, mean and max KL(eager || compiled), top-1 agreement, NLL difference
        hidden states  per layer: max |diff|, relative L2, K, max |h|, outlier channels (|h| > 6, as in P1)
                       and the Jaccard overlap of the outlier-channel sets
-     This runs for every dtype, with Emmy's fast math on and off. EMMY_FAST_MATH is set per subprocess,
-     so a crash in a compiled kernel cannot take the run down.
+     This runs for every dtype, with Emmy's fast math on (its default: EMMY_FAST_MATH unset) and off
+     (EMMY_FAST_MATH=0). Each lane is its own subprocess, so a crash in a compiled kernel cannot take the run
+     down. Emmy lets single precision knobs (EMMY_FAST_EXP, EMMY_FAST_DIV, ...) override the umbrella, so the
+     worker's environment drops any such variable inherited from the shell and run.json lists what it dropped.
 
 Checkpoints: the configured Pythia models, plus the top-k checkpoints by K in P1's checkpoints.csv
 (the outlier-heavy ones), when a full P1 run exists.
@@ -36,9 +38,10 @@ Pythia-14M shape and a smaller one):
   hf_model        unsupported: "no tracer mapping for aten.new_ones" (and aten.diff without an
                   attention mask), both from transformers' mask construction, not from GPT-NeoX layers
   static_wrapper  traced; Emmy's IR, run through its torch reference, equals the graph and the eager
-                  logits (max |diff| 0), EXCEPT when seq_len equals hidden_size: then the IR's fused-QKV
-                  reshape gets an input of the wrong size (an Emmy frontend bug). seq_len is kept off
-                  every model dimension for that reason.
+                  logits (max |diff| 0), EXCEPT when seq_len equals hidden_size: Emmy's CPU evaluators
+                  (GatherOp.forward, torch_ref) then read the embedding lookup as torch.gather, and the
+                  fused-QKV view after it fails (docs/emmy-issue-seq-len-hidden-size.md has the minimal
+                  reproduction). seq_len is kept off every model dimension for that reason.
 Kernel lowering and the numerical comparison on a GPU are still untested (lowering the whole model on
 a CPU did not finish here).
 
@@ -342,7 +345,8 @@ def _probe(route: str, module, call, x0, backend: str, dev: str, key: dict) -> t
 def _work(spec: dict, wrun: _WorkerRun) -> dict:
     dev, dtype = spec["device"], getattr(torch, spec["dtype"])
     key = {"model": spec["repo"], "revision": spec["revision"], "dtype": spec["dtype"],
-           "fast_math": spec["fast_math"], "backend": spec["backend"]}
+           "fast_math": spec["fast_math"], "EMMY_FAST_MATH": os.environ.get("EMMY_FAST_MATH", "unset"),
+           "backend": spec["backend"]}
     if dtype == torch.float16 and not dev.startswith("cuda"):
         return {"support": [{**key, "status": "skipped", "errors": "float16 on CPU"}]}
     model, tok, src = hf.load_causal_lm(spec["repo"], spec["revision"], wrun, dtype=dtype, device=dev)
@@ -353,7 +357,7 @@ def _work(spec: dict, wrun: _WorkerRun) -> dict:
     dims = {c.hidden_size, c.intermediate_size, c.num_attention_heads, hd, 3 * hd, 3 * c.hidden_size,
             int(hd * getattr(c, "rotary_pct", 1.0))}
     seq_len = spec["seq_len"]
-    while seq_len in dims:  # emmy-ml 0.3.25 mis-shapes the QKV reshape when seq_len equals hidden_size
+    while seq_len in dims:  # emmy-ml 0.3.25 reads the embedding as a gather when seq_len == hidden_size
         seq_len -= 1
     if seq_len != spec["seq_len"]:
         wrun.note(f"seq_len {spec['seq_len']} equals a model dimension; using {seq_len}")
@@ -457,6 +461,25 @@ def model_list(cfg: dict, args, run) -> list[tuple[str, str]]:
     return models
 
 
+# Emmy's precision-trading knobs (emmy.compiler.pipeline.search.space.PRECISION_KNOBS); an individual pin
+# wins over the FAST_MATH umbrella, so none may leak into either lane from the user's shell
+PRECISION_VARS = ("EMMY_FAST_MATH", "EMMY_FAST_EXP", "EMMY_F16_MMA_F32_ACC", "EMMY_FP8_MMA", "EMMY_FAST_DIV",
+                  "EMMY_FAST_SQRT", "EMMY_FLUSH_TO_ZERO", "EMMY_CONTRACT_FMA")
+
+
+def fast_math_env(base, fm: int, run=None) -> dict:
+    """Worker environment for one lane: fm=1 leaves EMMY_FAST_MATH unset (Emmy's default, fast math on);
+    fm=0 sets EMMY_FAST_MATH=0. Inherited precision pins are dropped and noted."""
+    env = {k: v for k, v in base.items() if k not in PRECISION_VARS}
+    dropped = sorted(k for k in base if k in PRECISION_VARS)
+    if dropped and run is not None and not getattr(run, "_emmy_dropped_noted", False):
+        run.note(f"dropped inherited Emmy precision pins from the worker environment: {dropped}")
+        run._emmy_dropped_noted = True
+    if not fm:
+        env["EMMY_FAST_MATH"] = "0"
+    return env
+
+
 def main():
     ap = runtime.base_parser(__doc__)
     ap.add_argument("--probe-only", action="store_true")
@@ -509,7 +532,8 @@ def main():
                 sp = work / f"{tag}.spec.json"
                 sp.write_text(json.dumps(spec))
                 Path(spec["out"]).unlink(missing_ok=True)
-                env_vars = {**os.environ, "EMMY_FAST_MATH": str(fm), "PYTHONHASHSEED": str(run.seed)}
+                env_vars = fast_math_env(os.environ, fm, run)
+                env_vars["PYTHONHASHSEED"] = str(run.seed)
                 cmd = [sys.executable, str(Path(__file__).resolve()), "--worker", str(sp)]
                 run.note(f"{repo}@{rev} {dt} fast_math={fm} backend={backend}")
                 try:

@@ -51,7 +51,7 @@ def transformer_data(cfg, run):
     tok = None
     try:
         from transformers import AutoTokenizer
-        tok = AutoTokenizer.from_pretrained(c["tokenizer"])
+        tok = AutoTokenizer.from_pretrained(c["tokenizer"], revision=hf.PINS.resolve(c["tokenizer"], None, run))
     except Exception as e:
         if not run.offline_ok:
             raise

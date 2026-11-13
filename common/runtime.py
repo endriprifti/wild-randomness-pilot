@@ -37,6 +37,8 @@ def base_parser(description: str) -> argparse.ArgumentParser:
     p.add_argument("--offline-ok", action="store_true",
                    help="allow synthetic fallbacks when Hugging Face or dataset downloads fail "
                         "(always on under --smoke; never use for real results)")
+    p.add_argument("--require-pins", action="store_true",
+                   help="fail if a model or revision is not already pinned to a commit in pins.json")
     return p
 
 
@@ -144,6 +146,8 @@ class Run:
     started: str
     notes: list = dataclasses.field(default_factory=list)
     fallbacks: list = dataclasses.field(default_factory=list)
+    pins: dict = dataclasses.field(default_factory=dict)    # "repo@revision" -> commit actually loaded
+    require_pins: bool = False
 
     def note(self, msg: str) -> None:
         print(f"[{self.test}] {msg}", flush=True)
@@ -171,6 +175,7 @@ def start_run(test: str, cfg: dict, args: argparse.Namespace) -> Run:
     out.mkdir(parents=True, exist_ok=True)
     run = Run(test=test, cfg=cfg, out_dir=out, device=device, seed=seed, smoke=bool(args.smoke),
               offline_ok=bool(args.smoke or args.offline_ok), t0=time.time(),
+              require_pins=bool(getattr(args, "require_pins", False)),
               started=_dt.datetime.now(_dt.timezone.utc).isoformat())
     run.note(f"device={device} seed={seed} smoke={run.smoke} out={out}")
     return run
@@ -213,6 +218,7 @@ def finish_run(run: Run, status: str = "ok", extra: dict | None = None) -> Path:
         "command": " ".join([Path(sys.argv[0]).name] + sys.argv[1:]),
         "config": to_jsonable(run.cfg),
         "fallbacks": run.fallbacks,
+        "pinned_commits": run.pins,
         "notes": run.notes,
     }
     if extra:

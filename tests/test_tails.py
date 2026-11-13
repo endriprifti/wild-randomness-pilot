@@ -67,9 +67,33 @@ def test_label_wild_on_pareto(rng):
 
 
 def test_label_not_wild_on_light_tails(rng):
-    for x in (rng.exponential(1.0, 20000), rng.weibull(0.5, 20000)):
+    for x in (rng.exponential(1.0, 20000), rng.weibull(0.5, 20000), rng.lognormal(0, 1, 20000)):
         r = tails.read_tail(x, n_boot=50, hill_reps=100, rng=rng)
-        assert r.label in ("mild", "slow", "truncated")
+        assert r.label in ("mild", "slow", "truncated", "undecided")
+        assert r.reason
+
+
+def test_inseparable_alternatives_read_undecided(rng):
+    # two alternatives with different labels that fit equally well: no winner is picked
+    base = rng.normal(size=500)
+    ll = {"lognormal": base + 0.01 * rng.normal(size=500), "exp": base + 0.01 * rng.normal(size=500)}
+    label_of = {"lognormal": "slow", "exp": "mild"}
+    label, reason = tails._separate_alternatives(["lognormal", "exp"], label_of, ll, {}, 0.1)
+    assert label == "undecided" and "not separable" in reason
+    # one clearly better: its label stands
+    ll["lognormal"] = base + 1.0
+    label, _ = tails._separate_alternatives(["lognormal", "exp"], label_of, ll, {}, 0.1)
+    assert label == "slow"
+
+
+def test_nested_exp_weibull_uses_likelihood_ratio(rng):
+    ll = {"exp": np.full(400, -1.0), "weibull": np.full(400, -1.0)}
+    tests = {}
+    label, _ = tails._separate_alternatives(["weibull", "exp"], {"weibull": "slow", "exp": "mild"}, ll, tests, 0.1)
+    assert label == "undecided" and "weibull_vs_exp" in tests
+    ll["weibull"] = np.full(400, -0.99)            # LR = 8 on 1 df
+    label, _ = tails._separate_alternatives(["weibull", "exp"], {"weibull": "slow", "exp": "mild"}, ll, {}, 0.1)
+    assert label == "slow"
 
 
 def test_two_decade_rule_makes_zeta3_undecided(rng):
