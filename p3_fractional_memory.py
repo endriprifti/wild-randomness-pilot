@@ -34,7 +34,7 @@ import torch
 import torch.nn.functional as F
 
 import config
-from common import runtime, ssm
+from common import hf, runtime, ssm
 
 
 def memory_task(kind, L, n, cfg_t, rng):
@@ -50,7 +50,7 @@ def memory_task(kind, L, n, cfg_t, rng):
 
 
 def lra_image(cfg_t, run, rng):
-    """CIFAR-10 as grayscale sequences (LRA image). torchvision first, then the HF mirror."""
+    """CIFAR-10 as grayscale sequences (LRA image). The Hugging Face copy first, then torchvision."""
     def to_seq(imgs):
         x = torch.tensor(np.asarray(imgs), dtype=torch.float32)
         if x.ndim == 4 and x.shape[-1] == 3:
@@ -58,29 +58,17 @@ def lra_image(cfg_t, run, rng):
         x = x.reshape(len(x), -1, 1) / 255.0
         return (x - 0.5) / 0.25
     try:
-        import torchvision
-        root = str(runtime.PILOT_ROOT / "data")
-        tr = torchvision.datasets.CIFAR10(root, train=True, download=True)
-        te = torchvision.datasets.CIFAR10(root, train=False, download=True)
-        Xtr, ytr, Xte, yte = to_seq(tr.data), torch.tensor(tr.targets), to_seq(te.data), torch.tensor(te.targets)
-        src = "torchvision"
-    except Exception as e1:
-        try:
-            from datasets import load_dataset
-            ds = load_dataset("uoft-cs/cifar10")
-            Xtr = to_seq(np.stack([np.asarray(i) for i in ds["train"]["img"]]))
-            ytr = torch.tensor(ds["train"]["label"])
-            Xte = to_seq(np.stack([np.asarray(i) for i in ds["test"]["img"]]))
-            yte = torch.tensor(ds["test"]["label"])
-            src = "hf"
-        except Exception as e2:
-            if not run.offline_ok:
-                raise RuntimeError(f"CIFAR-10 unavailable: {e1}; {e2}")
-            run.fallback("CIFAR-10 for LRA image: random images with random labels (smoke only)")
-            n_tr, n_te = cfg_t.get("limit_train", 256), cfg_t.get("limit_test", 64)
-            Xtr = torch.randn(n_tr, 1024, 1); ytr = torch.randint(0, 10, (n_tr,))
-            Xte = torch.randn(n_te, 1024, 1); yte = torch.randint(0, 10, (n_te,))
-            src = "fallback"
+        Xtr, ytr, Xte, yte, src = hf.load_cifar10(run, str(runtime.PILOT_ROOT / "data"),
+                                                  cfg_t.get("limit_train"), cfg_t.get("limit_test"))
+        Xtr, ytr, Xte, yte = to_seq(Xtr), torch.tensor(ytr), to_seq(Xte), torch.tensor(yte)
+    except RuntimeError as e:
+        if not run.offline_ok:
+            raise
+        run.fallback(f"CIFAR-10 for LRA image: random images with random labels (smoke only; {str(e)[:160]})")
+        n_tr, n_te = cfg_t.get("limit_train", 256), cfg_t.get("limit_test", 64)
+        Xtr = torch.randn(n_tr, 1024, 1); ytr = torch.randint(0, 10, (n_tr,))
+        Xte = torch.randn(n_te, 1024, 1); yte = torch.randint(0, 10, (n_te,))
+        src = "fallback"
     if "limit_train" in cfg_t:
         Xtr, ytr = Xtr[:cfg_t["limit_train"]], ytr[:cfg_t["limit_train"]]
         Xte, yte = Xte[:cfg_t["limit_test"]], yte[:cfg_t["limit_test"]]

@@ -255,7 +255,8 @@ def main():
     ap.add_argument("--sizes", default=None, help="comma-separated subset of sizes")
     ap.add_argument("--spike-only", action="store_true", help="run only the two loss-spike passes")
     ap.add_argument("--keep-cache", action="store_true", help="keep every checkpoint in the Hugging Face cache "
-                                                              "(default: delete each one after it is read)")
+                                                              "(default: delete each one after it is read; "
+                                                              "--smoke always keeps them)")
     ap.add_argument("--skip", default="", help="comma-separated parts to skip: "
                                                "grad,esd,act,dh,htok,h71,scaling,spike,coupling")
     ap.add_argument("--jvp-batch", type=int, default=32)
@@ -375,7 +376,7 @@ def main():
         del model
         if dev.startswith("cuda"):
             torch.cuda.empty_cache()
-        if src == "hub" and not args.keep_cache:
+        if src == "hub" and not (args.keep_cache or run.smoke):   # smoke re-reads small checkpoints: keep them
             hf.purge_revision(repo, pin.get("commit"), run)   # disk holds about one checkpoint at a time
         reads[tag] = reads.get(tag, 0) + 1
         return row

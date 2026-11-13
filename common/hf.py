@@ -124,6 +124,9 @@ class ByteTokenizer:
     def __init__(self, vocab_size: int = 512):
         self.vocab_size = vocab_size
 
+    def __len__(self) -> int:
+        return self.vocab_size
+
     def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
         return [2 + (b % (self.vocab_size - 2)) for b in text.encode("utf-8")]
 
@@ -236,6 +239,45 @@ def load_texts(dataset: str, config: str | None, split: str, n: int, run, field:
             raise
         run.fallback(f"dataset {dataset}/{config}:{split}: synthetic Zipfian text ({type(e).__name__})")
         return zipf_text(n, 400, seed), "fallback"
+
+
+def load_cifar10(run, root: str, limit_train: int | None = None, limit_test: int | None = None):
+    """CIFAR-10 as uint8 images [N, 32, 32, 3] and int64 labels, plus the source.
+
+    The Hugging Face copy (uoft-cs/cifar10) comes first: with limits (smoke) it streams only the images
+    needed, without the 170 MB archive; without limits it downloads the parquet files. torchvision's
+    mirror comes second; it can be very slow (130 kB/s, about 22 minutes, from the WSL2 laptop).
+    Raises RuntimeError if neither works; the caller decides on a stand-in."""
+    errors = []
+    try:
+        from datasets import load_dataset
+        out = []
+        for split, lim in (("train", limit_train), ("test", limit_test)):
+            imgs, labels = [], []
+            if lim:
+                for ex in load_dataset("uoft-cs/cifar10", split=split, streaming=True):
+                    imgs.append(np.asarray(ex["img"].convert("RGB"), dtype=np.uint8))
+                    labels.append(int(ex["label"]))
+                    if len(imgs) >= lim:
+                        break
+            else:
+                ds = load_dataset("uoft-cs/cifar10", split=split)
+                imgs = [np.asarray(im.convert("RGB"), dtype=np.uint8) for im in ds["img"]]
+                labels = list(ds["label"])
+            out += [np.stack(imgs), np.asarray(labels, dtype=np.int64)]
+        return (*out, "hf:uoft-cs/cifar10")
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"Hugging Face: {type(e).__name__}: {str(e)[:120]}")
+    try:
+        import torchvision
+        tr = torchvision.datasets.CIFAR10(root, train=True, download=True)
+        te = torchvision.datasets.CIFAR10(root, train=False, download=True)
+        Xtr, ytr = tr.data[:limit_train or None], np.asarray(tr.targets, dtype=np.int64)[:limit_train or None]
+        Xte, yte = te.data[:limit_test or None], np.asarray(te.targets, dtype=np.int64)[:limit_test or None]
+        return Xtr, ytr, Xte, yte, "torchvision"
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"torchvision: {type(e).__name__}: {str(e)[:120]}")
+    raise RuntimeError("CIFAR-10 unavailable: " + "; ".join(errors))
 
 
 def load_rows(dataset: str, config: str | None, split: str, run, limit: int | None = None):

@@ -63,13 +63,35 @@ def transformer_data(cfg, run):
     ids = hf.tokenize_stream(texts, tok, c["seq_len"], n_train + n_eval)
     ood_texts, _ = hf.load_texts(*c["ood_dataset"], n=2000, run=run, min_chars=1, seed=run.seed + 7)
     ood = hf.tokenize_stream(["\n".join(ood_texts)], tok, c["seq_len"], n_eval)
-    vocab = getattr(tok, "vocab_size", 50304)
-    return {"train": ids[:-n_eval], "test": ids[-n_eval:], "ood": ood, "vocab": vocab, "source": src}
+    return {"train": ids[:-n_eval], "test": ids[-n_eval:], "ood": ood, "vocab": tokenizer_vocab(tok), "source": src}
+
+
+def tokenizer_vocab(tok) -> int:
+    """Number of token IDs the tokenizer can emit. len(tok) counts the added tokens; tok.vocab_size does not
+    (Pythia: vocab_size 50,254 but len 50,277, and the added whitespace tokens 50,254-50,276 occur in web text)."""
+    try:
+        n = len(tok)
+    except TypeError:
+        n = 0
+    return int(max(n, getattr(tok, "vocab_size", 0) or 0))
+
+
+def check_token_ids(data: dict, vocab_size: int) -> None:
+    """Fail on the CPU with a readable message, not with a CUDA device-side assert, if a token ID has no row
+    in the embedding and logits."""
+    for split in ("train", "test", "ood"):
+        x = data.get(split)
+        if torch.is_tensor(x) and x.numel():
+            top = int(x.max())
+            if top >= vocab_size:
+                raise ValueError(f"token ID {top} in the {split} split is outside the model's vocabulary of "
+                                 f"{vocab_size}: the tokenizer emits {data.get('vocab')} IDs (len(tok)); "
+                                 f"build the model with vocab_size >= len(tok)")
 
 
 def build_transformer(cfg, vocab, seed):
     neox = dict(getattr(hf, cfg["transformer"]["neox"]))
-    neox["vocab_size"] = max(neox["vocab_size"], int(vocab)) if vocab > 1000 else int(vocab)
+    neox["vocab_size"] = max(int(neox["vocab_size"]), int(vocab))   # config slots, or every ID the tokenizer emits
     neox["max_position_embeddings"] = max(neox.get("max_position_embeddings", 2048), cfg["transformer"]["seq_len"])
     return hf.neox_from_config(neox, seed=seed)
 
@@ -77,14 +99,12 @@ def build_transformer(cfg, vocab, seed):
 def cifar_data(cfg, run):
     c = cfg["resnet18"]
     try:
-        import torchvision
-        root = str(runtime.PILOT_ROOT / "data")
-        tr = torchvision.datasets.CIFAR10(root, train=True, download=True)
-        te = torchvision.datasets.CIFAR10(root, train=False, download=True)
-        Xtr = torch.tensor(tr.data).permute(0, 3, 1, 2).float() / 255
-        Xte = torch.tensor(te.data).permute(0, 3, 1, 2).float() / 255
-        ytr, yte, src = torch.tensor(tr.targets), torch.tensor(te.targets), "torchvision"
-    except Exception as e:
+        Xtr, ytr, Xte, yte, src = hf.load_cifar10(run, str(runtime.PILOT_ROOT / "data"),
+                                                  c.get("limit_train"), c.get("limit_test"))
+        Xtr = torch.tensor(Xtr).permute(0, 3, 1, 2).float() / 255
+        Xte = torch.tensor(Xte).permute(0, 3, 1, 2).float() / 255
+        ytr, yte = torch.tensor(ytr), torch.tensor(yte)
+    except RuntimeError as e:
         if not run.offline_ok:
             raise
         run.fallback(f"CIFAR-10: random images ({type(e).__name__})")
@@ -143,7 +163,10 @@ def train(kind, cfg, data, rule, p_clip, seed, lr_scale, device, run, save_stage
     runtime.set_all_seeds(seed)
     is_lm = kind == "transformer"
     c = cfg["transformer"] if is_lm else cfg["resnet18"]
-    model = (build_transformer(cfg, data["vocab"], seed) if is_lm else build_resnet(seed)).to(device)
+    model = build_transformer(cfg, data["vocab"], seed) if is_lm else build_resnet(seed)
+    if is_lm:
+        check_token_ids(data, model.config.vocab_size)
+    model = model.to(device)
     model.train()
     lr = c["lr"] * lr_scale
     if is_lm:

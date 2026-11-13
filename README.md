@@ -100,6 +100,22 @@ GPT-NeoX of Pythia shape, a byte tokenizer, synthetic Zipfian text and random CI
 download). Hub loading itself is therefore not exercised here. Each stand-in is listed under `fallbacks` in that
 job's `run.json`. See `SMOKE_RESULTS.md` for the table from the last run.
 
+On the laptop (2026-11-13, with Hub access) three problems showed up and are fixed:
+
+- **P4 vocabulary.** The model took `tok.vocab_size` (50,254 for Pythia's tokenizer), but the tokenizer emits
+  50,277 IDs: its added whitespace tokens (50,254 to 50,276) occur in FineWeb-Edu text, and the GPU stopped with
+  "scatter gather kernel index out of bounds". P4 now builds the model with max(config vocabulary, `len(tok)`),
+  and checks before training that every token ID has a row, so a mismatch fails on the CPU with a readable message.
+  The full runs are unchanged: Pythia-14M's config already has 50,304 slots.
+- **The Pile copy did not load.** `monology/pile-uncopyrighted` is stored as `.jsonl.zst`, and without the
+  `zstandard` package `datasets` fails with a ValueError, so P1 fell back to synthetic text (and a full run would
+  have stopped). `zstandard` is now in `requirements.txt`.
+- **Smoke timing.** Almost all of P3's 22 minutes went to downloading CIFAR-10 from torchvision's mirror at 130 kB/s.
+  P3 and P4 now load CIFAR-10 from Hugging Face (`uoft-cs/cifar10`) first, and smoke runs stream only the 320
+  images they use. P1's smoke reads fewer checkpoints (one main-grid step, H7.1 at the last stage, a four-step
+  loss scan) and keeps them in the cache instead of downloading each one again. P4's smoke uses smaller
+  measurement batches, because the real 50k-token vocabulary makes every Hessian-vector product costly.
+
 ## Blackwell (RTX 5090, sm_120) and library support
 
 | Library | Used by | Blackwell | Evidence |
@@ -210,7 +226,7 @@ before the run.
 
 ## Unit tests
 
-`python -m pytest -q` (81 tests, about 80 s on a CPU; `-m "not slow"` skips the two slowest). Synthetic data with
+`python -m pytest -q` (85 tests, about 80 s on a CPU; `-m "not slow"` skips the two slowest). Synthetic data with
 known parameters:
 
 - stable density against the Gaussian and Cauchy closed forms and against SciPy; ML fit recovers α ∈ {1.2, 1.5, 1.8},
@@ -233,6 +249,8 @@ known parameters:
   volume, step choice for the main grid, the 1,000-step scan and OLMo, the pythia-14m/31m name-switch flag
   (15 February 2026 is flagged), both loss-spike passes (each finds a planted spike at its onset, and only
   there), window merging, and the seed-variance table;
+- P4's vocabulary: a tokenizer whose added tokens lie above `vocab_size` gets a model with a row for every ID, in
+  smoke and full settings; the ID check fails readably; the full model keeps Pythia's 50,304 slots;
 - the Emmy check's streaming kurtosis and logit metrics, and the fast-math lanes' environments.
 
 ## Deviations, choices of ours, and items to verify

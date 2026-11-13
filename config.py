@@ -130,16 +130,18 @@ CONFIG = {
                        # only exercises the per-variant code (seed_variance.csv)
                        "polypythia_data": {"repo": "EleutherAI/pythia-{size}-data-seed{seed}", "sizes": ["14m"],
                                            "seeds": [1], "variant": "data"}},
-            "steps": [1000, 143000], "final_step": 143000,
+            # smoke timing (RTX 2050 laptop, real Pythia-14M checkpoints): one main-grid step, H7.1 at the last stage
+            # only, a 4-step loss scan and pass (b) on the jump interval itself; the cache is kept in smoke mode
+            "steps": [143000], "final_step": 143000,
             # smoke_force_top: if pass (a) finds no jump in the stand-in models, pass (b) runs around the largest z
             "spike_check": {"suite": "polypythia", "size": "14m", "flagged_seeds": [3], "reference_seeds": [1],
-                            "scan_every": 1000, "scan_range": [1000, 6000], "window": 1000,
+                            "scan_every": 1000, "scan_range": [1000, 4000], "window": 0,
                             "quantities": ["alpha", "alpha_esd", "K"], "robust_z": 3.5, "smoke_force_top": True},
-            "example_len": 32, "n_random_dirs": 1, "n_hessian_dirs": 1, "hessian_batch": 8,
-            "coupling_blocks": 40, "probe_seqs": 4, "probe_len": 64, "dh_points": 256,
+            "example_len": 32, "n_random_dirs": 1, "n_hessian_dirs": 0, "hessian_batch": 8,   # Hessian: unit tests and P4
+            "coupling_blocks": 25, "probe_seqs": 4, "probe_len": 64, "dh_points": 256,
             "surprisal_docs": 2, "surprisal_len": 512,
             "h71": {"full_res_sizes": ["14m"], "coarse_sizes": [], "coarse_blocks": 20, "n_blocks": 30,
-                    "batch_sizes": [8, 16, 32], "n_boot": 3, "stages": [0.5, 1.0]},
+                    "batch_sizes": [8, 16, 32], "n_boot": 3, "stages": [1.0]},
             "eval_seqs": 2, "eval_len": 128,
             "tails": {"n_boot": 10, "hill_reps": 20, "n_jobs": 1}, "scale": {"n_surr": 9},
         },
@@ -227,14 +229,15 @@ CONFIG = {
             "models": ["transformer", "resnet18"], "p_clip": [0.0, 0.1], "adaptive": ["autoclip"],
             "matched_update_length": True, "seeds": [0],
             "transformer": {"neox": "TINY_NEOX", "dataset": ["HuggingFaceFW/fineweb-edu", "sample-10BT", "train"],
-                            "tokenizer": "EleutherAI/pythia-14m", "tokens": 160 * 8 * 64, "seq_len": 64,
+                            "tokenizer": "EleutherAI/pythia-14m", "tokens": 110 * 8 * 64, "seq_len": 64,   # 110 steps: enough for H_grad (>= 100 after warmup)
                             "batch": 8, "lr": 1e-3, "weight_decay": 0.1, "warmup_frac": 0.05,
                             "ood_dataset": ["Salesforce/wikitext", "wikitext-2-raw-v1", "test"], "eval_seqs": 4},
             "resnet18": {"epochs": 5, "batch": 16, "lr": 0.01, "momentum": 0.9, "weight_decay": 5e-4,
                          "warmup_frac": 0.05, "ood_noise_sigma": 0.1, "limit_train": 256, "limit_test": 64},
             "calib_steps": 5, "n_hgrad_dirs": 2,
-            "measure": {"hessian_batch": 16, "power_iters": 3, "trace_samples": 2, "sharp_rho": 0.05,
-                        "sharp_steps": 1, "alpha_pool_blocks": 40, "probe_points": 200},
+            # the real 50k-token vocabulary makes every HVP and per-example JVP costly: smallest batches that still run
+            "measure": {"hessian_batch": 8, "power_iters": 3, "trace_samples": 2, "sharp_rho": 0.05,
+                        "sharp_steps": 1, "alpha_pool_blocks": 25, "probe_points": 200},
             "h71": {"run": {"model": "resnet18", "rule": "none", "seed": 0}, "n_blocks": 20,
                     "batch_sizes": [8, 16, 32], "n_random_dirs": 1, "n_hessian_dirs": 0,
                     "layer": "layer4.1.conv2.weight", "n_boot": 3},
