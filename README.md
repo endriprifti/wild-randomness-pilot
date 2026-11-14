@@ -48,7 +48,7 @@ after P1 if you want it to add the three checkpoints with the largest K from P1'
 
 ## P0b: extra calibrations on the laptop (CPU only)
 
-`p0b_calibration.py` fills three gaps that P0 left, without touching the cloud run (it is not part of
+`p0b_calibration.py` fills the gaps that P0 left, without touching the cloud run (it is not part of
 `run_all.sh`):
 
 1. **Cascade series, 20 replicates.** The MFDFA width test (`multifractal_claim`, 99 phase, IAAFT and shuffle
@@ -73,35 +73,108 @@ after P1 if you want it to add the three checkpoints with the largest K from P1'
    shared by all replicates. Refitting 200 null samples per replicate, as `lr_test_gaussian` does, would take
    about 45 h on 6 cores. Three replicates per cell also run `lr_test_gaussian` itself, to show that both give the
    same statistic and p-values within Monte Carlo error (`stable_lr_check.csv`).
+4. **Gaussian pools for the H7.1 verdict** (parts `h71null` and `h71gauss`). A flat α̂(B) is also what a Gaussian
+   gives, at α̂ = 2, so the verdict reads the level and the scale exponent as well as the slope (see
+   [H7.1 verdict](#h71-verdict-slope-level-and-scale-exponent)). `h71null` fits 400 Gaussian pools at each setting
+   of the full run (1,600 blocks: P0, P0b, P1 at 14M, P4; 200 blocks: P1's coarse sizes; B = 8 … 1024), the
+   reference for the level and for the scale exponent near −1/2. `h71gauss` runs the full test on 5 Gaussian pools,
+   which should read "flat at 2 (mild)" where the slope alone reads "invariant". At the end of the run every full
+   test (truncated-Lévy and Gaussian) gets its verdict.
 
 ```bash
 cd ~/pilot && git pull && source ~/.venv-pilot/bin/activate
 python p0b_calibration.py --smoke --jobs 6           # about 1 min
 nohup python p0b_calibration.py --jobs 6 > p0b.log 2>&1 &
-python p0b_calibration.py --jobs 6 --parts stable    # or one part at a time: cascades, h71, stable
+python p0b_calibration.py --jobs 6 --parts stable    # or one part at a time: cascades, h71, h71null, h71gauss, stable
+```
+
+If a P0b run from the earlier commit (f3a59ad, three parts) is already going, let it finish: its numbers match
+this version's (same seeds). Then add the two new parts in their own folder, and give its Gaussian reference to the
+verdict tool for the truncated-Lévy tests:
+
+```bash
+nohup python p0b_calibration.py --jobs 6 --parts h71null,h71gauss --out results/p0b_h71_level > p0b_level.log 2>&1 &
+python -m common.h71_verdict results/p0b_calibration/h71_trunc_tests.csv --null results/p0b_h71_level/h71_gauss_null.csv
 ```
 
 `--jobs` sets the worker processes (default: every CPU), each with one thread. Every task has its own seed, so the
 results do not depend on `--jobs`. Each part's files are written as soon as that part is complete. The run starts
 with a line giving its task count and an estimate.
 
-**Run time: about 3.5 h on 6 cores** (3 to 5 h, depending on the laptop's speed per core). This is an estimate
+**Run time: about 4.5 h on 6 cores** (3.5 to 6 h, depending on the laptop's speed per core). This is an estimate
 from single tasks timed on this environment's CPU, whose timing of P0 (about 13.7 h on 4 threads) matched the
-13.1 h P0 took on the L40S host. It adds up to about 21 CPU-hours:
+13.1 h P0 took on the L40S host. It adds up to about 26 CPU-hours:
 
-- the 15 full H7.1 tests: about 11.4 h, 46 min each;
+- the 15 full H7.1 tests on truncated-Lévy pools: about 11.4 h, 46 min each;
 - the lr_test_gaussian check: about 3.4 h;
 - the other stable fits: about 3 h;
+- the 800 Gaussian reference pools (`h71null`): about 2.7 h;
+- the 5 full H7.1 tests on Gaussian pools (`h71gauss`): about 2.5 h;
 - the 600 H7.1 replicate pools: about 2.3 h;
 - the cascades: about 0.7 h.
+
+The two new parts alone (`--parts h71null,h71gauss`) take about 5 CPU-hours, under 1 h on 6 cores.
 
 Outputs (`results/p0b_calibration/`):
 
 - `cascade_series.csv` and `cascade_series_summary.csv`: the claim rate per (p, n);
 - `h71_trunc.csv`, `h71_trunc_tests.csv` and `h71_trunc_summary.csv`: per cutoff, the spread of b, the share
-  above 0.05, mean α̂ per B and the test readings;
+  above 0.05, mean α̂ per B, the test readings and the verdicts;
+- `h71_gauss_null.csv` and `h71_gauss_null_summary.csv`: the Gaussian reference (one row per pool; per setting the
+  5% quantile of mean α̂, the central 90% of the scale exponent, the share of fits at α̂ = 2);
+- `h71_gauss_tests.csv`: the full test on Gaussian pools, with verdicts; `h71_verdicts.csv`: verdict counts per pool;
 - `stable_fit.csv`, `stable_fit_summary.csv`, `stable_lr_null.csv` and `stable_lr_check.csv`;
 - `run.json`.
+
+## H7.1 verdict: slope, level and scale exponent
+
+`h71_test` reads only the slope b of α̂ on log2 B (its `reading` column): "invariant" if the 90% interval lies
+inside ±0.03, "drift" if above 0.05. A flat slope is what a stable law gives, but also what a Gaussian gives once
+its blocks are Gaussian: α̂ then sits at 2 at every B. `common/h71_verdict.py` therefore reads three things from
+each test's summary row:
+
+| Verdict | Slope b (90% bootstrap interval) | Level ᾱ (mean α̂ over B) | Scale exponent s (log γ̂_B on log B) |
+|---|---|---|---|
+| invariant (wild) | inside ±0.03 | below 2: under the 5% quantile of ᾱ on Gaussian pools of the same size | consistent with 1/ᾱ − 1: the bootstrap 90% interval of s − (1/ᾱ − 1) contains 0 |
+| flat at 2 (mild) | inside ±0.03 | consistent with 2: not under that quantile | near −1/2: inside the central 90% of s on the same Gaussian pools |
+| drift | above 0.05 | any | any |
+| undecided | anything else | | `verdict_reason` says which condition failed |
+
+α̂ cannot exceed 2, so α = 2 is tested one-sided against Gaussian pools with the same pool length, blocks and batch
+sizes, fitted exactly as a real pool (the bootstrap is not used for the level, since it fails at the boundary).
+Every input is already a column of the summary CSVs (`b_lo`, `b_hi`, `alpha_mean`, `scale_exponent`,
+`scale_gap_lo`, `scale_gap_hi`, `n_pool`, `n_blocks`), so the verdict is recomputed from saved files, without
+refitting and without changing the cloud run's code. On the laptop, after unpacking the archives from the L40S:
+
+```bash
+python -m common.h71_verdict results/p0_calibration/block_check_bootstrap.csv \
+    results/p1_pythia/h71_summary.csv results/p4_resnet18/h71_summary.csv \
+    --null results/p0b_calibration/h71_gauss_null.csv --jobs 6
+```
+
+It writes `<name>_verdict.csv` beside each file (the original columns, including the slope-only `reading`, plus
+`alpha_null_q`, `s_null_lo`, `s_null_hi`, `null_reps`, `slope_reading`, `level_reading`, `scale_reading`,
+`verdict` and `verdict_reason`) and prints the counts. The batch sizes come from the `alpha_B<B>` columns (P0b),
+from `h71_per_B.csv` beside the file (P1, P4) or from `config.BATCH_SIZES` (P0; `--batch-sizes` overrides). A
+setting missing from the Gaussian reference (for example a pool that came out short) is simulated on the spot
+and added to the `--null` file (400 pools; about 1 h on 6 cores at 1,600 blocks).
+
+**Check at full size** (this environment's CPU, 2026-11-14; 1,600 blocks, B = 8 … 1024, 100 Gaussian reference
+pools, full tests with a reduced bootstrap of 30 resamples). The reference puts the 5% quantile of ᾱ at 1.993
+(13% of Gaussian pools have ᾱ = 2 exactly) and s between −0.507 and −0.492. The slope alone read every flat pool
+"invariant". The verdict read two SαS α = 1.5 pools (ᾱ 1.53, 1.54) and one α = 1.9 pool (ᾱ 1.915) as
+"invariant (wild)", a truncated-Lévy pool with cutoff 100 as "drift" (b in [0.068, 0.086]), and two Gaussian
+pools as "flat at 2 (mild)" and "invariant (wild)": the second had ᾱ = 1.992, just under 1.993, which is the
+one-sided test's 5% size.
+
+**Known limit: noise near α = 2.** Point fits on finite-variance Student-t pools (no bootstrap) give a flat or
+nearly flat slope with ᾱ below the Gaussian quantile: ν = 3, ᾱ 1.93 to 1.95 (b 0.015 to 0.026); ν = 4, ᾱ 1.98
+(b 0.006); ν = 5 and 10 read as Gaussian (ᾱ 1.995, 1.999). SαS α = 1.95 and 1.97 give ᾱ 1.96 and 1.98. So up to
+B = 1,024 a stable law with α above about 1.9 cannot be told from finite variance with ζ of 3 to 4 (slow
+convergence to the Gaussian), and the rule as written reads both "invariant (wild)". `--wild-max` (config
+`H71["wild_max_alpha"]`, off by default) adds a margin: "invariant (wild)" then also needs ᾱ ≤ that value, and
+pools between it and the Gaussian quantile read "undecided". The per-example tail fit of §7.1 (ζ) separates
+these cases where the batch-size test cannot.
 
 ## Full run on one L40S: `run_all.sh`
 
@@ -371,7 +444,7 @@ before the run.
 
 ## Unit tests
 
-`python -m pytest -q` (99 tests, about 90 s on a CPU; `-m "not slow"` skips the two slowest). Synthetic data with
+`python -m pytest -q` (117 tests, about 90 s on a CPU; `-m "not slow"` skips the two slowest). Synthetic data with
 known parameters:
 
 - stable density against the Gaussian and Cauchy closed forms and against SciPy; ML fit recovers α ∈ {1.2, 1.5, 1.8},
@@ -383,6 +456,9 @@ known parameters:
   phase surrogates keep the spectrum, IAAFT keeps the marginal; MFDFA width on the binomial series and on fGn;
 - D_2 and Δh_rep on binomial cascades, the uniform square, and the dimension clause in 50 dimensions;
 - H7.1 slope on SαS pools (invariant) and a truncated Lévy pool (drift); the 1,600-block arithmetic;
+- H7.1 verdict: each branch (wild, mild, drift, and undecided for the slope, for the scale exponent and without a
+  Gaussian reference); flat at 2 is not read as invariant; the optional margin leaves ᾱ near 2 undecided; the Gaussian reference is seeded per pool, tops up only
+  what is missing and is matched to each row's setting; the command line recomputes verdicts from a saved summary;
 - coupling test, Holm, detectable r; censored escape rates and the (η, B) power-law fit against the Gaussian rival;
 - per-example JVP against autograd, Hessian eigenvalues and Hutchinson trace on a quadratic;
 - NF4 code book, FWHT, rotation invariance, RTN error bound, matched bits, fixed-rate clipping;

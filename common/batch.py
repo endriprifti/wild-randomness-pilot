@@ -10,6 +10,10 @@ of the alpha-hat(B) across B (one pool) is kept.
 Preregistered reading (thresholds ours, sec. 7.5): invariance if the 90% interval lies inside
 +-0.03; drift towards 2 if it lies above 0.05; otherwise undecided. The scale exponent is the
 slope of log gamma-hat_B on log B, compared with 1/alpha-hat - 1.
+
+The summary's "reading" is the slope alone. A flat slope is also what a Gaussian gives (alpha-hat = 2 at every B),
+so the H7.1 verdict (common/h71_verdict.py) adds the level of alpha-hat and the scale exponent: invariant (wild),
+flat at 2 (mild), drift or undecided, recomputed from the summary columns written here.
 """
 
 from __future__ import annotations

@@ -34,7 +34,13 @@ SCALE = {                                                     # sec. 7.2
     "dfa_s_min": 10,          # DFA scales from 10 to n/10 (two decades need n >= 10^4)
 }
 
-H71 = {"inv_tol": 0.03, "drift_tol": 0.05, "level": 0.90, "n_blocks": 1600, "n_boot": 200}
+H71 = {"inv_tol": 0.03, "drift_tol": 0.05, "level": 0.90, "n_blocks": 1600, "n_boot": 200,
+       # optional margin for the H7.1 verdict: "invariant (wild)" also needs mean alpha-hat <= this; None = off
+       # (Student t with 3-4 degrees of freedom reads alpha-hat ~ 1.93-1.98 with a flat slope up to B = 1,024)
+       "wild_max_alpha": None}
+# H7.1 verdict (common/h71_verdict.py): alpha = 2 is tested against Gaussian pools of the same length, n_blocks and
+# batch sizes (5% quantile of mean alpha-hat; central 90% of the scale exponent). OURS: pools per setting.
+H71_NULL_REPS = 400
 
 CONFIG = {
     # ------------------------------------------------------------------ P0b: P0's thin spots (CPU, laptop)
@@ -47,7 +53,12 @@ CONFIG = {
             "h71": {"alpha": 1.5, "cutoffs": [20.0, 100.0, 500.0], "n_blocks": 1600,
                     "replicates": 200,        # per cutoff
                     "test_reps": 5,           # OURS: pools per cutoff that get the full test (each ~1,600 stable fits)
-                    "test_n_boot": 200},      # as in sec. 7.5
+                    "test_n_boot": 200,       # as in sec. 7.5
+                    # Gaussian pools (alpha = 2): the reference for the level of the H7.1 verdict at the settings of
+                    # the full run (1,600 blocks: P0, P0b, P1 at 14M, P4; 200 blocks: P1's coarse sizes), and
+                    # full tests on Gaussian pools, which should read "flat at 2 (mild)"
+                    "null_n_blocks": [1600, 200], "null_reps": H71_NULL_REPS,
+                    "gauss_test_reps": 5},    # OURS
             # direct stable fit and the bootstrap LR test against the Gaussian on SaS samples
             "stable": {"alphas": [1.2, 1.5, 1.8, 2.0], "n_values": [1000, 10000, 100000], "replicates": 200,
                        "lr_null_draws": 1000,  # OURS: shared null per n (the LR statistic is location-scale invariant)
@@ -57,7 +68,7 @@ CONFIG = {
         "smoke": {
             "cascades": {"n_values": [1000], "replicates": 2},
             "h71": {"cutoffs": [20.0, 100.0], "n_blocks": 60, "batch_sizes": [8, 16, 32], "replicates": 2,
-                    "test_reps": 1, "test_n_boot": 3},
+                    "test_reps": 1, "test_n_boot": 3, "null_n_blocks": [60], "null_reps": 20, "gauss_test_reps": 1},
             "stable": {"n_values": [1000], "replicates": 3, "lr_null_draws": 20, "lr_check_reps": 1,
                        "lr_check_n_boot": 5},
             "scale": {"n_surr": 9},

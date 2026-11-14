@@ -14,6 +14,16 @@
             check runs at several cutoffs. Per cutoff, as P0's block check on stable pools: 200 replicate pools
             give the spread of b (alpha-hat on log2 B), and test_reps further pools get the full preregistered
             test (h71_test, bootstrap 90% interval, n_boot = 200) and its reading.
+  h71null   the Gaussian reference of the H7.1 verdict (common/h71_verdict.py): null_reps Gaussian pools (alpha = 2)
+            at each null_n_blocks (1,600 and 200 blocks, B = 8 ... 1024, pools of n_blocks x 1024 values), fitted as
+            a real pool. Their mean alpha-hat gives the 5% quantile below which alpha = 2 is rejected, and their
+            scale exponent the central 90% range around -1/2. Written to h71_gauss_null.csv, the file that
+            python -m common.h71_verdict reads to recompute verdicts from saved CSVs (P1, P4 from the cloud run).
+  h71gauss  the full test on gauss_test_reps Gaussian pools (1,600 blocks): the control that should read
+            "flat at 2 (mild)", where the slope alone reads invariant.
+
+After the run, every H7.1 test (h71, h71gauss) gets the verdict of common/h71_verdict.py: invariant (wild), flat
+at 2 (mild), drift or undecided, from its slope, its level and its scale exponent.
   stable    the direct stable fit (fit_stable) and the bootstrap LR test against the Gaussian
             (lr_test_gaussian) on SaS alpha = 1.2, 1.5, 1.8, 2.0 at n = 10^3, 10^4, 10^5, 200 replicates
             each: bias, SD and RMSE of alpha-hat (against Nolan's asymptotic SE), the share of fits at the
@@ -28,10 +38,12 @@ Every task gets its own seed from (seed, part, indices), so results do not depen
 which the worker processes finish.
 
 Outputs (results/p0b_calibration/[smoke/]): cascade_series.csv, cascade_series_summary.csv, h71_trunc.csv,
-h71_trunc_tests.csv, h71_trunc_summary.csv, stable_fit.csv, stable_fit_summary.csv, stable_lr_null.csv, stable_lr_check.csv, run.json
+h71_trunc_tests.csv, h71_trunc_summary.csv, h71_gauss_null.csv, h71_gauss_null_summary.csv, h71_gauss_tests.csv,
+h71_verdicts.csv, stable_fit.csv, stable_fit_summary.csv, stable_lr_null.csv, stable_lr_check.csv, run.json
 
 Commands:
-  python p0b_calibration.py --jobs 6                 # all three parts on 6 worker processes
+  python p0b_calibration.py --jobs 6                 # every part on 6 worker processes
+  python p0b_calibration.py --jobs 6 --parts h71null,h71gauss --out results/p0b_h71_level   # only the new H7.1 parts
   python p0b_calibration.py --jobs 6 --parts stable  # one part
   python p0b_calibration.py --smoke
 """
@@ -53,9 +65,11 @@ from scipy import stats
 
 import config
 from common import hurst, runtime, stable
+from common import h71_verdict as hv
 from common.batch import _slopes, fit_over_batches, h71_test
 
-PART_CODES = {"cascades": 1, "h71": 2, "stable": 3, "null": 4, "check": 5}
+PART_CODES = {"cascades": 1, "h71": 2, "stable": 3, "null": 4, "check": 5, "h71gauss": 6}
+PARTS = ("cascades", "h71", "h71null", "h71gauss", "stable")
 
 
 def task_rng(seed: int, part: str, *idx: int) -> np.random.Generator:
@@ -115,7 +129,7 @@ def t_h71_rep(seed, r, hc, Bs, i_c=0, cutoff=None):
     a = [x["alpha"] for x in rows]
     cross = next((x["B"] for x in rows if np.isfinite(x["alpha"]) and np.isfinite(a[0]) and x["alpha"] - a[0] > 0.2),
                  None)
-    return {"cutoff": cutoff, "replicate": r, "b": b, "scale_exponent": s, "alpha_mean": abar,
+    return {"pool": "truncated Levy", "cutoff": cutoff, "replicate": r, "b": b, "scale_exponent": s, "alpha_mean": abar,
             "pred_scale_exponent": 1 / abar - 1,
             "B_cross_hint": cross, **{f"alpha_B{x['B']}": x["alpha"] for x in rows}}
 
@@ -125,7 +139,18 @@ def t_h71_test(seed, r, hc, Bs, tol, i_c, cutoff):
     pool = trunc_levy_pool(hc["alpha"], cutoff, hc["n_blocks"] * max(Bs), rng)
     t = h71_test(pool, Bs, hc["n_blocks"], n_boot=hc["test_n_boot"], level=tol["level"], inv_tol=tol["inv_tol"],
                  drift_tol=tol["drift_tol"], rng=rng)
-    return {"cutoff": cutoff, "test": r, **t["summary"], **{f"alpha_B{x['B']}": x["alpha"] for x in t["per_B"]}}
+    return {"pool": "truncated Levy", "cutoff": cutoff, "test": r, **t["summary"],
+            **{f"alpha_B{x['B']}": x["alpha"] for x in t["per_B"]}}
+
+
+def t_h71_gauss_test(seed, r, hc, Bs, tol):
+    """The full test on a Gaussian pool (alpha = 2 at every B): the control for "flat at 2 (mild)"."""
+    rng = task_rng(seed, "h71gauss", r)
+    pool = rng.standard_normal(hc["n_blocks"] * max(Bs))
+    t = h71_test(pool, Bs, hc["n_blocks"], n_boot=hc["test_n_boot"], level=tol["level"], inv_tol=tol["inv_tol"],
+                 drift_tol=tol["drift_tol"], rng=rng)
+    return {"pool": "gaussian", "cutoff": np.nan, "test": r, **t["summary"],
+            **{f"alpha_B{x['B']}": x["alpha"] for x in t["per_B"]}}
 
 
 def t_stable(seed, i_a, alpha, i_n, n, r):
@@ -180,8 +205,24 @@ def summarize_h71(reps: pd.DataFrame, tests: pd.DataFrame, tol: dict) -> list[di
         if len(t):
             row.update({"tests": int(len(t)), "test_readings": t.reading.value_counts().to_dict(),
                         "test_drift_rate": float((t.reading == "drift").mean())})
+            if "verdict" in t.columns:
+                row["test_verdicts"] = t.verdict.value_counts().to_dict()
         out.append(row)
     return out
+
+
+def summarize_null(null: pd.DataFrame, level: float) -> pd.DataFrame:
+    """Per setting: the bounds the verdict uses, and how often a Gaussian pool's alpha-hat sits at 2."""
+    rows = []
+    for (n_pool, nb, bsk), g in null.groupby(hv.NULL_KEY):
+        acols = [c for c in g.columns if c.startswith("alpha_B")]
+        rows.append({"n_pool": n_pool, "n_blocks": nb, "batch_sizes": bsk, **hv.null_bounds(g, level),
+                     "alpha_mean_median": float(g.alpha_mean.median()),
+                     "share_alpha_mean_at_2": float((g.alpha_mean >= 2.0 - 1e-6).mean()),
+                     "share_fits_at_2": float((g[acols].to_numpy() >= 2.0 - 1e-6).mean()) if acols else np.nan,
+                     "s_median": float(g.scale_exponent.median()), "b_mean": float(g.b.mean()),
+                     "b_q05": float(g.b.quantile(0.05)), "b_q95": float(g.b.quantile(0.95))})
+    return pd.DataFrame(rows)
 
 
 def summarize_stable(df: pd.DataFrame, levels=(0.05, 0.10)) -> pd.DataFrame:
@@ -203,7 +244,7 @@ def summarize_stable(df: pd.DataFrame, levels=(0.05, 0.10)) -> pd.DataFrame:
 # ----------------------------------------------------------------------------- main
 def main():
     ap = runtime.base_parser(__doc__)
-    ap.add_argument("--parts", default="cascades,h71,stable", help="comma-separated subset of cascades,h71,stable")
+    ap.add_argument("--parts", default=",".join(PARTS), help=f"comma-separated subset of {','.join(PARTS)}")
     ap.add_argument("--jobs", type=int, default=len(os.sched_getaffinity(0)),
                     help="worker processes (default: every CPU this process may use)")
     args = ap.parse_args()
@@ -211,7 +252,7 @@ def main():
     cfg = config.get("p0b_calibration", args.smoke)
     run = runtime.start_run("p0b_calibration", cfg, args)
     parts = [p for p in args.parts.split(",") if p]
-    bad = set(parts) - {"cascades", "h71", "stable"}
+    bad = set(parts) - set(PARTS)
     if bad:
         raise SystemExit(f"unknown part(s) {sorted(bad)}")
     seed, S, tol = run.seed, cfg["scale"], cfg["h71_tolerances"]
@@ -233,6 +274,14 @@ def main():
             for r in range(hc["test_reps"]):
                 tasks.append(((hc["test_n_boot"] + 1) * len(Bs) * 1.7, "h71_test", t_h71_test,
                               (seed, r, hc, Bs, tol, i_c, c)))
+    if "h71null" in parts:
+        for nb in hc["null_n_blocks"]:
+            for r in range(hc["null_reps"]):
+                tasks.append((hv.null_cost(nb, Bs), "h71null", hv.null_replicate, (seed, nb * max(Bs), nb, Bs, r)))
+    if "h71gauss" in parts:
+        for r in range(hc["gauss_test_reps"]):
+            tasks.append(((hc["test_n_boot"] + 1) * hv.null_cost(hc["n_blocks"], Bs), "h71gauss", t_h71_gauss_test,
+                          (seed, r, hc, Bs, tol)))
     if "stable" in parts:
         for i_a, a in enumerate(stc["alphas"]):
             for i_n, n in enumerate(stc["n_values"]):
@@ -277,6 +326,20 @@ def main():
             runtime.write_csv(run.out_dir / "h71_trunc_summary.csv",
                               [{k: (str(v) if isinstance(v, dict) else v) for k, v in r.items()} for r in extra["h71_trunc"]])
             run.note("h71 written")
+        elif part == "h71null":
+            path = run.out_dir / "h71_gauss_null.csv"
+            null = pd.concat([hv.load_null(path), pd.DataFrame(rows)], ignore_index=True)
+            null = null.drop_duplicates(subset=hv.NULL_KEY + ["seed", "replicate"], keep="last")
+            null = null.sort_values(hv.NULL_KEY + ["seed", "replicate"])
+            runtime.write_csv(path, null.to_dict("records"))
+            summ = summarize_null(null, tol["level"])
+            runtime.write_csv(run.out_dir / "h71_gauss_null_summary.csv", summ.to_dict("records"))
+            extra["h71_gauss_null"] = summ.to_dict("records")
+            run.note("h71null written")
+        elif part == "h71gauss":
+            tests = pd.DataFrame(rows).sort_values("test")
+            runtime.write_csv(run.out_dir / "h71_gauss_tests.csv", tests.to_dict("records"))
+            run.note("h71gauss written")
         elif part in ("stable", "null", "check") and all(remaining.get(k, 0) == 0 for k in ("stable", "null", "check")):
             df = pd.DataFrame(results["stable"]).sort_values(["alpha_true", "n", "replicate"])
             null = pd.DataFrame(results["null"]).sort_values(["n", "draw"])
@@ -314,6 +377,38 @@ def main():
                 run.note(f"{done}/{len(tasks)} tasks done after {(time.perf_counter() - t_start) / 3600:.2f} h")
             if remaining[part] == 0:
                 finish_part(part)
+
+    # H7.1 verdicts on every full test of this run, from the Gaussian reference (simulated here if missing)
+    tests = {}
+    if results.get("h71_test"):
+        tests["h71_trunc_tests.csv"] = pd.DataFrame(results["h71_test"]).sort_values(["cutoff", "test"])
+    if results.get("h71gauss"):
+        tests["h71_gauss_tests.csv"] = pd.DataFrame(results["h71gauss"]).sort_values("test")
+    if tests:
+        null_path = run.out_dir / "h71_gauss_null.csv"
+        null = hv.load_null(null_path)
+        keys = sorted({k for df in tests.values() for k in hv.needed_keys(df, Bs)})
+        new = hv.simulate_null(keys, hc["null_reps"], seed, args.jobs, null, log=run.note)
+        if len(new):
+            null = pd.concat([null, new], ignore_index=True)
+            runtime.write_csv(null_path, null.to_dict("records"))
+        verdicts = []
+        for name, df in tests.items():
+            df = hv.apply_verdicts(df, null, Bs, tol["inv_tol"], tol["drift_tol"], tol["level"],
+                                   tol.get("wild_max_alpha"))
+            runtime.write_csv(run.out_dir / name, df.to_dict("records"))
+            verdicts.append(df)
+            if name == "h71_trunc_tests.csv":
+                reps = pd.DataFrame(results.get("h71", []))
+                extra["h71_trunc"] = summarize_h71(reps, df, tol)
+                runtime.write_csv(run.out_dir / "h71_trunc_summary.csv",
+                                  [{k: (str(v) if isinstance(v, dict) else v) for k, v in r.items()}
+                                   for r in extra["h71_trunc"]])
+        allv = pd.concat(verdicts, ignore_index=True)
+        counts = hv.verdict_counts(allv, ["pool", "cutoff"]).reset_index()
+        runtime.write_csv(run.out_dir / "h71_verdicts.csv", counts.to_dict("records"))
+        extra["h71_verdicts"] = counts.to_dict("records")
+        run.note("h71 verdicts written:\n" + counts.to_string(index=False))
     runtime.finish_run(run, extra=extra)
 
 
