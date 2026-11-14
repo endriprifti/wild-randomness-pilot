@@ -37,6 +37,32 @@ SCALE = {                                                     # sec. 7.2
 H71 = {"inv_tol": 0.03, "drift_tol": 0.05, "level": 0.90, "n_blocks": 1600, "n_boot": 200}
 
 CONFIG = {
+    # ------------------------------------------------------------------ P0b: P0's thin spots (CPU, laptop)
+    "p0b_calibration": {
+        "full": {
+            # MFDFA width test on cascade series: 20 replicates per (p, n) (P0 had 1); random-order cascades
+            "cascades": {"p": [0.5, 0.7, 0.8], "n_values": [1000, 10000, 100000], "replicates": 20},
+            # H7.1 on truncated-Levy pools (alpha 1.5). Where alpha-hat drifts to 2 depends on the cutoff: 20 (P0's
+            # trunclevy_1.5) finishes the drift by B ~ 64, 100 spreads it over B = 8 ... 1024, 500 starts it near 512
+            "h71": {"alpha": 1.5, "cutoffs": [20.0, 100.0, 500.0], "n_blocks": 1600,
+                    "replicates": 200,        # per cutoff
+                    "test_reps": 5,           # OURS: pools per cutoff that get the full test (each ~1,600 stable fits)
+                    "test_n_boot": 200},      # as in sec. 7.5
+            # direct stable fit and the bootstrap LR test against the Gaussian on SaS samples
+            "stable": {"alphas": [1.2, 1.5, 1.8, 2.0], "n_values": [1000, 10000, 100000], "replicates": 200,
+                       "lr_null_draws": 1000,  # OURS: shared null per n (the LR statistic is location-scale invariant)
+                       "lr_check_reps": 3,     # OURS: replicates per cell that also run lr_test_gaussian itself
+                       "lr_check_n_boot": 200},
+        },
+        "smoke": {
+            "cascades": {"n_values": [1000], "replicates": 2},
+            "h71": {"cutoffs": [20.0, 100.0], "n_blocks": 60, "batch_sizes": [8, 16, 32], "replicates": 2,
+                    "test_reps": 1, "test_n_boot": 3},
+            "stable": {"n_values": [1000], "replicates": 3, "lr_null_draws": 20, "lr_check_reps": 1,
+                       "lr_check_n_boot": 5},
+            "scale": {"n_surr": 9},
+        },
+    },
     # ------------------------------------------------------------------ P0: calibration (CPU)
     "p0_calibration": {
         "full": {
@@ -295,6 +321,7 @@ CONFIG = {
 HARDWARE = {
     # job -> (estimated GPU-h from the appendix, smallest GPU class that fits the full job)
     "p0_calibration": ("CPU", "CPU (multi-core)"),
+    "p0b_calibration": ("CPU", "CPU (multi-core); run on the laptop, outside the cloud run"),
     "emmy_check": ("~1 (OURS)", "RTX 5090 or L40S; needs nvcc"),
     "p5_escape": (25, "4 GB laptop / Kaggle T4"),
     "p2_w4a4": (30, "RTX 5090 (32 GB)"),

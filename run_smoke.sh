@@ -29,6 +29,7 @@ run_job () {
 
 run_job unit_tests      $PY -m pytest -q
 run_job p0_calibration  $PY p0_calibration.py --smoke $EXTRA
+run_job p0b_calibration $PY p0b_calibration.py --smoke $EXTRA
 run_job emmy_check      $PY emmy_check.py --smoke $EXTRA
 run_job p5_escape       $PY p5_escape.py --smoke $EXTRA
 run_job p5_escape_h31   $PY p5_escape.py --smoke --part h31 $EXTRA

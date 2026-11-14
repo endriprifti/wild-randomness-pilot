@@ -29,7 +29,7 @@ WSL2, **T4** = Kaggle's 16 GB T4 (not the P100, see below), **5090** = RTX 5090 
 
 | # | Job | GPU-h | Fits | Command |
 |---|---|---|---|---|
-| 0 | Calibration | CPU | CPU only | `python p0_calibration.py` |
+| 0 | Calibration | CPU | CPU only | `python p0_calibration.py`; extra calibrations: `python p0b_calibration.py --jobs 6` (laptop, see P0b below) |
 | 1 | Emmy check | ~1 (ours) | 5090 (Emmy's own benchmark GPU); needs nvcc and the Emmy env | `python emmy_check.py --frontend-only` (CPU), then `python emmy_check.py --probe-only`, then `python emmy_check.py` |
 | 2 | Escape grid, H3.3 / H6.1 | 25 | 4 GB, T4, 5090 | `python p5_escape.py` and `python p5_escape.py --part h31` |
 | 3 | W4A4 and weight-only, H6.2 (simulated quantization) | 30 | 5090 (Pythia-6.9B and OLMo-7B in fp16, about 14 GB each); L40S also fine | `python p2_w4a4.py` (one model: `--models EleutherAI/pythia-6.9b`) |
@@ -45,6 +45,63 @@ Every script takes `--smoke`, `--seed N`, `--device cuda|cpu`, `--out DIR` and `
 stand-ins outside smoke mode; off by default, so a real run fails loudly if a download fails). Run the Emmy check
 after P1 if you want it to add the three checkpoints with the largest K from P1's `checkpoints.csv` (it reads
 `results/p1_checkpoints/` and the `results/p1_<suite>/` folders that `run_all.sh` writes).
+
+## P0b: extra calibrations on the laptop (CPU only)
+
+`p0b_calibration.py` fills three gaps that P0 left, without touching the cloud run (it is not part of
+`run_all.sh`):
+
+1. **Cascade series, 20 replicates.** The MFDFA width test (`multifractal_claim`, 99 phase, IAAFT and shuffle
+   surrogates) on binomial cascade series with p = 0.5 (monofractal control: fGn, H = 0.5), 0.7 and 0.8, at
+   n = 2^9, 2^13 and 2^16, 20 replicates each. P0's series is the deterministic binomial series, so its
+   replicates would be identical; here each replicate is a random-order binomial cascade (each split gives p and
+   1 − p to its two halves in random order). It has the same values at every dyadic level, hence the same h(q)
+   (unit test).
+2. **H7.1 on truncated-Lévy pools.** Signed SαS α = 1.5 values cut at |x| ≤ c, where α̂ must drift towards 2. The
+   test can only see a drift that falls inside B = 8 … 1024, and where it falls depends on c. In a short check
+   here (2 pools per cutoff): with P0's c = 20, α̂ is already about 1.8 at B = 8 and 2 from B = 64, so the slope is
+   only b ≈ 0.03 per doubling, below the 0.05 drift threshold; c = 50 to 200 spread the drift over the range
+   (b ≈ 0.06 to 0.07); with c = 500, α̂ starts to rise only near B = 512 (b ≈ 0.03). So the check runs at
+   c = 20, 100 and 500. For each, 200 replicate pools give the spread of b (as P0's block check on stable pools),
+   and 5 more pools get the full preregistered test (`h71_test`, bootstrap 90% interval, 200 resamples) and its
+   reading.
+3. **Direct stable fit and the LR test against the Gaussian.** `fit_stable` on SαS α = 1.2, 1.5, 1.8, 2.0 at
+   n = 10^3, 10^4, 10^5, 200 replicates each. Reported: bias, SD and RMSE of α̂ (with Nolan's asymptotic SE
+   beside it), the share of fits at the boundary α = 2, and the bootstrap LR test's rejection rate at 5% and 10%
+   (its size at α = 2, its power below). The LR statistic does not depend on the Gaussian's location or scale, so
+   its parametric-bootstrap null depends on n only. It is simulated once per n (1,000 Gaussian samples) and
+   shared by all replicates. Refitting 200 null samples per replicate, as `lr_test_gaussian` does, would take
+   about 45 h on 6 cores. Three replicates per cell also run `lr_test_gaussian` itself, to show that both give the
+   same statistic and p-values within Monte Carlo error (`stable_lr_check.csv`).
+
+```bash
+cd ~/pilot && git pull && source ~/.venv-pilot/bin/activate
+python p0b_calibration.py --smoke --jobs 6           # about 1 min
+nohup python p0b_calibration.py --jobs 6 > p0b.log 2>&1 &
+python p0b_calibration.py --jobs 6 --parts stable    # or one part at a time: cascades, h71, stable
+```
+
+`--jobs` sets the worker processes (default: every CPU), each with one thread. Every task has its own seed, so the
+results do not depend on `--jobs`. Each part's files are written as soon as that part is complete. The run starts
+with a line giving its task count and an estimate.
+
+**Run time: about 3.5 h on 6 cores** (3 to 5 h, depending on the laptop's speed per core). This is an estimate
+from single tasks timed on this environment's CPU, whose timing of P0 (about 13.7 h on 4 threads) matched the
+13.1 h P0 took on the L40S host. It adds up to about 21 CPU-hours:
+
+- the 15 full H7.1 tests: about 11.4 h, 46 min each;
+- the lr_test_gaussian check: about 3.4 h;
+- the other stable fits: about 3 h;
+- the 600 H7.1 replicate pools: about 2.3 h;
+- the cascades: about 0.7 h.
+
+Outputs (`results/p0b_calibration/`):
+
+- `cascade_series.csv` and `cascade_series_summary.csv`: the claim rate per (p, n);
+- `h71_trunc.csv`, `h71_trunc_tests.csv` and `h71_trunc_summary.csv`: per cutoff, the spread of b, the share
+  above 0.05, mean α̂ per B and the test readings;
+- `stable_fit.csv`, `stable_fit_summary.csv`, `stable_lr_null.csv` and `stable_lr_check.csv`;
+- `run.json`.
 
 ## Full run on one L40S: `run_all.sh`
 
@@ -314,7 +371,7 @@ before the run.
 
 ## Unit tests
 
-`python -m pytest -q` (95 tests, about 90 s on a CPU; `-m "not slow"` skips the two slowest). Synthetic data with
+`python -m pytest -q` (99 tests, about 90 s on a CPU; `-m "not slow"` skips the two slowest). Synthetic data with
 known parameters:
 
 - stable density against the Gaussian and Cauchy closed forms and against SciPy; ML fit recovers α ∈ {1.2, 1.5, 1.8},
@@ -341,6 +398,9 @@ known parameters:
   there), window merging, and the seed-variance table;
 - P4's vocabulary: a tokenizer whose added tokens lie above `vocab_size` gets a model with a row for every ID, in
   smoke and full settings; the ID check fails readably; the full model keeps Pythia's 50,304 slots;
+- P0b's helpers: random-order cascades keep the binomial values at every dyadic level, truncated-Lévy pools are
+  signed and cut, task seeds do not depend on order, and the shared-null LR statistic and p-value match
+  `lr_test_gaussian`;
 - the GPU stable sampler against the NumPy one (same distribution for α from 1 to 2, skewed or not; reproducible
   from its seed);
 - the Emmy check's streaming kurtosis and logit metrics, and the fast-math lanes' environments.
