@@ -35,9 +35,10 @@ SCALE = {                                                     # sec. 7.2
 }
 
 H71 = {"inv_tol": 0.03, "drift_tol": 0.05, "level": 0.90, "n_blocks": 1600, "n_boot": 200,
-       # optional margin for the H7.1 verdict: "invariant (wild)" also needs mean alpha-hat <= this; None = off
-       # (Student t with 3-4 degrees of freedom reads alpha-hat ~ 1.93-1.98 with a flat slope up to B = 1,024)
-       "wild_max_alpha": None}
+       # margin of the H7.1 verdict (Endri, 2026-11-14): "invariant (wild)" also needs mean alpha-hat <= 1.9; between
+       # 1.9 and the Gaussian 5% quantile it reads undecided (Student t with 3-4 degrees of freedom gives a flat
+       # alpha-hat of 1.93-1.98 up to B = 1,024, as SaS 1.95-1.97 does). OURS. 2.0 turns it off.
+       "wild_max_alpha": 1.9}
 # H7.1 verdict (common/h71_verdict.py): alpha = 2 is tested against Gaussian pools of the same length, n_blocks and
 # batch sizes (5% quantile of mean alpha-hat; central 90% of the scale exponent). OURS: pools per setting.
 H71_NULL_REPS = 400

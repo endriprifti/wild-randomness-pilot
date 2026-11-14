@@ -32,12 +32,14 @@ def test_classify_branches(kw, verdict, reason):
     assert reason in out["verdict_reason"]
 
 
-def test_optional_margin_keeps_near_two_undecided():
+def test_margin_keeps_near_two_undecided():
     near = row(alpha_mean=1.96, scale_exponent=-0.49, scale_gap_lo=-0.01, scale_gap_hi=0.01)
-    assert hv.classify(near, BOUNDS)["verdict"] == "invariant (wild)"              # off by default
-    out = hv.classify(near, BOUNDS, wild_max=1.9)
+    out = hv.classify(near, BOUNDS)                                                  # margin 1.9 by default
     assert out["verdict"] == "undecided" and "above 1.9" in out["verdict_reason"]
-    assert hv.classify(row(), BOUNDS, wild_max=1.9)["verdict"] == "invariant (wild)"  # alpha 1.5 unaffected
+    assert hv.classify(near, BOUNDS, wild_max=2.0)["verdict"] == "invariant (wild)"  # 2 turns it off
+    assert hv.classify(near, BOUNDS, wild_max=None)["verdict"] == "invariant (wild)"
+    assert hv.classify(row(alpha_mean=1.9), BOUNDS)["verdict"] == "invariant (wild)"  # 1.9 itself is wild
+    assert "<= 1.9" in hv.classify(row(), BOUNDS)["verdict_reason"]
 
 
 def test_flat_at_two_is_not_read_as_invariant():

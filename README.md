@@ -135,12 +135,13 @@ each test's summary row:
 
 | Verdict | Slope b (90% bootstrap interval) | Level ᾱ (mean α̂ over B) | Scale exponent s (log γ̂_B on log B) |
 |---|---|---|---|
-| invariant (wild) | inside ±0.03 | below 2: under the 5% quantile of ᾱ on Gaussian pools of the same size | consistent with 1/ᾱ − 1: the bootstrap 90% interval of s − (1/ᾱ − 1) contains 0 |
+| invariant (wild) | inside ±0.03 | below 2: under the 5% quantile of ᾱ on Gaussian pools of the same size, and ᾱ ≤ 1.9 | consistent with 1/ᾱ − 1: the bootstrap 90% interval of s − (1/ᾱ − 1) contains 0 |
 | flat at 2 (mild) | inside ±0.03 | consistent with 2: not under that quantile | near −1/2: inside the central 90% of s on the same Gaussian pools |
 | drift | above 0.05 | any | any |
-| undecided | anything else | | `verdict_reason` says which condition failed |
+| undecided | anything else, including ᾱ between 1.9 and the Gaussian quantile | | `verdict_reason` says which condition failed |
 
-α̂ cannot exceed 2, so α = 2 is tested one-sided against Gaussian pools with the same pool length, blocks and batch
+The margin 1.9 (Endri, 2026-11-14; `H71["wild_max_alpha"]` in `config.py`, `--wild-max`, 2 turns it off) is
+explained under "Known limit" below. α̂ cannot exceed 2, so α = 2 is tested one-sided against Gaussian pools with the same pool length, blocks and batch
 sizes, fitted exactly as a real pool (the bootstrap is not used for the level, since it fails at the boundary).
 Every input is already a column of the summary CSVs (`b_lo`, `b_hi`, `alpha_mean`, `scale_exponent`,
 `scale_gap_lo`, `scale_gap_hi`, `n_pool`, `n_blocks`), so the verdict is recomputed from saved files, without
@@ -162,19 +163,18 @@ and added to the `--null` file (400 pools; about 1 h on 6 cores at 1,600 blocks)
 **Check at full size** (this environment's CPU, 2026-11-14; 1,600 blocks, B = 8 … 1024, 100 Gaussian reference
 pools, full tests with a reduced bootstrap of 30 resamples). The reference puts the 5% quantile of ᾱ at 1.993
 (13% of Gaussian pools have ᾱ = 2 exactly) and s between −0.507 and −0.492. The slope alone read every flat pool
-"invariant". The verdict read two SαS α = 1.5 pools (ᾱ 1.53, 1.54) and one α = 1.9 pool (ᾱ 1.915) as
-"invariant (wild)", a truncated-Lévy pool with cutoff 100 as "drift" (b in [0.068, 0.086]), and two Gaussian
-pools as "flat at 2 (mild)" and "invariant (wild)": the second had ᾱ = 1.992, just under 1.993, which is the
-one-sided test's 5% size.
+"invariant". The verdict read two SαS α = 1.5 pools (ᾱ 1.53, 1.54) as "invariant (wild)", a truncated-Lévy pool
+with cutoff 100 as "drift" (b in [0.068, 0.086]), one Gaussian pool as "flat at 2 (mild)", and two pools as
+"undecided" because ᾱ lay between 1.9 and 1.993: a Gaussian pool with ᾱ = 1.992 (without the margin it would read
+wild, the one-sided test's 5% size) and an SαS α = 1.9 pool with ᾱ = 1.915.
 
 **Known limit: noise near α = 2.** Point fits on finite-variance Student-t pools (no bootstrap) give a flat or
 nearly flat slope with ᾱ below the Gaussian quantile: ν = 3, ᾱ 1.93 to 1.95 (b 0.015 to 0.026); ν = 4, ᾱ 1.98
 (b 0.006); ν = 5 and 10 read as Gaussian (ᾱ 1.995, 1.999). SαS α = 1.95 and 1.97 give ᾱ 1.96 and 1.98. So up to
 B = 1,024 a stable law with α above about 1.9 cannot be told from finite variance with ζ of 3 to 4 (slow
-convergence to the Gaussian), and the rule as written reads both "invariant (wild)". `--wild-max` (config
-`H71["wild_max_alpha"]`, off by default) adds a margin: "invariant (wild)" then also needs ᾱ ≤ that value, and
-pools between it and the Gaussian quantile read "undecided". The per-example tail fit of §7.1 (ζ) separates
-these cases where the batch-size test cannot.
+convergence to the Gaussian); without a margin the rule reads both "invariant (wild)". Hence the margin:
+"invariant (wild)" needs ᾱ ≤ 1.9, and pools between 1.9 and the Gaussian quantile read "undecided". The
+per-example tail fit of §7.1 (ζ) separates these cases where the batch-size test cannot.
 
 ## Full run on one L40S: `run_all.sh`
 
@@ -457,7 +457,7 @@ known parameters:
 - D_2 and Δh_rep on binomial cascades, the uniform square, and the dimension clause in 50 dimensions;
 - H7.1 slope on SαS pools (invariant) and a truncated Lévy pool (drift); the 1,600-block arithmetic;
 - H7.1 verdict: each branch (wild, mild, drift, and undecided for the slope, for the scale exponent and without a
-  Gaussian reference); flat at 2 is not read as invariant; the optional margin leaves ᾱ near 2 undecided; the Gaussian reference is seeded per pool, tops up only
+  Gaussian reference); flat at 2 is not read as invariant; the 1.9 margin leaves ᾱ near 2 undecided (and 2 turns it off); the Gaussian reference is seeded per pool, tops up only
   what is missing and is matched to each row's setting; the command line recomputes verdicts from a saved summary;
 - coupling test, Holm, detectable r; censored escape rates and the (η, B) power-law fit against the Gaussian rival;
 - per-example JVP against autograd, Hessian eigenvalues and Hutchinson trace on a quadratic;

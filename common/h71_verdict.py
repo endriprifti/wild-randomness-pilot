@@ -15,10 +15,14 @@ verdict reads three things from each test's summary row:
           contains 0. With alpha-hat consistent with 2 it must be near -1/2: inside the central 90% of s on the
           same Gaussian pools.
 
-  invariant (wild)   slope flat, level below 2, s consistent with 1/alpha - 1
+  invariant (wild)   slope flat, level below 2 and alpha_mean <= wild_max (1.9), s consistent with 1/alpha - 1
   flat at 2 (mild)   slope flat, level consistent with 2, s near -1/2
   drift              slope above drift_tol
   undecided          anything else; verdict_reason says which condition failed
+
+The margin wild_max (Endri, 2026-11-14): between 1.9 and the Gaussian 5% quantile the verdict is undecided. Up to
+B = 1,024, finite-variance noise with zeta of about 3 to 4 (Student t) keeps alpha-hat at 1.93 to 1.98 with a flat
+slope, as a stable law with alpha that close to 2 does, so the test cannot call either one wild.
 
 Every input is a column that h71_test already writes (b_lo, b_hi, alpha_mean, scale_exponent, scale_gap_lo,
 scale_gap_hi, n_pool, n_blocks), so the verdict is recomputed from saved CSVs without refitting: P0's
@@ -144,13 +148,11 @@ def _f(x) -> float:
 
 
 def classify(row, bounds: dict, inv_tol: float = 0.03, drift_tol: float = 0.05,
-             wild_max: float | None = None) -> dict:
+             wild_max: float | None = 1.9) -> dict:
     """Verdict for one test's summary row (a dict or a pandas row) given its Gaussian reference.
 
-    wild_max (optional, off by default): "invariant (wild)" also needs alpha_mean <= wild_max. Between wild_max and
-    the Gaussian quantile the verdict is undecided: within B <= 1,024, finite-variance noise with zeta of about 3 to
-    4 (Student t) keeps alpha-hat near 1.93 to 1.98 with a flat slope, as a stable law with alpha that close to 2
-    does."""
+    "invariant (wild)" also needs alpha_mean <= wild_max; between wild_max and the Gaussian quantile the verdict is
+    undecided (see the module docstring). wild_max = None or 2 turns the margin off."""
     b_lo, b_hi = _f(row["b_lo"]), _f(row["b_hi"])
     abar, s = _f(row["alpha_mean"]), _f(row["scale_exponent"])
     g_lo, g_hi = _f(row["scale_gap_lo"]), _f(row["scale_gap_hi"])
@@ -189,7 +191,8 @@ def classify(row, bounds: dict, inv_tol: float = 0.03, drift_tol: float = 0.05,
                                       f"near 2, where finite variance with zeta ~ 3-4 looks the same up to B = 1,024")
         elif out["scale_reading"] == "consistent with 1/alpha-1":
             out.update(verdict="invariant (wild)",
-                       verdict_reason=f"slope flat; alpha_mean {abar:.3f} < {aq:.3f} (Gaussian 5%); "
+                       verdict_reason=f"slope flat; alpha_mean {abar:.3f} < {aq:.3f} (Gaussian 5%)"
+                                      + (f" and <= {wild_max:g}; " if wild_max is not None else "; ") +
                                       f"s - (1/alpha-1) interval [{g_lo:.3f}, {g_hi:.3f}] contains 0")
         else:
             out.update(verdict="undecided",
@@ -214,7 +217,7 @@ def needed_keys(df: pd.DataFrame, batch_sizes) -> list[tuple]:
 
 
 def apply_verdicts(df: pd.DataFrame, null: pd.DataFrame, batch_sizes, inv_tol: float = 0.03,
-                   drift_tol: float = 0.05, level: float = 0.90, wild_max: float | None = None) -> pd.DataFrame:
+                   drift_tol: float = 0.05, level: float = 0.90, wild_max: float | None = 1.9) -> pd.DataFrame:
     """Add the reference bounds, the three readings and the verdict to every row of a summary table."""
     missing = [c for c in SUMMARY_COLUMNS if c not in df.columns]
     if missing:
@@ -273,7 +276,7 @@ def main(argv=None):
     ap.add_argument("--drift-tol", type=float, default=config.H71["drift_tol"])
     ap.add_argument("--level", type=float, default=config.H71["level"])
     ap.add_argument("--wild-max", type=float, default=config.H71.get("wild_max_alpha"),
-                    help="optional: invariant (wild) also needs mean alpha-hat <= this (default %(default)s = off)")
+                    help="invariant (wild) also needs mean alpha-hat <= this (default %(default)s; 2 turns it off)")
     ap.add_argument("--suffix", default="_verdict", help="output file: <input stem><suffix>.csv")
     args = ap.parse_args(argv)
 
