@@ -17,7 +17,10 @@ Every block has n_s state dimensions per channel, the quantity H4.1 holds equal:
   legs     HiPPO-LegS with A and B frozen (optional arm).
   s4d      S4D-Lin (Gu et al. 2022b): n_s/2 complex diagonal modes (n_s real state dims), ZOH.
   mamba    Mamba (Gu and Dao 2023) selective SSM with d_state = n_s, reference scan in PyTorch
-           (chunked); the mamba-ssm CUDA kernels are not required.
+           (chunked); the mamba-ssm CUDA kernels are not required. The scan keeps a
+           [B, T, T, Dn, n_s] tensor per chunk of length T for the backward pass, so its memory
+           grows as T * n_s over the sequence: the chunk is shortened as n_s grows
+           (scan_chunk, T * n_s <= 256), which leaves the result unchanged (the chunks are exact).
 """
 
 from __future__ import annotations
@@ -156,6 +159,15 @@ class ConvSSM(nn.Module):
 
 
 # ----------------------------------------------------------------------------- Mamba
+def scan_chunk(n_s: int, cap: int = 256, longest: int = 32) -> int:
+    """Chunk length T of the selective scan with T * n_s <= cap (memory per sequence ~ L T Dn n_s).
+
+    P3 at full size (batch 32, L = 1,024, two layers): with T = 32 the mamba arm would peak near
+    38 GiB at n_s = 32 and 77 GiB at n_s = 64 (python memory_check.py); with T * n_s <= 256 every
+    n_s stays between 10 and 13 GiB."""
+    return max(1, min(longest, cap // max(1, int(n_s))))
+
+
 def selective_scan(u, delta, A, Bm, Cm, D, chunk: int = 32):
     """Reference selective scan. u, delta [B, L, Dn]; A [Dn, N]; Bm, Cm [B, L, N]; D [Dn].
 
@@ -196,10 +208,10 @@ def selective_scan_naive(u, delta, A, Bm, Cm, D):
 
 class MambaMixer(nn.Module):
     def __init__(self, H: int, n_s: int, expand: int = 2, d_conv: int = 4, dt_rank: int | None = None,
-                 chunk: int = 32):
+                 chunk: int | None = None):
         super().__init__()
         Dn = expand * H
-        self.Dn, self.N, self.chunk = Dn, n_s, chunk
+        self.Dn, self.N, self.chunk = Dn, n_s, (chunk or scan_chunk(n_s))
         self.dt_rank = dt_rank or max(1, math.ceil(H / 16))
         self.in_proj = nn.Linear(H, 2 * Dn, bias=False)
         self.conv = nn.Conv1d(Dn, Dn, d_conv, groups=Dn, padding=d_conv - 1)

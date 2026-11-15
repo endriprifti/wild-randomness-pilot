@@ -8,6 +8,13 @@ about two forward passes, with no per-example backward pass.
 
 Models with batch statistics (BatchNorm) must be measured in eval mode, otherwise
 "per-example" gradients are coupled through the batch.
+
+Micro-batches (chunk): every batch measure here is a mean over examples, so it can be computed
+on micro-batches of at most `chunk` examples and combined with weights n_c / n: the Hessian-vector
+product of the mean loss is sum_c (n_c / n) H_c v, with H_c the Hessian of micro-batch c's mean
+loss (H v is linear in the loss); the same holds for the gradient and the loss in the sharpness
+ascent, and per-example projections are simply stacked. The result equals the full-batch one up
+to floating-point summation order, at the memory of one micro-batch. chunk=None keeps one batch.
 """
 
 from __future__ import annotations
@@ -43,6 +50,34 @@ def random_directions(params: dict[str, torch.Tensor], k: int, generator: torch.
     return dirs
 
 
+def batch_len(batch) -> int:
+    if isinstance(batch, torch.Tensor):
+        return int(batch.shape[0])
+    if isinstance(batch, (tuple, list)):
+        return batch_len(batch[0])
+    if isinstance(batch, dict):
+        return batch_len(next(iter(batch.values())))
+    raise TypeError(f"cannot split a batch of type {type(batch).__name__}")
+
+
+def batch_slice(batch, s: int, e: int):
+    if isinstance(batch, torch.Tensor):
+        return batch[s:e]
+    if isinstance(batch, (tuple, list)):
+        return type(batch)(batch_slice(b, s, e) for b in batch)
+    if isinstance(batch, dict):
+        return {k: batch_slice(v, s, e) for k, v in batch.items()}
+    raise TypeError(f"cannot split a batch of type {type(batch).__name__}")
+
+
+def micro_batches(batch, chunk: int | None) -> list[tuple[object, float]]:
+    """[(micro-batch, n_c / n)]; the whole batch with weight 1 if chunk is None or covers it."""
+    n = batch_len(batch)
+    if not chunk or chunk >= n:
+        return [(batch, 1.0)]
+    return [(batch_slice(batch, s, min(s + chunk, n)), (min(s + chunk, n) - s) / n) for s in range(0, n, chunk)]
+
+
 def _split(model, sel):
     frozen = {n: p.detach() for n, p in model.named_parameters() if n not in sel}
     buffers = dict(model.named_buffers())
@@ -50,12 +85,17 @@ def _split(model, sel):
 
 
 def per_example_projections(model: torch.nn.Module, per_example_loss: Callable, batch,
-                            params: dict[str, torch.Tensor], directions: list[dict]) -> torch.Tensor:
+                            params: dict[str, torch.Tensor], directions: list[dict],
+                            chunk: int | None = None) -> torch.Tensor:
     """Matrix [batch, n_directions] of grad L_i . u for each direction u (forward-mode JVP).
 
     per_example_loss(outputs_fn, batch) must return a vector of per-example losses, where
-    outputs_fn(**inputs) runs the model with the substituted parameters.
+    outputs_fn(**inputs) runs the model with the substituted parameters. With chunk, the rows
+    are computed on micro-batches of at most chunk examples and stacked.
     """
+    parts = micro_batches(batch, chunk)
+    if len(parts) > 1:
+        return torch.cat([per_example_projections(model, per_example_loss, b, params, directions) for b, _ in parts])
     sel = {n: p.detach() for n, p in params.items()}
     frozen, buffers = _split(model, sel)
 
@@ -82,13 +122,34 @@ def mean_loss_fn(model, per_example_loss, batch, params):
     return f, {n: params[n].detach() for n in sel_names}
 
 
-def hvp_fn(model, per_example_loss, batch, params):
-    """v -> H v for the Hessian block of the selected parameters (forward-over-reverse)."""
-    f, p0 = mean_loss_fn(model, per_example_loss, batch, params)
-    g = grad(f)
+def hvp_fn(model, per_example_loss, batch, params, chunk: int | None = None):
+    """v -> H v for the Hessian block of the selected parameters (forward-over-reverse).
+
+    With chunk, H v = sum_c (n_c / n) H_c v over micro-batches of at most chunk examples (exact:
+    the loss is a mean over examples), so memory is that of one micro-batch."""
+    parts = micro_batches(batch, chunk)
+    grads = []
+    for b, w in parts:
+        f, p0 = mean_loss_fn(model, per_example_loss, b, params)
+        grads.append((grad(f), w))
+    if len(grads) == 1:
+        g = grads[0][0]
+
+        def hvp(v):
+            return jvp(g, (p0,), (v,))[1]
+        return hvp, p0
 
     def hvp(v):
-        return jvp(g, (p0,), (v,))[1]
+        out = None
+        for g, w in grads:
+            hv = jvp(g, (p0,), (v,))[1]
+            if out is None:
+                out = {n: t * w for n, t in hv.items()}
+            else:
+                for n, t in hv.items():
+                    out[n].add_(t, alpha=w)
+            del hv
+        return out
     return hvp, p0
 
 
@@ -140,21 +201,23 @@ def hutchinson_trace(hvp, p0, n_samples: int = 20, generator: torch.Generator | 
 
 
 @torch.no_grad()
-def _eval_loss(model, per_example_loss, batch):
+def _eval_loss(model, per_example_loss, batch, chunk: int | None = None):
     run = lambda *a, **kw: model(*a, **kw)
-    return float(per_example_loss(run, batch).mean())
+    return float(sum(w * float(per_example_loss(run, b).mean()) for b, w in micro_batches(batch, chunk)))
 
 
 def adaptive_sharpness(model, per_example_loss, batch, rho: float = 0.05, steps: int = 5,
-                       lr: float | None = None) -> float:
+                       lr: float | None = None, chunk: int | None = None) -> float:
     """Adaptive (rescaling-invariant) sharpness: max over ||delta / |w| ||_2 <= rho of L(w + delta) - L(w).
 
     Approximated by a few steps of projected gradient ascent in the |w|-scaled coordinates
-    (Kwon et al. 2021; Andriushchenko et al. 2023). Restores the weights afterwards.
+    (Kwon et al. 2021; Andriushchenko et al. 2023). Restores the weights afterwards. With chunk,
+    the loss and its gradient are accumulated over micro-batches with weights n_c / n.
     """
     params = [p for p in model.parameters() if p.requires_grad]
     w0 = [p.detach().clone() for p in params]
-    base = _eval_loss(model, per_example_loss, batch)
+    parts = micro_batches(batch, chunk)
+    base = _eval_loss(model, per_example_loss, batch, chunk)
     lr = lr if lr is not None else rho / max(steps, 1)
     deltas = [torch.zeros_like(p) for p in params]
     try:
@@ -163,8 +226,8 @@ def adaptive_sharpness(model, per_example_loss, batch, rho: float = 0.05, steps:
                 p.data.copy_(w + d)
             model.zero_grad(set_to_none=True)
             run = lambda *a, **kw: model(*a, **kw)
-            loss = per_example_loss(run, batch).mean()
-            loss.backward()
+            for b, wc in parts:
+                (per_example_loss(run, b).mean() * wc).backward()
             # gradient in scaled coordinates z = delta / |w|: dL/dz = |w| dL/ddelta
             zs = [d / (w.abs() + 1e-12) for d, w in zip(deltas, w0)]
             gz = [(p.grad if p.grad is not None else torch.zeros_like(p)) * w.abs() for p, w in zip(params, w0)]
@@ -176,7 +239,7 @@ def adaptive_sharpness(model, per_example_loss, batch, rho: float = 0.05, steps:
             deltas = [z * w.abs() for z, w in zip(zs, w0)]
         for p, w, d in zip(params, w0, deltas):
             p.data.copy_(w + d)
-        worst = _eval_loss(model, per_example_loss, batch)
+        worst = _eval_loss(model, per_example_loss, batch, chunk)
     finally:
         for p, w in zip(params, w0):
             p.data.copy_(w)

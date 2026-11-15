@@ -260,21 +260,26 @@ def measure(kind, model, data, cfg, run, rng, device, proj, warm):
     out = {}
     is_lm = kind == "transformer"
     pel = lm.per_example_lm_loss if is_lm else resnet_pel
+    # every batch measure below runs on micro-batches of mb examples (weights n_c / n; exact for means)
+    mb = M.get("micro_batch", {}).get(kind)
     tr = data["train"][:len(data["test"])] if is_lm else (data["train"][0][:len(data["test"][0])], data["train"][1][:len(data["test"][0])])
-    out["train_loss"], out["train_err"] = mean_loss(kind, model, tr, device)
-    out["test_loss"], out["test_err"] = mean_loss(kind, model, data["test"], device)
+    ebs = min(64, mb) if mb else 64
+    out["train_loss"], out["train_err"] = mean_loss(kind, model, tr, device, bs=ebs)
+    out["test_loss"], out["test_err"] = mean_loss(kind, model, data["test"], device, bs=ebs)
     out["gap"] = out["test_loss"] - out["train_loss"]
-    out["ood_loss"], out["ood_err"] = mean_loss(kind, model, data["ood"], device)
+    out["ood_loss"], out["ood_err"] = mean_loss(kind, model, data["ood"], device, bs=ebs)
     model.eval()
     hb = M["hessian_batch"]
     hbatch = data["train"][:hb].to(device).long() if is_lm else (data["train"][0][:hb].to(device), data["train"][1][:hb].to(device))
     params = gradients.select_params(model, None)
-    hvp, p0 = gradients.hvp_fn(model, pel, hbatch, params)
+    hvp, p0 = gradients.hvp_fn(model, pel, hbatch, params, chunk=mb)
     gen = torch.Generator().manual_seed(run.seed)
     vals, _ = gradients.top_eigvecs(hvp, p0, 1, M["power_iters"], gen)
     out["lambda_max"] = vals[0]
     out["hessian_trace"] = gradients.hutchinson_trace(hvp, p0, M["trace_samples"], gen)
-    out["adaptive_sharpness"] = gradients.adaptive_sharpness(model, pel, hbatch, M["sharp_rho"], M["sharp_steps"])
+    out["adaptive_sharpness"] = gradients.adaptive_sharpness(model, pel, hbatch, M["sharp_rho"], M["sharp_steps"],
+                                                             chunk=mb)
+    del hvp, p0
     # alpha / zeta of unclipped minibatch noise at the training batch size, one random direction
     B = cfg["transformer"]["batch"] if is_lm else cfg["resnet18"]["batch"]
     n_avail = len(data["train"]) if is_lm else len(data["train"][0])
@@ -282,7 +287,7 @@ def measure(kind, model, data, cfg, run, rng, device, proj, warm):
     sel = gradients.select_params(model, None)
     d = gradients.random_directions(sel, 1, gen)
     vals_p = []
-    bs = 32
+    bs = min(32, mb) if mb else 32
     for s in range(0, n_pool, bs):
         b = data["train"][s:s + bs].to(device).long() if is_lm else (data["train"][0][s:s + bs].to(device), data["train"][1][s:s + bs].to(device))
         vals_p.append(gradients.per_example_projections(model, pel, b, sel, d)[:, 0].cpu())

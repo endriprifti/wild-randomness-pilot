@@ -55,3 +55,16 @@ def test_width_matching(kind):
     ref = ssm.n_params(ssm.SSMModel("s4d", 1, 1, 32, 16, 2, 256, False))
     H, p = ssm.width_for_budget(kind, 1, 1, 16, 2, 256, False, ref, H_grid=range(2, 129, 2))
     assert abs(p / ref - 1) < 0.1
+
+
+def test_scan_chunk_shrinks_with_the_state_size_and_gives_the_same_scan():
+    assert [ssm.scan_chunk(n) for n in (2, 4, 8, 16, 32, 64)] == [32, 32, 32, 16, 8, 4]
+    assert ssm.MambaMixer(8, 64).chunk == 4 and ssm.MambaMixer(8, 64, chunk=32).chunk == 32
+    g = torch.Generator().manual_seed(0)
+    B, L, Dn, N = 2, 40, 3, 64
+    u, delta = torch.randn(B, L, Dn, generator=g), torch.rand(B, L, Dn, generator=g) * 0.1
+    A = -torch.rand(Dn, N, generator=g) - 0.1
+    Bm, Cm, Dv = torch.randn(B, L, N, generator=g), torch.randn(B, L, N, generator=g), torch.randn(Dn, generator=g)
+    y4 = ssm.selective_scan(u, delta, A, Bm, Cm, Dv, chunk=ssm.scan_chunk(N))
+    y32 = ssm.selective_scan(u, delta, A, Bm, Cm, Dv, chunk=32)
+    assert torch.allclose(y4, y32, atol=1e-5)

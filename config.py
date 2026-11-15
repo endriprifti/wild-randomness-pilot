@@ -127,7 +127,11 @@ CONFIG = {
                 # OPTIONAL, last job, only if credits remain: needs the L40S (48 GB)
                 "olmo7b": {"repo": "allenai/OLMo-2-1124-7B", "sizes": ["7b"], "seeds": [0], "variant": "base",
                            "branch_regex": r"^step(\d+)-tokens", "optional": True,
-                           "step_fracs": [0.002, 0.01, 0.1, 0.5, 1.0]},
+                           "step_fracs": [0.002, 0.01, 0.1, 0.5, 1.0],
+                           # micro-batches (python memory_check.py, float32, eager attention): 27.2 GiB of weights;
+                           # eval at 4 x 2,048 tokens would peak near 39.6 GiB and the JVP at 32 x 128 near
+                           # 42.1 GiB on the 44 GiB L40S; 1 and 8 peak near 30.3 and 31.5 GiB
+                           "eval_batch": 1, "jvp_batch": 8},
             },
             "steps": [1, 8, 64, 512, 1000, 4000, 8000, 16000, 32000, 64000, 143000],   # Pythia-style suites
             # Loss spikes (PolyPythias paper, Fig. 5, which gives no step numbers): 410M seeds 3 and 4. Two passes:
@@ -262,7 +266,12 @@ CONFIG = {
             "calib_steps": 200, "diverge_factor": 3.0, "autoclip_pct": 10.0, "zclip_z": 2.5, "zclip_beta": 0.97, "agc_lambda": 0.01,
             "n_hgrad_dirs": 8,
             "measure": {"hessian_batch": 512, "power_iters": 20, "trace_samples": 20, "sharp_rho": 0.05,
-                        "sharp_steps": 5, "alpha_pool_blocks": 1600, "probe_points": 5000},
+                        "sharp_steps": 5, "alpha_pool_blocks": 1600, "probe_points": 5000,
+                        # micro-batch of every batch measure in measure() (HVP, trace, sharpness, per-example
+                        # projections, losses). Peak memory, estimated with python memory_check.py: the HVP on
+                        # 512 sequences of 512 tokens needs about 537 GiB (the L40S failure of 2026-11-15); 16
+                        # sequences need about 17 GiB. ResNet-18: about 2.5 GiB at 128 images.
+                        "micro_batch": {"transformer": 16, "resnet18": 128}},
             "h71": {"run": {"model": "resnet18", "rule": "none", "seed": 0}, "n_blocks": 1600,
                     "batch_sizes": BATCH_SIZES, "n_random_dirs": 2, "n_hessian_dirs": 1,
                     "layer": "layer4.1.conv2.weight", "n_boot": 200},
@@ -280,7 +289,8 @@ CONFIG = {
             "calib_steps": 5, "n_hgrad_dirs": 2,
             # the real 50k-token vocabulary makes every HVP and per-example JVP costly: smallest batches that still run
             "measure": {"hessian_batch": 8, "power_iters": 3, "trace_samples": 2, "sharp_rho": 0.05,
-                        "sharp_steps": 1, "alpha_pool_blocks": 25, "probe_points": 200},
+                        "sharp_steps": 1, "alpha_pool_blocks": 25, "probe_points": 200,
+                        "micro_batch": {"transformer": 4, "resnet18": 4}},   # smoke runs the chunked path
             "h71": {"run": {"model": "resnet18", "rule": "none", "seed": 0}, "n_blocks": 20,
                     "batch_sizes": [8, 16, 32], "n_random_dirs": 1, "n_hessian_dirs": 0,
                     "layer": "layer4.1.conv2.weight", "n_boot": 3},

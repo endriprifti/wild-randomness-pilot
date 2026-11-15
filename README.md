@@ -15,6 +15,7 @@ plus `run.json` (config, git commit, GPU type and memory, library versions, wall
 | `p4_clipping.py` | H6.1, H7.1 control, H_grad | clipping sweep (fixed p_clip, AutoClip, ZClip, AGC), matched update length, flatness and tail measures |
 | `p1_checkpoints.py` | α, α_ESD, K, H, Δh across Pythia, PolyPythias, OLMo | measurement only on public checkpoints; H7.1 at training stages; exploratory coupling |
 | `p3_fractional_memory.py` | H4.1 | fractional block against S4 (LegS), S4D and Mamba at matched parameters and equal tuning budget |
+| `memory_check.py` | (tooling) | peak GPU memory of the largest steps of P1, P3 and P4, estimated on the meta device (no GPU, no downloads) |
 
 Notation follows the paper: ζ is the fitted Pareto (survival) exponent, α = min(ζ, 2) only for the stable index.
 
@@ -33,9 +34,9 @@ WSL2, **T4** = Kaggle's 16 GB T4 (not the P100, see below), **5090** = RTX 5090 
 | 1 | Emmy check | ~1 (ours) | 5090 (Emmy's own benchmark GPU); needs nvcc and the Emmy env | `python emmy_check.py --frontend-only` (CPU), then `python emmy_check.py --probe-only`, then `python emmy_check.py` |
 | 2 | Escape grid, H3.3 / H6.1 | 25 | 4 GB, T4, 5090 | `python p5_escape.py` and `python p5_escape.py --part h31` |
 | 3 | W4A4 and weight-only, H6.2 (simulated quantization) | 30 | 5090 (Pythia-6.9B and OLMo-7B in fp16, about 14 GB each); L40S also fine | `python p2_w4a4.py` (one model: `--models EleutherAI/pythia-6.9b`) |
-| 4 | Clipping sweep, H6.1 / H7.1 control | 30 | T4, 5090 | `python p4_clipping.py --model transformer` and `python p4_clipping.py --model resnet18` |
-| 5 | Checkpoint measurements, with the 410M loss-spike check (pass (a) downloads about 391 GB, see below) | 45 | Pythia and PolyPythias: T4 (up to 410M), 5090 (up to 1.4B); OLMo 2 1B: 5090 | `python p1_checkpoints.py --pin-only`, then `--suite pythia`, `--suite polypythia,polypythia_data,polypythia_weight`, `--suite olmo` |
-| 6 | Fractional memory, H4.1 | 65 | T4, 5090 | `python p3_fractional_memory.py` (drop LRA first if time runs short: `--tasks powerlaw,exponential`) |
+| 4 | Clipping sweep, H6.1 / H7.1 control | 30 | 5090 (transformer peak ~21 GiB, see GPU memory below); ResNet-18 also T4 | `python p4_clipping.py --model transformer` and `python p4_clipping.py --model resnet18` |
+| 5 | Checkpoint measurements, with the 410M loss-spike check (pass (a) downloads about 391 GB, see below) | 45 | Pythia: 5090 (H7.1's HVP at 14M to 160M peaks ~16 GiB); PolyPythias: T4; OLMo 2 1B: 5090 | `python p1_checkpoints.py --pin-only`, then `--suite pythia`, `--suite polypythia,polypythia_data,polypythia_weight`, `--suite olmo` |
+| 6 | Fractional memory, H4.1 | 65 | 5090; T4 is tight (Mamba at n_s = 64 peaks ~13 GiB) | `python p3_fractional_memory.py` (drop LRA first if time runs short: `--tasks powerlaw,exponential`) |
 | 7 | **Optional, last:** OLMo 2 7B checkpoints | not in the 45 (ours: ~10) | **L40S** (fp32 weights plus per-example JVP exceed 32 GB) | `python p1_checkpoints.py --suite olmo7b`, only if credits remain |
 
 Jobs 0 to 6 all fit the RTX 5090. Job 7 is the only one that needs the L40S, and nothing else depends on it.
@@ -220,6 +221,39 @@ tail -f logs/progress.txt
   revision or file fails at once.
 - **Output folders.** Each job writes to `results/<job>/` (`--out`), so the three P1 suites and the two P4 models do
   not overwrite each other.
+
+### GPU memory on the L40S
+
+The first full P4 transformer job (2026-11-15) ran out of memory after training, in `measure()`: the Hessian-vector
+product ran on all 512 measurement sequences at once (float32, eager attention, a 50k vocabulary). Since then:
+
+- **Micro-batches.** Every batch measure in P4's `measure()` (the HVP behind the top eigenvalue and the Hutchinson
+  trace, adaptive sharpness, the per-example projections and the losses) runs on micro-batches set by
+  `measure.micro_batch` in `config.py` (16 sequences for the transformer, 128 images for ResNet-18). The loss is a
+  mean over examples, so the HVP and the gradient are the sums of the micro-batch ones weighted by n_c / n, and the
+  result is the same up to rounding (unit tests). `common/gradients.py` takes `chunk=` for this.
+- **Allocator.** `common/runtime.py` sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` unless it is already
+  set; the first log line of every job records the value.
+- **OLMo 2 7B.** 27.2 GiB of float32 weights leave little room: the suite sets `eval_batch: 1` and `jvp_batch: 8`
+  (sequences per no-grad forward and per JVP; the other suites keep 4 and 32, and `--jvp-batch` still overrides).
+- **P3's Mamba scan** kept [B, T, T, D, N] tensors per chunk for the backward pass, which grows with the state size:
+  about 19, 38 and 77 GiB at n_s = 16, 32 and 64 (10, 11 and 13 GiB now). The chunk now shrinks with the state size (`ssm.scan_chunk`:
+  T · n_s ≤ 256, at most 32 steps), which gives the same scan.
+
+`python memory_check.py` estimates the peak of each large step without a GPU or downloads: it builds every model on
+the meta device and adds up live tensor storage after every operation (CUDA context and allocator overhead come on
+top, so a step above 85% of the card reads "tight"). It reproduces the failure (537 GiB for the unchunked HVP,
+`--calibrate`) and the training step that ran (21 GiB). At the settings in `config.py`, against 44.4 GiB:
+
+| Job | Largest step | Peak (GiB) |
+|---|---|---|
+| `p4_transformer` | training step, 64 × 512 tokens with AdamW (HVP at 16 sequences: 16.9) | 21.4 |
+| `p4_resnet18` | HVP at 128 images | 2.5 |
+| `p1_pythia` | HVP for H7.1's Hessian direction, 64 × 128 tokens (14M to 160M); 410M to 1.4B: JVP and losses | 16.3 |
+| `p1_polypythia` | per-example JVP, 32 × 128 tokens (no HVP) | 7.7 |
+| `p1_olmo` | per-example JVP, 32 × 128 tokens | 17.3 |
+| `p3_fractional` | Mamba training step at n_s = 64, 32 × 1,024 | 12.9 |
+| `p1_olmo7b` | per-example JVP, 8 × 128 tokens (27.2 of it weights) | 31.5 |
 
 ### Hours on the L40S
 
@@ -444,7 +478,7 @@ before the run.
 
 ## Unit tests
 
-`python -m pytest -q` (117 tests, about 90 s on a CPU; `-m "not slow"` skips the two slowest). Synthetic data with
+`python -m pytest -q` (124 tests, about 2 min on a CPU; `-m "not slow"` skips the two slowest). Synthetic data with
 known parameters:
 
 - stable density against the Gaussian and Cauchy closed forms and against SciPy; ML fit recovers α ∈ {1.2, 1.5, 1.8},
@@ -461,8 +495,12 @@ known parameters:
   what is missing and is matched to each row's setting; the command line recomputes verdicts from a saved summary;
 - coupling test, Holm, detectable r; censored escape rates and the (η, B) power-law fit against the Gaussian rival;
 - per-example JVP against autograd, Hessian eigenvalues and Hutchinson trace on a quadratic;
+- micro-batches: on a small GPT-NeoX, the HVP, Hutchinson trace, top eigenvalue, adaptive sharpness and
+  per-example projections computed in micro-batches (1, 3, 4 and 10 sequences of 10, uneven last part included)
+  match the full batch to float32 rounding (the loss is cast to float32); tuple batches on an MLP;
+- `memory_check.py`'s tracker: live bytes on the meta device, with freed tensors leaving the count;
 - NF4 code book, FWHT, rotation invariance, RTN error bound, matched bits, fixed-rate clipping;
-- chunked selective scan against the naive scan, the fractional kernel against the Mittag-Leffler impulse
+- chunked selective scan against the naive scan (also at the shorter chunk that larger states get), the fractional kernel against the Mittag-Leffler impulse
   response t^(ν−1) E_{ν,ν}(−λ t^ν), and parameter matching across SSM arms;
 - tail labels: alternatives that cannot be separated read "undecided"; exponential against Weibull uses the
   likelihood-ratio test;

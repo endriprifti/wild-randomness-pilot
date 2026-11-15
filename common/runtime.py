@@ -24,6 +24,11 @@ from typing import Any, Iterable
 
 import numpy as np
 
+# CUDA caching allocator: expandable segments cut fragmentation when large blocks of changing size are freed and
+# reallocated (the P4 out-of-memory of 2026-11-15 left 2 GiB reserved but unusable). The allocator reads this when
+# CUDA is first used, which happens after this import in every script; a value set outside is kept.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 PILOT_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -177,7 +182,8 @@ def start_run(test: str, cfg: dict, args: argparse.Namespace) -> Run:
               offline_ok=bool(args.smoke or args.offline_ok), t0=time.perf_counter(),
               require_pins=bool(getattr(args, "require_pins", False)),
               started=_dt.datetime.now(_dt.timezone.utc).isoformat())
-    run.note(f"device={device} seed={seed} smoke={run.smoke} out={out}")
+    run.note(f"device={device} seed={seed} smoke={run.smoke} out={out} "
+             f"PYTORCH_CUDA_ALLOC_CONF={os.environ.get('PYTORCH_CUDA_ALLOC_CONF', '')}")
     return run
 
 

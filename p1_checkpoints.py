@@ -303,7 +303,8 @@ def main():
                                                               "--smoke always keeps them)")
     ap.add_argument("--skip", default="", help="comma-separated parts to skip: "
                                                "grad,esd,act,dh,htok,h71,scaling,spike,coupling")
-    ap.add_argument("--jvp-batch", type=int, default=32)
+    ap.add_argument("--jvp-batch", type=int, default=None,
+                    help="sequences per JVP micro-batch (default: the suite's jvp_batch in config.py, else 32)")
     args = ap.parse_args()
     cfg = config.get("p1_checkpoints", args.smoke)
     run = runtime.start_run("p1_checkpoints", cfg, args)
@@ -328,6 +329,10 @@ def main():
     def read_checkpoint(suite, size, seed, repo, variant, step, rev, final, skip_here, tag):
         """Load one checkpoint, measure everything not in skip_here, append and return its row."""
         model, tok, src = hf.load_causal_lm(repo, rev, run, dtype=dtype, device=dev)
+        # micro-batches: sequences per no-grad forward (losses, hidden states) and per JVP; olmo7b sets smaller
+        # ones so that 27 GiB of float32 weights plus activations stay well under the L40S's 44 GiB
+        eb = int(cfg["suites"][suite].get("eval_batch", 4))
+        jb = int(args.jvp_batch or cfg["suites"][suite].get("jvp_batch", 32))
         pin = (hf.PINS.entry(repo, rev) or {}) if src == "hub" else {}
         key = type(tok).__name__ + str(getattr(tok, "name_or_path", ""))
         if key not in data_cache:  # same examples for every checkpoint of a tokenizer
@@ -360,14 +365,14 @@ def main():
             if str(row.get(col, "")).startswith("CHECK"):
                 run.note(f"{repo}@{rev} ({row['commit']}): {col} {row[col]}")
         frac = step / final if final else 1.0
-        row["probe_loss"] = float(lm.token_losses(model, probe_v, dev).mean())   # locates loss spikes
+        row["probe_loss"] = float(lm.token_losses(model, probe_v, dev, batch=eb).mean())   # locates loss spikes
 
         if "esd" not in skip_here:
             a_esd, lrows = spectra.model_alpha_esd(model, rng=rng)
             row["alpha_esd"] = a_esd
             esd_rows.extend({**r, "repo": repo, "step": step} for r in lrows)
         if "act" not in skip_here or "dh" not in skip_here:
-            hs = lm.hidden_states(model, probe_v, dev)
+            hs = lm.hidden_states(model, probe_v, dev, batch=eb)
             if "act" not in skip_here:
                 ks = []
                 for li, H in enumerate(hs):
@@ -389,7 +394,7 @@ def main():
                             "dh_clause_ok": d["clause_ok"], "dh_decades": d["decades_r"]})
             del hs
         if "htok" not in skip_here:
-            series = lm.token_losses(model, sur_v, dev).reshape(-1).numpy()
+            series = lm.token_losses(model, sur_v, dev, batch=eb).reshape(-1).numpy()
             m = hurst.memory_claim(series, n_surr=S["n_surr"], rng=rng, wavelet_j1=S["wavelet_j1"])
             row.update({f"Htok_{k}": v for k, v in m.items()})
             row["H_dep"] = m["H_dep_dfa"]  # exploratory stand-in in the coupling matrix
@@ -397,7 +402,7 @@ def main():
             B = cfg["coupling_B"]
             n = cfg["coupling_blocks"] * B
             params, dirs = directions(model, pool_v[:cfg["hessian_batch"]], dev, cfg["n_random_dirs"], 0, run.seed)
-            P = jvp_projections(model, pool_v[:n], params, [d for _, _, d in dirs], dev, args.jvp_batch)
+            P = jvp_projections(model, pool_v[:n], params, [d for _, _, d in dirs], dev, jb)
             q = noise_quantities(P[:, 0], B, cfg["coupling_blocks"], T, rng)
             row.update(q)
         # H7.1 at the four training stages
@@ -408,7 +413,7 @@ def main():
             n_pool = nb * max(h71_Bs)
             params, dirs = directions(model, pool_v[:cfg["hessian_batch"]], dev,
                                       cfg["n_random_dirs"], cfg["n_hessian_dirs"], run.seed)
-            P = jvp_projections(model, pool_v[:n_pool], params, [d for _, _, d in dirs], dev, args.jvp_batch)
+            P = jvp_projections(model, pool_v[:n_pool], params, [d for _, _, d in dirs], dev, jb)
             for j, (kind, i, _) in enumerate(dirs):
                 res = batchmod.h71_test(P[:, j], h71_Bs, nb, n_boot=h71cfg.get("n_boot", config.H71["n_boot"]),
                                         rng=rng)
@@ -417,7 +422,7 @@ def main():
                 h71_rows.extend({**meta, **r} for r in res["per_B"])
                 h71_summ.append({**meta, **res["summary"]})
         if step == final and "scaling" not in skip_here:
-            row["eval_loss"] = float(lm.token_losses(model, evals_v, dev).mean())
+            row["eval_loss"] = float(lm.token_losses(model, evals_v, dev, batch=eb).mean())
         rows.append(row)
         run.note(f"{repo}@{rev} [{tag}]: done")
         del model
