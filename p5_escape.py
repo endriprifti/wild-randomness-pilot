@@ -36,11 +36,15 @@ Commands:
   python p5_escape.py --smoke
 Reruns of selected cells keep each cell's seed, so the minibatches and injected noise are those of
 the full grid (exit checks draw no random numbers):
-  python p5_escape.py --floor-from results/p5_escape --fine-check 10:250 --out results/p5_escape_floor10
-  python p5_escape.py --modes injected --alphas 1.2 --second-reading --log-checks --out results/p5_escape_a12
+  python p5_escape.py --floor-from results/p5_escape --alphas 1.5,1.8,2.0 --fine-check 10:250 \
+      --out results/p5_escape_floor10
+  python p5_escape.py --modes injected --alphas 1.2 --fine-check 10:250 --second-reading --log-checks \
+      --out results/p5_escape_a12
   python p5_escape.py --part refit --base results/p5_escape \
       --replace results/p5_escape_floor10,results/p5_escape_a12 --out results/p5_escape_refit
   python p5_escape.py --part h31-flags --base results/p5_escape_h31 --out results/p5_escape_h31_flags
+(--alphas restricts only the injected cells, so the floor rerun keeps the SGD and clipped cells and leaves the
+alpha = 1.2 cells to the second command; --fine-check 10:250 checks at 10, 20, ..., 250, then every check_every.)
 """
 
 from __future__ import annotations
@@ -302,6 +306,11 @@ def full_grid(cfg, g_maxes):
     return list(enumerate(grid))
 
 
+def keep_alphas(grid, alphas):
+    """Keep every SGD and clipped cell and only the injected cells whose alpha is listed (indices gi kept)."""
+    return [c for c in grid if c[1][0] != "injected" or any(abs(c[1][5] - a) < 1e-9 for a in alphas)]
+
+
 def _norm_key(df: pd.DataFrame, quantiles=None) -> pd.DataFrame:
     """Add g_max_q (the quantile behind g_max) to restarts saved before it was recorded."""
     df = df.copy()
@@ -480,7 +489,8 @@ def main():
     ap = runtime.base_parser(__doc__)
     ap.add_argument("--part", default="escape", help="escape | h31 | refit | h31-flags")
     ap.add_argument("--modes", default=None, help="escape: only these modes (sgd,clipped,injected)")
-    ap.add_argument("--alphas", default=None, help="escape: only these injected alphas, e.g. 1.2")
+    ap.add_argument("--alphas", default=None, help="escape: of the injected cells keep only these alphas, e.g. 1.2 "
+                    "(SGD and clipped cells are kept; add --modes injected for injected cells only)")
     ap.add_argument("--floor-from", default=None, help="escape: only the cells of this saved run whose restarts "
                                                        "all exited at its first check")
     ap.add_argument("--floor-share", type=float, default=1.0, help="with --floor-from: share of first-check exits")
@@ -560,8 +570,7 @@ def main():
     if args.modes:
         grid = [c for c in grid if c[1][0] in args.modes.split(",")]
     if args.alphas:
-        want = [float(a) for a in args.alphas.split(",")]
-        grid = [c for c in grid if c[1][0] != "injected" or any(abs(c[1][5] - a) < 1e-9 for a in want)]
+        grid = keep_alphas(grid, [float(a) for a in args.alphas.split(",")])
     if args.floor_from:
         cells = floor_cells(args.floor_from, args.floor_share)
         def chosen(cell):

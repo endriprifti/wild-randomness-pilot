@@ -293,7 +293,7 @@ python -m common.popqa results/p2_w4a4 --out results/p2_w4a4_popqa
 python p5_escape.py --part h31-flags --base results/p5_escape_h31 --out results/p5_escape_h31_flags
 # GPU, one after another
 nohup sh -c '
-python p5_escape.py --floor-from results/p5_escape --fine-check 10:250 --out results/p5_escape_floor10 > logs/rerun_p5_floor10.log 2>&1
+python p5_escape.py --floor-from results/p5_escape --alphas 1.5,1.8,2.0 --fine-check 10:250 --out results/p5_escape_floor10 > logs/rerun_p5_floor10.log 2>&1
 python p5_escape.py --modes injected --alphas 1.2 --fine-check 10:250 --second-reading --log-checks --out results/p5_escape_a12 > logs/rerun_p5_a12.log 2>&1
 python p5_escape.py --part refit --base results/p5_escape --replace results/p5_escape_floor10,results/p5_escape_a12 --out results/p5_escape_refit > logs/rerun_p5_refit.log 2>&1
 python p2_w4a4.py --out results/p2_w4a4_bf16 > logs/rerun_p2_bf16.log 2>&1
@@ -303,8 +303,10 @@ tar czf results_archive/reruns-2026-11-15.tar.gz results/p2_w4a4_bf16 results/p2
     results/p5_escape_a12 results/p5_escape_refit results/p5_escape_h31_flags logs/rerun_*.log
 ```
 
-The α = 1.2 rerun also uses the fine checks, so those cells get both fixes; in the refit the later folder wins
-where cells overlap. `python p5_escape.py --part h31 --out results/p5_escape_h31_v2` reruns H3.1 with λ_min and the
+The floor rerun leaves out α = 1.2 (`--alphas` restricts only the injected cells, so the SGD and clipped floor
+cells stay), and the α = 1.2 rerun uses the same fine checks, so every α = 1.2 cell runs once with both fixes.
+`--fine-check 10:250` checks at steps 10, 20, …, 250 and then every 250 steps as before (224 checks up to
+k_cens = 50,000 instead of 200). In the refit the later folder wins where cells overlap. `python p5_escape.py --part h31 --out results/p5_escape_h31_v2` reruns H3.1 with λ_min and the
 final gradient norm, if the flags from λ_max alone are not enough.
 
 ### Hours on the L40S
@@ -530,7 +532,7 @@ before the run.
 
 ## Unit tests
 
-`python -m pytest -q` (137 tests, about 2 min on a CPU; `-m "not slow"` skips the two slowest). Synthetic data with
+`python -m pytest -q` (138 tests, about 2 min on a CPU; `-m "not slow"` skips the two slowest). Synthetic data with
 known parameters:
 
 - stable density against the Gaussian and Cauchy closed forms and against SciPy; ML fit recovers α ∈ {1.2, 1.5, 1.8},

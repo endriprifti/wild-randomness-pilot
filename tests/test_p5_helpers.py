@@ -15,6 +15,22 @@ def test_check_schedule_adds_fine_checks_only_up_to_the_limit():
     assert [k for k in range(1, 801) if every(k)] == [250, 500, 750]
     ks = [k for k in range(1, 801) if fine(k)]
     assert ks[:3] == [10, 20, 30] and ks[24:] == [250, 500, 750] and len(ks) == 27
+    full = p5.check_schedule({"check_every": 250, "fine_check": [10, 250]})
+    ks = [k for k in range(1, 50_001) if full(k)]
+    assert len(ks) == 224 and ks[24:26] == [250, 500] and all(b - a == 250 for a, b in zip(ks[24:], ks[25:]))
+
+
+def test_alpha_filter_keeps_sgd_and_clipped_cells_and_their_indices():
+    import config
+    cfg = config.get("p5_escape", smoke=False)
+    grid = p5.full_grid(cfg, [1.0, 2.0, 3.0])
+    kept = p5.keep_alphas(grid, [1.5, 1.8, 2.0])
+    modes = pd.Series([c[1][0] for c in kept]).value_counts().to_dict()
+    assert modes == {"sgd": 24, "clipped": 24, "injected": 24}
+    assert not any(c[1][0] == "injected" and abs(c[1][5] - 1.2) < 1e-9 for c in kept)
+    assert all(grid[gi] == (gi, cell) for gi, cell in kept)          # same gi, so the same seeds
+    only = p5.keep_alphas([c for c in grid if c[1][0] == "injected"], [1.2])
+    assert len(only) == 8 and {c[1][5] for c in only} == {1.2}
 
 
 def _cfg(**kw):
