@@ -306,6 +306,14 @@ def full_grid(cfg, g_maxes):
     return list(enumerate(grid))
 
 
+def cell_label(cell) -> str:
+    """e.g. 'sgd eta 0.1 B 8', 'clipped q 0.9 B 8', 'injected alpha 1.5 B 8'."""
+    mode, B, eta, _, q, a = cell
+    what = {"sgd": ("eta", eta), "clipped": ("q", q), "injected": ("alpha", a)}[mode]
+    what = f"{what[0]} {float(what[1]):g}"
+    return f"{mode} {what} B {int(B)}"
+
+
 def keep_alphas(grid, alphas):
     """Keep every SGD and clipped cell and only the injected cells whose alpha is listed (indices gi kept)."""
     return [c for c in grid if c[1][0] != "injected" or any(abs(c[1][5] - a) < 1e-9 for a in alphas)]
@@ -347,13 +355,20 @@ def load_restarts(folder) -> tuple[pd.DataFrame, dict]:
     return df, cfg
 
 
-def floor_cells(folder, share: float = 1.0) -> list[tuple]:
-    """Cells of a saved run whose restarts all exited and at least `share` of them at the first check."""
+def first_check_exits(g: pd.DataFrame, first: int) -> int:
+    """Restarts of a cell that exited at the first check (k <= check_every)."""
+    return int((g.exited.astype(bool) & (g.k <= first)).sum())
+
+
+def floor_cells(folder, share: float = 0.0) -> list[tuple]:
+    """Cells of a saved run where at least one restart exited at the first check (and, with share > 0, at least
+    that share of its restarts): their exit times are known only to lie in (0, check_every]."""
     df, cfg = load_restarts(folder)
     first = int(cfg["check_every"])
     out = []
     for key, g in df.groupby(KEY, dropna=False):
-        if g.exited.all() and (g.k <= first).mean() >= share:
+        n1 = first_check_exits(g, first)
+        if n1 >= 1 and n1 >= share * len(g):
             out.append(_cell_tuple(*key))
     return out
 
@@ -491,9 +506,10 @@ def main():
     ap.add_argument("--modes", default=None, help="escape: only these modes (sgd,clipped,injected)")
     ap.add_argument("--alphas", default=None, help="escape: of the injected cells keep only these alphas, e.g. 1.2 "
                     "(SGD and clipped cells are kept; add --modes injected for injected cells only)")
-    ap.add_argument("--floor-from", default=None, help="escape: only the cells of this saved run whose restarts "
-                                                       "all exited at its first check")
-    ap.add_argument("--floor-share", type=float, default=1.0, help="with --floor-from: share of first-check exits")
+    ap.add_argument("--floor-from", default=None, help="escape: only the cells of this saved run where at least one "
+                                                       "restart exited at its first check")
+    ap.add_argument("--floor-share", type=float, default=0.0, help="with --floor-from: also require this share of "
+                                                                 "first-check exits (default: one is enough)")
     ap.add_argument("--check-every", type=int, default=None, help="override check_every")
     ap.add_argument("--fine-check", default=None, help="EVERY:UNTIL, extra checks every EVERY steps up to UNTIL")
     ap.add_argument("--second-reading", action="store_true", help="keep stepping after a barrier exit until the "
@@ -577,7 +593,8 @@ def main():
             m, B, e, _, q, a = cell
             return any(_same_cell(_cell_tuple(m, B, e, q, a), k) for k in cells)
         grid = [c for c in grid if chosen(c[1])]
-        run.note(f"floor cells from {args.floor_from}: {len(cells)} found, {len(grid)} in this grid")
+        run.note(f"floor cells from {args.floor_from}: {len(cells)} found, {len(grid)} in this grid: "
+                 + "; ".join(cell_label(c[1]) for c in grid))
     if not grid:
         run.note("no grid cells selected; nothing to run")
         runtime.finish_run(run, status="empty", extra={"grid_points": 0})

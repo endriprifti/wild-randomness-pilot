@@ -95,3 +95,54 @@ def test_h31_flags_from_a_first_run_csv():
     assert s.loc[2.0, "non_minimum"] == 1 and s.loc[2.0, "converged"] == 1 and s.loc[1.2, "diverged"] == 2
     with_min = p5.h31_flags(df.assign(lambda_min=[0.0, np.nan, 0.0, -1.0, -0.5]), {"min_tol": 0.01})
     assert not with_min.minimum.iloc[4]                                     # lambda_min = -0.5 < -0.08
+
+
+ENDRI_15 = (["sgd eta 0.05 B 8"] + [f"sgd eta 0.1 B {b}" for b in (8, 16, 32)]
+            + [f"sgd eta 0.2 B {b}" for b in (8, 16, 32, 64)]
+            + [f"injected alpha 1.5 B {b}" for b in (8, 16, 32, 64, 128, 256, 512)])
+
+
+def _first_run(tmp_path, first_check: dict, rng):
+    """A first-run folder in the old format (k, exited only): cells in first_check get that many first-check exits
+    (the rest exit later or never); alpha = 1.2 restarts exit at the first check or never; others exit later."""
+    import config
+    cfg = config.get("p5_escape", smoke=False)
+    grid = p5.full_grid(cfg, [0.3, 0.7, 1.9])
+    G, R = [], []
+    for gi, cell in grid:
+        m, B, e, gm, q, a = cell
+        lab = p5.cell_label(cell)
+        n1 = first_check.get(lab, 0)
+        if m == "injected" and a == 1.2:
+            n1 = int(rng.integers(0, 51))
+            k = np.r_[np.full(n1, 250.0), np.full(50 - n1, 50_000.0)]
+        else:
+            later = 250.0 * rng.integers(2, 200, 50 - n1)
+            k = np.r_[np.full(n1, 250.0), np.where(rng.random(50 - n1) < 0.3, 50_000.0, later)]
+        ex = k < 50_000
+        G.append({"mode": m, "B": B, "eta": e, "g_max": gm, "alpha_injected": a, "exits": int(ex.sum()),
+                  "wall_s": 8.0 * k.max() / 250})
+        R += [{"mode": m, "B": B, "eta": e, "g_max": gm, "alpha_injected": a, "restart": r, "k": float(k[r]),
+               "exited": bool(ex[r])} for r in range(50)]
+    pd.DataFrame(G).to_csv(tmp_path / "grid.csv", index=False)
+    pd.DataFrame(R).to_csv(tmp_path / "restarts.csv", index=False)
+    (tmp_path / "run.json").write_text(json.dumps({"config": cfg, "wall_clock_seconds": sum(r["wall_s"] for r in G) + 100}))
+    return cfg, grid
+
+
+def test_floor_rerun_picks_every_cell_with_a_first_check_exit_and_rerun_hours_lists_them(tmp_path):
+    import rerun_hours
+    rng = np.random.default_rng(3)
+    counts = dict(zip(ENDRI_15, [1, 50, 7, 2, 50, 50, 31, 1, 3, 12, 50, 1, 4, 9, 2]))
+    cfg, grid = _first_run(tmp_path, counts, rng)
+    cells = p5.floor_cells(tmp_path)
+    picked = [c for c in p5.keep_alphas(grid, [1.5, 1.8, 2.0])
+              if any(p5._same_cell(p5._cell_tuple(c[1][0], c[1][1], c[1][2], c[1][4], c[1][5]), k) for k in cells)]
+    assert sorted(p5.cell_label(c[1]) for c in picked) == sorted(ENDRI_15)
+    e = rerun_hours.p5_estimates(tmp_path, [1.2])
+    assert sorted(c["label"] for c in e["floor_cells"]) == sorted(ENDRI_15) and e["n_floor"] == 15
+    assert e["n_alpha_cells"] == 8 and e["extra_checks"] == 24 and abs(e["c_max_s"] - 8.0) < 1e-9
+    floor_wall = sum(8.0 * c["k_stop"] / 250 for c in e["floor_cells"])
+    assert abs(e["floor_rerun_h_max"] * 3600 - (100 + floor_wall + 15 * 24 * 8.0)) < 1e-6
+    # the old rule (every restart exited, all at the first check) would have kept only the cells with 50/50
+    assert sum(c["first_check_exits"] == 50 for c in e["floor_cells"]) == 4

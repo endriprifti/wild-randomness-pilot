@@ -303,11 +303,14 @@ tar czf results_archive/reruns-2026-11-15.tar.gz results/p2_w4a4_bf16 results/p2
     results/p5_escape_a12 results/p5_escape_refit results/p5_escape_h31_flags logs/rerun_*.log
 ```
 
-The floor rerun leaves out α = 1.2 (`--alphas` restricts only the injected cells, so the SGD and clipped floor
-cells stay), and the α = 1.2 rerun uses the same fine checks, so every α = 1.2 cell runs once with both fixes.
-`--fine-check 10:250` checks at steps 10, 20, …, 250 and then every 250 steps as before (224 checks up to
-k_cens = 50,000 instead of 200). In the refit the later folder wins where cells overlap. `python p5_escape.py --part h31 --out results/p5_escape_h31_v2` reruns H3.1 with λ_min and the
-final gradient norm, if the flags from λ_max alone are not enough.
+The floor rerun takes every cell of the first run where at least one restart exited at the first check (those
+exits are known only to lie in (0, 250]); the log and `python rerun_hours.py` list the cells. It leaves out
+α = 1.2 (`--alphas` restricts only the injected cells, so the SGD and clipped floor cells stay), and the α = 1.2
+rerun uses the same fine checks, so every α = 1.2 cell runs once with both fixes. `--fine-check 10:250` checks at
+steps 10, 20, …, 250 and then every 250 steps as before (224 checks up to k_cens = 50,000 instead of 200); a
+restart's exit is never later than in the first run, so a cell never runs more steps than it did then. In the
+refit the later folder wins where cells overlap. `python p5_escape.py --part h31 --out results/p5_escape_h31_v2`
+reruns H3.1 with λ_min and the final gradient norm, if the flags from λ_max alone are not enough.
 
 ### Hours on the L40S
 
@@ -532,7 +535,7 @@ before the run.
 
 ## Unit tests
 
-`python -m pytest -q` (138 tests, about 2 min on a CPU; `-m "not slow"` skips the two slowest). Synthetic data with
+`python -m pytest -q` (139 tests, about 2 min on a CPU; `-m "not slow"` skips the two slowest). Synthetic data with
 known parameters:
 
 - stable density against the Gaussian and Cauchy closed forms and against SciPy; ML fit recovers α ∈ {1.2, 1.5, 1.8},
@@ -554,8 +557,8 @@ known parameters:
   not;
 - P5 reruns: a finer check schedule sees each exit no later than the coarse one and leaves exits after the fine
   window unchanged (the cell's seed repeats its trajectories); saved runs get k_lo and g_max quantiles; floor
-  cells; H3.1 flags (diverged above ln 10, λ_max < 0 or λ_min < −0.01 λ_max is not a minimum, sharpness kept only
-  for converged runs);
+  cells (at least one first-check exit; α = 1.2 left to its own rerun); H3.1 flags (diverged above ln 10,
+  λ_max < 0 or λ_min < −0.01 λ_max is not a minimum, sharpness kept only for converged runs);
 - P2's outlier scheme: a kept channel 1000 times larger leaves every other channel's activation error, the other
   weight columns and the layer's output error unchanged (before the fix it rounded most of them to zero); the
   rotation arm in bfloat16 adds no rounding beyond bfloat16 storage;
