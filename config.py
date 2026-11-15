@@ -196,7 +196,9 @@ CONFIG = {
     "p2_w4a4": {
         "full": {
             "models": ["EleutherAI/pythia-6.9b", "allenai/OLMo-7B-hf"],
-            "dtype": "float16",
+            # bfloat16 for both: Pythia-6.9B overflows in float16 (NaN baseline on the L40S, 2026-11-15);
+            # OLMo was trained in bfloat16. float32 also fits the L40S (--dtype float32)
+            "dtype": "bfloat16",
             "arms": {
                 "w4a4": [{"name": "uniform", "a_bits": 4, "group": 128},
                          {"name": "outlier", "a_bits": 4, "group": 256, "outlier_frac": 0.005},
@@ -309,14 +311,24 @@ CONFIG = {
             "restarts": 50, "k_cens": 50_000, "check_every": 250,
             "descent_steps": 200, "descent_lr": 0.1, "segment_points": 11,
             "barrier_tol": 0.01,                   # OURS (preregister): loss barrier above both ends, nats
+            # extra checks every fine_check[0] steps up to step fine_check[1] (reruns of floor cells: --fine-check 10:250)
+            "fine_check": None,
+            # second reading (OURS, placeholders; checks.csv lets refit re-threshold them): exit when the descended
+            # endpoint is farther than dist_tol x |W_S| from W_S or its loss exceeds L(W_S) by loss_tol nats;
+            # continue = keep stepping after a barrier exit until this reading fires too (--second-reading)
+            "second_reading": {"dist_tol": 0.1, "loss_tol": 0.05, "continue": False},
             "converge_steps": 20000, "converge_lr": 0.1,
-            "h31": {"alphas": [1.2, 1.5, 1.8, 2.0], "seeds": [0, 1, 2, 3, 4], "steps": 20000, "lr": 0.1, "iqr": 0.05},
+            # diverge_loss: train loss above ln 10 (a uniform guess) = diverged; min_tol: lambda_min >= -min_tol x
+            # lambda_max counts as a minimum (OURS)
+            "h31": {"alphas": [1.2, 1.5, 1.8, 2.0], "seeds": [0, 1, 2, 3, 4], "steps": 20000, "lr": 0.1, "iqr": 0.05,
+                    "diverge_loss": 2.302585092994046, "min_tol": 0.01},
         },
         "smoke": {
             "n_train": 512, "hidden": 32, "batch_sizes": [8, 32], "etas": [0.1], "g_max_quantiles": [0.9],
             "inject_alphas": [1.5], "restarts": 4, "k_cens": 200, "check_every": 50, "descent_steps": 20,
             "converge_steps": 300,
-            "h31": {"alphas": [1.5, 2.0], "seeds": [0], "steps": 100, "lr": 0.1, "iqr": 0.05},
+            "h31": {"alphas": [1.5, 2.0], "seeds": [0], "steps": 100, "lr": 0.1, "iqr": 0.05,
+                    "diverge_loss": 2.302585092994046, "min_tol": 0.01},
         },
     },
     # ------------------------------------------------------------------ Emmy check

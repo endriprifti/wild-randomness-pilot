@@ -16,11 +16,18 @@ facts at equal perplexity increase, if rare-fact losses match the isotropic cont
 rotation matches outlier preservation on rare facts.
 
 Outputs (results/p2_w4a4/[smoke/]): schemes.csv (one row per model x arm x scheme incl.
-isotropic controls), popqa_items.csv (per item correctness), deciles.csv, activations.csv, run.json
+isotropic controls), popqa_items.csv (per item correctness, with s_pop, decile and relation type),
+deciles.csv, trends.csv (drop against log popularity over all deciles, see common/popqa.py),
+popqa_deciles.csv and popqa_relation_deciles.csv (what each decile holds), activations.csv, run.json
+
+Both models load in bfloat16 (config dtype; --dtype overrides). Pythia-6.9B overflows in float16
+(the first L40S run, 2026-11-15, gave a NaN baseline), and a non-finite baseline perplexity now
+stops the job with an error instead of writing invalid rows.
 
 Commands:
-  python p2_w4a4.py                                  # Pythia-6.9B and OLMo-7B, ~14 GB each in fp16
+  python p2_w4a4.py                                  # Pythia-6.9B and OLMo-7B, ~14 GB each in bfloat16
   python p2_w4a4.py --models EleutherAI/pythia-6.9b
+  python p2_w4a4.py --dtype float32                  # ~27 GB of weights each; also fits the L40S
   python p2_w4a4.py --smoke
 """
 
@@ -35,7 +42,7 @@ import pandas as pd
 import torch
 
 import config
-from common import hf, lm, quant, runtime, spectra
+from common import hf, lm, popqa, quant, runtime, spectra
 
 
 def popqa_items(cfg, run, rng):
@@ -47,14 +54,16 @@ def popqa_items(cfg, run, rng):
         for i in range(pq["limit"] or 200):
             ans = f"w{int(rng.integers(0, 50))}"
             items.append({"question": f"What is the code of item {i}?", "answers": [ans],
-                          "s_pop": float(rng.lognormal(5, 2)), "subj": f"item {i}"})
+                          "s_pop": float(rng.lognormal(5, 2)), "subj": f"item {i}",
+                          "prop": ["country", "sport", "occupation", "author"][i % 4]})
         return items, "fallback"
     items = []
     for ex in ds:
         ans = ex["possible_answers"]
         if isinstance(ans, str):
             ans = json.loads(ans)
-        items.append({"question": ex["question"], "answers": ans, "s_pop": float(ex["s_pop"]), "subj": ex["subj"]})
+        items.append({"question": ex["question"], "answers": ans, "s_pop": float(ex["s_pop"]), "subj": ex["subj"],
+                      "prop": ex.get("prop")})
     return items, src
 
 
@@ -87,9 +96,7 @@ def perplexity(model, windows, device):
 
 
 def decile_table(items, correct, n_dec):
-    pops = np.array([it["s_pop"] for it in items])
-    edges = np.quantile(pops, np.linspace(0, 1, n_dec + 1))
-    d = np.clip(np.searchsorted(edges, pops, side="right") - 1, 0, n_dec - 1)
+    d = popqa.decile_index(np.array([it["s_pop"] for it in items]), n_dec)
     return d, np.array([correct[d == k].mean() if (d == k).any() else np.nan for k in range(n_dec)])
 
 
@@ -110,8 +117,11 @@ def main():
     ap = runtime.base_parser(__doc__)
     ap.add_argument("--models", default=None, help="comma-separated model ids (default: config)")
     ap.add_argument("--doc-counts", default=None, help="CSV with columns subj,doc_count (optional)")
+    ap.add_argument("--dtype", default=None, help="model dtype (default: config, bfloat16 in full runs)")
     args = ap.parse_args()
     cfg = config.get("p2_w4a4", args.smoke)
+    if args.dtype:
+        cfg["dtype"] = args.dtype
     run = runtime.start_run("p2_w4a4", cfg, args)
     rng = runtime.rng(run.seed)
     dev = run.device
@@ -135,16 +145,22 @@ def main():
 
         # baseline
         base_ppl = perplexity(model, windows, dev)
+        if not math.isfinite(base_ppl):
+            raise SystemExit(f"{name}: baseline perplexity is {base_ppl} in {cfg['dtype']} (overflow?); "
+                             "no rows written. Try --dtype bfloat16 or float32.")
         base_correct = popqa_eval(model, tok, items, shots, cfg, dev)
         dec_idx, base_dec = decile_table(items, base_correct, n_dec)
         hs = lm.hidden_states(model, probe, dev)
         for li, H in enumerate(hs):
             act_rows.append({"model": name, "layer": li, **spectra.activation_stats(H)})
         del hs
-        rows.append({"model": name, "arm": "baseline", "scheme": "fp16", "ppl": base_ppl,
-                     "acc": float(base_correct.mean()), "bits": 16.0, "source": src, "popqa_source": isrc})
-        item_rows += [{"model": name, "arm": "baseline", "scheme": "fp16", "i": i, "correct": bool(c),
-                       "s_pop": it["s_pop"], "decile": int(d)} for i, (c, it, d) in enumerate(zip(base_correct, items, dec_idx))]
+        run.note(f"{name} baseline ({cfg['dtype']}): ppl {base_ppl:.3f} acc {float(base_correct.mean()):.3f}")
+        rows.append({"model": name, "arm": "baseline", "scheme": cfg["dtype"], "ppl": base_ppl,
+                     "acc": float(base_correct.mean()), "bits": 16.0, "dtype": cfg["dtype"], "source": src,
+                     "popqa_source": isrc})
+        item_rows += [{"model": name, "arm": "baseline", "scheme": cfg["dtype"], "i": i, "correct": bool(c),
+                       "s_pop": it["s_pop"], "decile": int(d), "prop": it.get("prop")}
+                      for i, (c, it, d) in enumerate(zip(base_correct, items, dec_idx))]
         absmax = quant.calibrate_absmax(model, [calib[i:i + 1].long() for i in range(len(calib))], dev)
         bank = WeightBank(model)
         d_in = max(l.in_features for l in quant.linear_layers(model).values())
@@ -161,6 +177,8 @@ def main():
                 corr = popqa_eval(model, tok, items, shots, cfg, dev)
                 _, dec = decile_table(items, corr, n_dec)
                 drop = base_dec - dec
+                if not math.isfinite(ppl):
+                    run.note(f"WARNING {name} {arm}/{s.name}: perplexity {ppl} (not finite)")
                 row = {"model": name, "arm": arm, "scheme": s.name, "ppl": ppl, "dppl": ppl - base_ppl,
                        "acc": float(corr.mean()), "bits": s.bits_per_weight(d_in),
                        "drop_rare": float(drop[0]), "drop_frequent": float(drop[-1]),
@@ -210,6 +228,8 @@ def main():
                              "dppl": iso_ppl - base_ppl, "acc": float(corr_i.mean()), "sigma": mid,
                              "drop_rare": float(drop_i[0]), "drop_frequent": float(drop_i[-1]),
                              "rare_minus_frequent": float(drop_i[0] - drop_i[-1])})
+                item_rows += [{"model": name, "arm": arm, "scheme": f"isotropic_for_{s.name}", "i": i,
+                               "correct": bool(c)} for i, c in enumerate(corr_i)]
         bank.restore(model, dev)
         del model, bank
         if dev.startswith("cuda"):
@@ -218,9 +238,20 @@ def main():
     if args.doc_counts:
         dc = pd.read_csv(args.doc_counts)
         run.note(f"doc counts loaded for {len(dc)} subjects; join on 'subj' in popqa_items.csv for the count analysis")
+    # the drop against log popularity over all deciles (absolute and relative), and what each decile holds
+    trends, decs, rels = popqa.analyze(pd.DataFrame(item_rows), pq["deciles"])
+    if len(trends):
+        main_tr = trends[trends.method == "deciles"].pivot_table(index=["model", "arm", "scheme"], columns="measure",
+                                                                 values=["slope", "se"])
+        main_tr.columns = [f"trend_{m}_{v}" for v, m in main_tr.columns]
+        rows = [{**r, **(main_tr.loc[(r["model"], r["arm"], r["scheme"])].to_dict()
+                         if (r["model"], r["arm"], r["scheme"]) in main_tr.index else {})} for r in rows]
     runtime.write_csv(run.out_dir / "schemes.csv", rows)
     runtime.write_csv(run.out_dir / "deciles.csv", dec_rows)
     runtime.write_csv(run.out_dir / "popqa_items.csv", item_rows)
+    runtime.write_csv(run.out_dir / "trends.csv", trends.to_dict("records"))
+    runtime.write_csv(run.out_dir / "popqa_deciles.csv", decs.to_dict("records"))
+    runtime.write_csv(run.out_dir / "popqa_relation_deciles.csv", rels.to_dict("records"))
     runtime.write_csv(run.out_dir / "activations.csv", act_rows)
     runtime.finish_run(run, extra={"n_scheme_rows": len(rows)})
 

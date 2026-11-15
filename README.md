@@ -10,7 +10,7 @@ plus `run.json` (config, git commit, GPU type and memory, library versions, wall
 |---|---|---|
 | `p0_calibration.py` | Section 7 rules | CSN labels, Hurst estimators, D_q and H7.1 slope on samples of known state (CPU) |
 | `emmy_check.py` | (ours) | Emmy-compiled against eager PyTorch on outlier-heavy Pythia checkpoints, after a GPT-NeoX support probe |
-| `p5_escape.py` | H3.3, H6.1 (escape clause), H3.1 (injected arm) | escape times over (η, B), clipped and injected-noise arms; censored likelihood fits |
+| `p5_escape.py` | H3.3, H6.1 (escape clause), H3.1 (injected arm) | escape times over (η, B), clipped and injected-noise arms; interval-censored likelihood fits |
 | `p2_w4a4.py` | H6.2 | W4A4 and weight-only arms at matched bits, PopQA by popularity decile, isotropic-noise control |
 | `p4_clipping.py` | H6.1, H7.1 control, H_grad | clipping sweep (fixed p_clip, AutoClip, ZClip, AGC), matched update length, flatness and tail measures |
 | `p1_checkpoints.py` | α, α_ESD, K, H, Δh across Pythia, PolyPythias, OLMo | measurement only on public checkpoints; H7.1 at training stages; exploratory coupling |
@@ -33,7 +33,7 @@ WSL2, **T4** = Kaggle's 16 GB T4 (not the P100, see below), **5090** = RTX 5090 
 | 0 | Calibration | CPU | CPU only | `python p0_calibration.py`; extra calibrations: `python p0b_calibration.py --jobs 6` (laptop, see P0b below) |
 | 1 | Emmy check | ~1 (ours) | 5090 (Emmy's own benchmark GPU); needs nvcc and the Emmy env | `python emmy_check.py --frontend-only` (CPU), then `python emmy_check.py --probe-only`, then `python emmy_check.py` |
 | 2 | Escape grid, H3.3 / H6.1 | 25 | 4 GB, T4, 5090 | `python p5_escape.py` and `python p5_escape.py --part h31` |
-| 3 | W4A4 and weight-only, H6.2 (simulated quantization) | 30 | 5090 (Pythia-6.9B and OLMo-7B in fp16, about 14 GB each); L40S also fine | `python p2_w4a4.py` (one model: `--models EleutherAI/pythia-6.9b`) |
+| 3 | W4A4 and weight-only, H6.2 (simulated quantization) | 30 | 5090 (Pythia-6.9B and OLMo-7B in bfloat16, about 14 GB each); L40S also fine | `python p2_w4a4.py` (one model: `--models EleutherAI/pythia-6.9b`) |
 | 4 | Clipping sweep, H6.1 / H7.1 control | 30 | 5090 (transformer peak ~21 GiB, see GPU memory below); ResNet-18 also T4 | `python p4_clipping.py --model transformer` and `python p4_clipping.py --model resnet18` |
 | 5 | Checkpoint measurements, with the 410M loss-spike check (pass (a) downloads about 391 GB, see below) | 45 | Pythia: 5090 (H7.1's HVP at 14M to 160M peaks ~16 GiB); PolyPythias: T4; OLMo 2 1B: 5090 | `python p1_checkpoints.py --pin-only`, then `--suite pythia`, `--suite polypythia,polypythia_data,polypythia_weight`, `--suite olmo` |
 | 6 | Fractional memory, H4.1 | 65 | 5090; T4 is tight (Mamba at n_s = 64 peaks ~13 GiB) | `python p3_fractional_memory.py` (drop LRA first if time runs short: `--tasks powerlaw,exponential`) |
@@ -254,6 +254,58 @@ top, so a step above 85% of the card reads "tight"). It reproduces the failure (
 | `p1_olmo` | per-example JVP, 32 × 128 tokens | 17.3 |
 | `p3_fractional` | Mamba training step at n_s = 64, 32 × 1,024 | 12.9 |
 | `p1_olmo7b` | per-example JVP, 8 × 128 tokens (27.2 of it weights) | 31.5 |
+
+### Reruns after the first L40S run (2026-11-15)
+
+Fixes in the `.py` files (`run_all.sh` is unchanged):
+
+- **P2.** Both models now load in **bfloat16** (`config.py`; `--dtype` overrides): Pythia-6.9B overflowed in
+  float16 and gave a NaN baseline (perplexity NaN, accuracy 0), and a non-finite baseline perplexity now stops the
+  job with an error. The outlier scheme left its kept channels inside the per-token activation scale and the weight
+  group scales and only restored them afterwards, so they still set the step size of every other channel; they are
+  now left out of both (`quant.quant_act`, `quant.quant_weight_groups(..., keep)`). The rotation arm computes its
+  rotations in float32. `trends.csv` gives the drop's slope on log10 popularity over all ten deciles, absolute and
+  relative, raw and with relation types held fixed; `popqa_deciles.csv` shows what each decile holds (see
+  `common/popqa.py`).
+- **PopQA's decile 0** (from the dataset itself): 1,398 items with s_pop 2 to 99; ties are minor (34 items sit at the
+  edge 100 and go to decile 1). It holds 20% country and 14% sport questions (5% and 2% in decile 5), whose small
+  answer sets are easy to guess, which is why its baseline accuracy beats deciles 1 to 6; decile 9 holds 21%
+  capital and 10% "capital of" questions.
+- **P5.** Fits are interval-censored: an exit seen at check k happened in (k_lo, k]. A cell where every restart exits
+  at the first check now reads as an upper bound (`floor`, `E_k_ic_hi95`) instead of E k = 250. Each restart records
+  the loss and distance from W_S at its exit and at its last step, and a second reading (descended endpoint farther
+  than 0.1 |W_S| from W_S, or its loss more than 0.05 nats above L(W_S); placeholders, re-thresholdable with
+  `--part refit --dist-tol/--loss-tol`) is fitted next to the barrier rule. Cell reruns keep each cell's seed, so they
+  repeat the full grid's trajectories. One caveat the finer checks expose: the barrier rule can fire and then clear
+  between two checks, so a coarse schedule can miss a short excursion; checks.csv shows how often.
+- **H3.1.** `h31.csv` flags `diverged` (train loss not finite or above ln 10), `minimum` (λ_max > 0, and λ_min ≥
+  −0.01 λ_max where λ_min is measured) and `converged`; λ_max, the Hessian trace and adaptive sharpness are kept only
+  for converged runs (raw values in `*_raw`), and `h31_summary.csv` averages over converged runs.
+
+Run on the L40S once `run_all.sh` has finished, one GPU job at a time. Every rerun writes to a new folder, so the
+first results stay as they are:
+
+```bash
+cd ~/pilot && source ~/.venv-pilot/bin/activate && git pull
+python rerun_hours.py                                   # expected hours, from this card's first-run timings
+# CPU only, minutes: refits and flags from the saved first-run files
+python -m common.popqa results/p2_w4a4 --out results/p2_w4a4_popqa
+python p5_escape.py --part h31-flags --base results/p5_escape_h31 --out results/p5_escape_h31_flags
+# GPU, one after another
+nohup sh -c '
+python p5_escape.py --floor-from results/p5_escape --fine-check 10:250 --out results/p5_escape_floor10 > logs/rerun_p5_floor10.log 2>&1
+python p5_escape.py --modes injected --alphas 1.2 --fine-check 10:250 --second-reading --log-checks --out results/p5_escape_a12 > logs/rerun_p5_a12.log 2>&1
+python p5_escape.py --part refit --base results/p5_escape --replace results/p5_escape_floor10,results/p5_escape_a12 --out results/p5_escape_refit > logs/rerun_p5_refit.log 2>&1
+python p2_w4a4.py --out results/p2_w4a4_bf16 > logs/rerun_p2_bf16.log 2>&1
+' > logs/reruns.out 2>&1 &
+# afterwards
+tar czf results_archive/reruns-2026-11-15.tar.gz results/p2_w4a4_bf16 results/p2_w4a4_popqa results/p5_escape_floor10 \
+    results/p5_escape_a12 results/p5_escape_refit results/p5_escape_h31_flags logs/rerun_*.log
+```
+
+The α = 1.2 rerun also uses the fine checks, so those cells get both fixes; in the refit the later folder wins
+where cells overlap. `python p5_escape.py --part h31 --out results/p5_escape_h31_v2` reruns H3.1 with λ_min and the
+final gradient norm, if the flags from λ_max alone are not enough.
 
 ### Hours on the L40S
 
@@ -478,7 +530,7 @@ before the run.
 
 ## Unit tests
 
-`python -m pytest -q` (124 tests, about 2 min on a CPU; `-m "not slow"` skips the two slowest). Synthetic data with
+`python -m pytest -q` (137 tests, about 2 min on a CPU; `-m "not slow"` skips the two slowest). Synthetic data with
 known parameters:
 
 - stable density against the Gaussian and Cauchy closed forms and against SciPy; ML fit recovers α ∈ {1.2, 1.5, 1.8},
@@ -494,6 +546,20 @@ known parameters:
   Gaussian reference); flat at 2 is not read as invariant; the 1.9 margin leaves ᾱ near 2 undecided (and 2 turns it off); the Gaussian reference is seeded per pool, tops up only
   what is missing and is matched to each row's setting; the command line recomputes verdicts from a saved summary;
 - coupling test, Holm, detectable r; censored escape rates and the (η, B) power-law fit against the Gaussian rival;
+- interval censoring: with checks every 250 steps the exposure estimate sits at the check (E k = 250) while the
+  interval-censored MLE recovers E k = 150; a cell where every restart exits at the first check gives only an upper
+  bound; on a grid with many first-check exits the interval fit recovers both slopes and the exact-time fit does
+  not;
+- P5 reruns: a finer check schedule sees each exit no later than the coarse one and leaves exits after the fine
+  window unchanged (the cell's seed repeats its trajectories); saved runs get k_lo and g_max quantiles; floor
+  cells; H3.1 flags (diverged above ln 10, λ_max < 0 or λ_min < −0.01 λ_max is not a minimum, sharpness kept only
+  for converged runs);
+- P2's outlier scheme: a kept channel 1000 times larger leaves every other channel's activation error, the other
+  weight columns and the layer's output error unchanged (before the fix it rounded most of them to zero); the
+  rotation arm in bfloat16 adds no rounding beyond bfloat16 storage;
+- PopQA trends: the decile, relation-standardized and relation fixed-effect slopes recover a planted slope of the
+  drop on log popularity, and the last two remove a spurious trend made by piling an easy relation into the rare
+  deciles;
 - per-example JVP against autograd, Hessian eigenvalues and Hutchinson trace on a quadratic;
 - micro-batches: on a small GPT-NeoX, the HVP, Hutchinson trace, top eigenvalue, adaptive sharpness and
   per-example projections computed in micro-batches (1, 3, 4 and 10 sequences of 10, uneven last part included)

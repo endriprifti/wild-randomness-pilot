@@ -9,6 +9,10 @@ Schemes (round-to-nearest for every arm, so that only the treatment of outliers 
             symmetric per token (W4A4) or full precision (weight-only control).
   outlier   as uniform, but the input channels with the largest calibrated activation
             magnitude stay in 16 bits in both weights and activations (LLM.int8()/SpQR style).
+            The kept channels are left out of the per-token activation scale and of the weight
+            group scales, so they do not set the step size of the other channels (fixed
+            2026-11-15: before, the scales were taken over all channels and the kept ones were
+            only restored afterwards).
   rotation  QuaRot-style: x -> x Q and W -> W Q with Q a randomized Hadamard matrix
             (Haar-random orthogonal when the dimension is not a power of two), then uniform.
             Simulated online at every linear input; numerically this is the quantization error
@@ -71,15 +75,38 @@ def quant_sym(x: torch.Tensor, bits: int, dim: int = -1) -> torch.Tensor:
     return torch.round(x / scale).clamp(-qmax - 1, qmax) * scale
 
 
-def quant_weight_groups(W: torch.Tensor, bits: int, group: int) -> torch.Tensor:
+def quant_weight_groups(W: torch.Tensor, bits: int, group: int, keep: torch.Tensor | None = None) -> torch.Tensor:
+    """Per-group INT fake quantization along the input dimension. Columns in `keep` (16-bit outlier
+    channels) are left out of the group scales and returned unchanged."""
     out_f, in_f = W.shape
+    Wz = W
+    if keep is not None and len(keep):
+        Wz = W.clone()
+        Wz[:, keep] = 0          # a zero never sets an absmax, so the kept columns do not set any scale
     if group <= 0 or group >= in_f:
-        return quant_sym(W, bits, dim=1)
-    pad = (-in_f) % group
-    Wp = F.pad(W, (0, pad)) if pad else W
-    Wg = Wp.reshape(out_f, -1, group)
-    Wq = quant_sym(Wg, bits, dim=2).reshape(out_f, -1)
-    return Wq[:, :in_f]
+        Wq = quant_sym(Wz, bits, dim=1)
+    else:
+        pad = (-in_f) % group
+        Wp = F.pad(Wz, (0, pad)) if pad else Wz
+        Wg = Wp.reshape(out_f, -1, group)
+        Wq = quant_sym(Wg, bits, dim=2).reshape(out_f, -1)[:, :in_f]
+    if keep is not None and len(keep):
+        Wq[:, keep] = W[:, keep]
+    return Wq
+
+
+def quant_act(x: torch.Tensor, bits: int, keep: torch.Tensor | None = None) -> torch.Tensor:
+    """Per-token symmetric fake quantization of activations (computed in at least float32). Channels in
+    `keep` stay in the input precision and are left out of the per-token absmax, so an outlier channel
+    does not set the scale of the others."""
+    work = torch.promote_types(x.dtype, torch.float32)
+    if keep is None or not len(keep):
+        return quant_sym(x.to(work), bits, dim=-1).to(x.dtype)
+    rest = torch.ones(x.shape[-1], dtype=torch.bool, device=x.device)
+    rest[keep] = False
+    xq = x.clone()
+    xq[..., rest] = quant_sym(x[..., rest].to(work), bits, dim=-1).to(x.dtype)
+    return xq
 
 
 def quant_nf4(W: torch.Tensor, block: int = 64) -> torch.Tensor:
@@ -142,17 +169,19 @@ class QuantLinear(nn.Module):
         self.rotation = rotation
         self.noise = noise or {}
         W = lin.weight.data
+        dtype = W.dtype
         self.keep = None
         with torch.no_grad():
             if scheme.name == "rotation":
-                W = rotation.apply(W)  # (x Q)(W Q)^T = x W^T
+                # (x Q)(W Q)^T = x W^T, computed in float32 so that a bfloat16 model's 8-bit mantissa does not
+                # add rounding error to this arm alone
+                W = rotation.apply(W.to(torch.promote_types(dtype, torch.float32)))
             if scheme.name == "outlier":
                 k = max(1, int(round(scheme.outlier_frac * W.shape[1])))
                 self.keep = torch.topk(act_absmax.to(W.device).float(), k).indices
             if scheme.name in ("uniform", "rotation", "outlier"):
-                Wq = quant_weight_groups(W.float(), scheme.w_bits, scheme.group).to(W.dtype)
-                if self.keep is not None:
-                    Wq[:, self.keep] = W[:, self.keep]
+                work = torch.promote_types(W.dtype, torch.float32)
+                Wq = quant_weight_groups(W.to(work), scheme.w_bits, scheme.group, self.keep).to(dtype)
             elif scheme.name == "nf4":
                 Wq = quant_nf4(W.float(), scheme.group if scheme.group > 0 else 64).to(W.dtype)
             elif scheme.name == "isotropic":
@@ -166,17 +195,15 @@ class QuantLinear(nn.Module):
 
     def forward(self, x):
         s = self.scheme
+        dtype = x.dtype
         if s.name == "rotation":
-            x = self.rotation.apply(x)
+            x = self.rotation.apply(x.to(torch.promote_types(dtype, torch.float32)))
         if s.a_bits is not None and s.name in ("uniform", "rotation", "outlier"):
-            xq = quant_sym(x.float(), s.a_bits, dim=-1).to(x.dtype)
-            if self.keep is not None:
-                xq[..., self.keep] = x[..., self.keep]
-            x = xq
+            x = quant_act(x, s.a_bits, self.keep)
         elif s.name == "isotropic" and self.noise.get("sigma_a", 0.0) > 0:
             rms = x.float().pow(2).mean(dim=-1, keepdim=True).sqrt()
             x = (x.float() + self.noise["sigma_a"] * rms * torch.randn_like(x, dtype=torch.float32)).to(x.dtype)
-        return F.linear(x, self.weight, self.bias)
+        return F.linear(x.to(dtype), self.weight, self.bias)
 
 
 def linear_layers(model: nn.Module, skip=("embed", "lm_head", "embed_out", "wte")) -> dict[str, nn.Linear]:
@@ -212,7 +239,8 @@ def apply_scheme(model: nn.Module, scheme: Scheme, absmax: dict | None = None, s
         if scheme.name == "rotation":
             d = lin.in_features
             if d not in rotations:
-                rotations[d] = Rotation(d, seed + d, lin.weight.device, lin.weight.dtype, scheme.rotation_nonpow2)
+                rdt = torch.promote_types(lin.weight.dtype, torch.float32)       # rotations in at least float32
+                rotations[d] = Rotation(d, seed + d, lin.weight.device, rdt, scheme.rotation_nonpow2)
             rot = rotations[d]
         am = absmax.get(name) if absmax else None
         nz = None
