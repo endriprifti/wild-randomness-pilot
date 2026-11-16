@@ -488,10 +488,33 @@ reads `train/*.jsonl.zst` for the gradient pool and `val.jsonl.zst` for validati
 | `uoft-cs/cifar10` | train, test | P3 (LRA image), P4 ResNet-18 |
 | Fashion-MNIST (torchvision) | train, test | P5 |
 
-`python check_data.py` (a few minutes, CPU) streams the first row of each of these splits exactly as the job reads
-it, pins new dataset revisions in `pins.json` (`--no-pin` leaves the file alone), writes
+`python check_data.py` (a few minutes, CPU) streams the first row with a non-empty text field of each of these
+splits (row 1 for WikiText, whose row 0 is a blank line; the jobs skip blank rows the same way) exactly as the job
+reads it, pins new dataset revisions in `pins.json` (`--no-pin` leaves the file alone), writes
 `results/check_data/check_data.csv` and exits 1 if any split fails. The list comes from `config.py`, so a new
 dataset entry is checked without editing the script.
+
+The dataset pins in the committed `pins.json` come from `check_data.py` on the laptop (2026-11-16): the Pile copy
+at `3be90335b6`, WikiText at `b08601e043`, PopQA at `098765c79e`, FineWeb-Edu at `87f09149ef`, CIFAR-10 at
+`0b2714987f`.
+
+### Pulling on the L40S without losing local pins
+
+The L40S's `pins.json` gains names during the run (pinned on first use), so `git pull` refuses to overwrite it, or
+would conflict with a committed update. Save it, pull, and merge it back (`merge_pins.py` keeps every entry of both
+files; a name with two different commits keeps the local one, which that machine's results loaded, and is
+reported):
+
+```bash
+cd ~/pilot
+F=~/pins.local.$(date -u +%Y%m%dT%H%M%SZ).json
+cp pins.json "$F"
+git checkout -- pins.json && git pull --ff-only
+python3 merge_pins.py "$F"                   # standard library only; exit code 2 if a name had two commits
+```
+
+A job that is running keeps its pins in memory and merges them into the file on disk when it saves, so pulling
+between or during jobs loses nothing; `run_all.sh` is not changed by these commits, so the running script is safe.
 
 ### Pinned commits
 
@@ -568,7 +591,7 @@ before the run.
 
 ## Unit tests
 
-`python -m pytest -q` (146 tests, about 2 min on a CPU; `-m "not slow"` skips the two slowest). Synthetic data with
+`python -m pytest -q` (149 tests, about 2 min on a CPU; `-m "not slow"` skips the two slowest). Synthetic data with
 known parameters:
 
 - stable density against the Gaussian and Cauchy closed forms and against SciPy; ML fit recovers α ∈ {1.2, 1.5, 1.8},
@@ -595,7 +618,8 @@ known parameters:
 - dataset loading: a folder laid out like `monology/pile-uncopyrighted` reproduces "Bad split: validation" and
   reads `val.jsonl.zst` with `data_files`; only transient errors are retried (a ValueError is tried once); a smoke
   run falls back for a dataset only when the Hub is unreachable; `check_data.py` lists every split and smoke reads
-  the same ones; no `load_dataset` call outside `common/hf.py`;
+  the same ones; no `load_dataset` call outside `common/hf.py`; blank WikiText rows are skipped by `load_texts`
+  and by `check_data.py`; `merge_pins.py` and the pull recipe keep every local and committed pin;
 - P2's outlier scheme: a kept channel 1000 times larger leaves every other channel's activation error, the other
   weight columns and the layer's output error unchanged (before the fix it rounded most of them to zero); the
   rotation arm in bfloat16 adds no rounding beyond bfloat16 storage;

@@ -421,11 +421,28 @@ def pin_dataset(spec: DataSpec, run=None) -> str:
     return PINS.resolve(spec.repo, spec.revision, run, repo_type="dataset")
 
 
-def first_item(spec, run=None) -> tuple[dict, str]:
-    """The first row of a split at its pinned commit (streaming), and the commit. Used by check_data.py."""
+def is_empty(v) -> bool:
+    """An empty field: missing, None, or a string of whitespace only (WikiText's blank lines)."""
+    return v is None or (isinstance(v, str) and not v.strip())
+
+
+def first_item(spec, run=None, max_rows: int = 1000) -> tuple[dict, str, int]:
+    """The first row of a split whose field is not empty (the first row if the spec has no field), at the pinned
+    commit (streaming), with the commit and the row's index. load_texts skips empty rows the same way (they are
+    shorter than min_chars). Raises DataSpecError if none of the first max_rows rows has the field filled.
+    Used by check_data.py."""
     spec = data_spec(spec)
     sha = pin_dataset(spec, run)
-    return hub_retry(lambda: next(iter(_open(spec, sha, True))), run, f"first item of {spec.label}"), sha
+
+    def find():
+        for i, ex in enumerate(_open(spec, sha, True)):
+            if not spec.field or not is_empty(ex.get(spec.field)):
+                return ex, i
+            if i + 1 >= max_rows:
+                break
+        raise DataSpecError(f"{spec.label}: no row with a non-empty {spec.field!r} field in the first {max_rows}")
+    item, i = hub_retry(find, run, f"first item of {spec.label}")
+    return item, sha, i
 
 
 def load_texts(spec, n: int, run, field: str | None = None, min_chars: int = 200,

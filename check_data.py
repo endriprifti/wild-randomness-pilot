@@ -1,7 +1,8 @@
 """Open one item of every dataset split that a full-config job reads, at the revision it will read.
 
-Run it before a cloud run or a rerun (a few minutes; it streams only the first row of each split, plus the
-Fashion-MNIST download of about 30 MB):
+Run it before a cloud run or a rerun (a few minutes; it streams only the first row of each split whose text
+field is not empty, e.g. row 1 of WikiText, whose row 0 is a blank line, plus the Fashion-MNIST download of
+about 30 MB):
 
   python check_data.py                    # every job; pins new dataset revisions in pins.json
   python check_data.py --jobs p1_checkpoints,p2_w4a4
@@ -96,10 +97,9 @@ def check_one(spec) -> dict:
                "data_files": "" if not spec.data_files else str(spec.data_files[spec.split]),
                "revision": spec.revision, "commit": ""}
         try:
-            item, sha = hf.first_item(spec)
-            row.update(commit=sha or "", status="ok", first_item=_summary(item))
-            if spec.field and not item.get(spec.field):
-                row.update(status="FAIL", error=f"first item has no {spec.field!r} field: {sorted(item)}")
+            item, sha, i = hf.first_item(spec)
+            where = f"row {i} (first with a non-empty {spec.field!r}): " if spec.field and i else ""
+            row.update(commit=sha or "", status="ok", first_row=i, first_item=where + _summary(item))
         except Exception as e:  # noqa: BLE001
             row.update(status="FAIL", error=f"{type(e).__name__}: {str(e)[:300]}",
                        transient=hf.is_transient(e))

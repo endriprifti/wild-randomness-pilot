@@ -159,3 +159,73 @@ def test_every_dataset_load_goes_through_the_pinned_loader():
         if re.search(r"\bload_dataset\(", f.read_text()):
             offenders.append(f.name)
     assert not offenders, f"load_dataset called outside common/hf.py: {offenders}"
+
+
+def _wikitext_like(root: Path) -> Path:
+    """WikiText's layout of rows: blank lines between headings and paragraphs; row 0 is blank."""
+    rows = ["", " = Valkyria Chronicles III = \n", "", " Senjō no Valkyria 3 is a tactical role @-@ playing game .\n",
+            "", " = = Gameplay = = \n", "   ", " The game began development in 2010 .\n"]
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "test.jsonl").write_text("".join(json.dumps({"text": t}) + "\n" for t in rows))
+    return root
+
+
+def test_empty_rows_are_skipped_by_load_texts_and_check_data(tmp_path, local):
+    repo = _wikitext_like(tmp_path / "wikitext")
+    spec = {"repo": str(repo), "split": "test", "data_files": {"test": "test.jsonl"}}
+    texts, src = hf.load_texts(spec, 3, StubRun(), min_chars=1)            # P2's perplexity text, P4's OOD text
+    assert src == "hub" and texts[0].startswith(" = Valkyria") and len(texts) == 3 and all(t for t in texts)
+    item, _, i = hf.first_item(spec)
+    assert i == 1 and item["text"].startswith(" = Valkyria")
+    row = check_data.check_one(hf.data_spec(spec))
+    assert row["status"] == "ok" and row["first_row"] == 1 and "row 1" in row["first_item"]
+    (repo / "blank.jsonl").write_text("".join(json.dumps({"text": ""}) + "\n" for _ in range(5)))
+    blank = check_data.check_one(hf.data_spec({"repo": str(repo), "split": "test",
+                                               "data_files": {"test": "blank.jsonl"}}))
+    assert blank["status"] == "FAIL" and "non-empty" in blank["error"]
+
+
+def test_merge_pins_keeps_every_entry(tmp_path):
+    import merge_pins
+    base = {"a@main": {"commit": "1" * 40, "commit_date": "x"}, "b@main": {"commit": "2" * 40},
+            "datasets/d@main": {"commit": "3" * 40}}
+    local = {"a@main": {"commit": "1" * 40, "deduped_check": {"verdict": "differs"}},
+             "b@main": {"commit": "9" * 40}, "c@step1": {"commit": "4" * 40}}
+    merged, added, conflicts = merge_pins.merge(base, local)
+    assert set(merged) == {"a@main", "b@main", "c@step1", "datasets/d@main"} and added == ["c@step1"]
+    assert merged["a@main"] == {"commit": "1" * 40, "commit_date": "x", "deduped_check": {"verdict": "differs"}}
+    assert conflicts == ["b@main"] and merged["b@main"]["commit"] == "9" * 40       # the local run loaded it
+
+
+def test_the_pull_recipe_loses_no_local_pin(tmp_path):
+    """The four steps in merge_pins.py's docstring, on a clone with local pins and an upstream commit that adds
+    dataset pins (the L40S situation of 2026-11-16)."""
+    import subprocess
+    import merge_pins
+
+    def git(*a, cwd):
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=cwd, check=True,
+                       capture_output=True)
+    up, l40s = tmp_path / "up", tmp_path / "l40s"
+    up.mkdir()
+    git("init", "-q", "-b", "main", cwd=up)
+    write = lambda p, d: p.write_text(json.dumps(dict(sorted(d.items())), indent=1) + "\n")   # noqa: E731
+    write(up / "pins.json", {f"EleutherAI/pythia-14m@step{s}": {"commit": f"{s:040d}"} for s in (1, 2)})
+    git("add", "pins.json", cwd=up)
+    git("commit", "-q", "-m", "pins", cwd=up)
+    git("clone", "-q", str(up), str(l40s), cwd=tmp_path)
+    run_pins = json.loads((l40s / "pins.json").read_text())                  # the L40S pins names on first use
+    run_pins.update({"allenai/OLMo-2-1124-7B@step1000-tokens4B": {"commit": "a" * 40},
+                     "EleutherAI/pythia-410m-seed3@step7000": {"commit": "b" * 40}})
+    write(l40s / "pins.json", run_pins)
+    up_pins = json.loads((up / "pins.json").read_text())
+    up_pins["datasets/monology/pile-uncopyrighted@main"] = {"commit": "3be90335b6" + "0" * 30}
+    write(up / "pins.json", up_pins)
+    git("commit", "-q", "-am", "dataset pins", cwd=up)
+    saved = tmp_path / "pins.local.json"
+    saved.write_text((l40s / "pins.json").read_text())                       # 1
+    git("checkout", "--", "pins.json", cwd=l40s)                              # 2
+    git("pull", "-q", "--ff-only", cwd=l40s)                                  # 3
+    assert merge_pins.main([str(saved), "--into", str(l40s / "pins.json")]) == 0   # 4
+    final = json.loads((l40s / "pins.json").read_text())
+    assert set(final) == set(run_pins) | set(up_pins) and len(final) == 5

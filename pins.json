@@ -6660,5 +6660,30 @@
   "resolved_utc": "2026-11-13T15:50:42+00:00",
   "weights_bytes": 5939687552,
   "commit_date": "2025-04-27T03:19:11+00:00"
+ },
+ "datasets/HuggingFaceFW/fineweb-edu@main": {
+  "commit": "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9",
+  "resolved_utc": "2026-11-16T14:00:59+00:00",
+  "commit_date": "2025-07-11T20:16:53+00:00"
+ },
+ "datasets/Salesforce/wikitext@main": {
+  "commit": "b08601e04326c79dfdd32d625aee71d232d685c3",
+  "resolved_utc": "2026-11-16T14:00:37+00:00",
+  "commit_date": "2024-01-04T16:49:18+00:00"
+ },
+ "datasets/akariasai/PopQA@main": {
+  "commit": "098765c79ea10a2cb19c828324e33281b8336ec0",
+  "resolved_utc": "2026-11-16T14:00:41+00:00",
+  "commit_date": "2022-12-22T01:01:20+00:00"
+ },
+ "datasets/monology/pile-uncopyrighted@main": {
+  "commit": "3be90335b66f24456a5d6659d9c8d208c0357119",
+  "resolved_utc": "2026-11-16T14:00:29+00:00",
+  "commit_date": "2023-08-31T03:45:38+00:00"
+ },
+ "datasets/uoft-cs/cifar10@main": {
+  "commit": "0b2714987fa478483af9968de7c934580d0bb9a2",
+  "resolved_utc": "2026-11-16T14:00:44+00:00",
+  "commit_date": "2024-01-04T06:53:11+00:00"
  }
 }
