@@ -14,8 +14,11 @@ variance 2 gamma^2.
 
 from __future__ import annotations
 
+import contextlib
 import math
+import os
 from dataclasses import dataclass, asdict
+from pathlib import Path
 
 import numpy as np
 from scipy import optimize, special, stats
@@ -94,6 +97,10 @@ class _StdDensity:
         self.x = -L + self.dx * np.arange(n)
         self.du = 2 * np.pi / (n * self.dx)
         self.u = (np.arange(n) - n // 2) * self.du
+        # the same for every (alpha, beta): computed once (identical values to computing them in every table)
+        self._shift = np.exp(-1j * self.u * self.x[0])
+        self._sign = np.exp(1j * np.pi * np.arange(n))
+        self.inner = np.abs(self.x) <= self.X_SWITCH + 1.0
 
     def _phi(self, alpha, beta):
         u = self.u
@@ -107,23 +114,23 @@ class _StdDensity:
                 psi = au * (1 + 1j * beta * (2 / np.pi) * np.sign(u) * np.where(au > 0, np.log(au), 0.0))
         return np.exp(-psi)
 
+    def values(self, alpha, beta) -> np.ndarray:
+        """f(x_j; alpha, beta) on the whole FFT grid, floored at 1e-300."""
+        phi = self._phi(alpha, beta)
+        # f(x_j) = (1/2pi) sum_k phi(u_k) exp(-i u_k x_j) du with u_k = (k - n/2) du,
+        # x_j = x_0 + j dx and du dx = 2pi/n, so exp(-i u_k x_j)
+        # = exp(-i u_k x_0) exp(-2 pi i k j / n) (-1)^j.
+        vals = np.fft.fft(phi * self._shift) * self._sign
+        f = np.real(vals) * self.du / (2 * np.pi)
+        return np.maximum(f, 1e-300)
+
     def table(self, alpha, beta):
         key = (round(alpha, 6), round(beta, 6))
         hit = self._cache.get(key)
         if hit is not None:
             return hit
-        n = self.N
-        phi = self._phi(alpha, beta)
-        # f(x_j) = (1/2pi) sum_k phi(u_k) exp(-i u_k x_j) du
-        # f(x_j) = (1/2pi) sum_k phi(u_k) exp(-i u_k x_j) du with u_k = (k - n/2) du,
-        # x_j = x_0 + j dx and du dx = 2pi/n, so exp(-i u_k x_j)
-        # = exp(-i u_k x_0) exp(-2 pi i k j / n) (-1)^j.
-        shift = np.exp(-1j * self.u * self.x[0])
-        vals = np.fft.fft(phi * shift) * np.exp(1j * np.pi * np.arange(n))
-        f = np.real(vals) * self.du / (2 * np.pi)
-        f = np.maximum(f, 1e-300)
-        mask = np.abs(self.x) <= self.X_SWITCH + 1.0
-        spline = CubicSpline(self.x[mask], np.log(f[mask]))
+        f = self.values(alpha, beta)
+        spline = CubicSpline(self.x[self.inner], np.log(f[self.inner]))
         if len(self._cache) > 512:
             self._cache.clear()
         self._cache[key] = spline
@@ -176,13 +183,139 @@ def _tail_logpdf(z, alpha, beta):
 _DENSITY = _StdDensity()
 
 
+def _lagrange4(s):
+    """Weights of 4-point (cubic) Lagrange interpolation at offset s from the first of four equally spaced nodes."""
+    s = np.asarray(s, dtype=float)
+    return np.stack([-(s - 1) * (s - 2) * (s - 3) / 6, s * (s - 2) * (s - 3) / 2,
+                     -s * (s - 1) * (s - 3) / 2, s * (s - 1) * (s - 2) / 6])
+
+
+class _GridDensity:
+    """The FFT density of _StdDensity, precomputed once on an (alpha, beta) grid and interpolated.
+
+    _StdDensity computes a 65,536-point FFT and a cubic spline for every new (alpha, beta), about 9 ms, and a
+    Nelder-Mead fit asks for about 300 of them: 1.6 to 2.3 s per fit, so one H7.1 test (1,608 fits) takes about
+    45 minutes of one core. Here the density f on the same x nodes (|x| <= X_SWITCH + 1) is stored for alpha in
+    [0.6, 2] (step 0.01) and beta in [-1, 1] (step 0.05), about 310 MB, built once and memory-mapped from a cache
+    file. A density is then a cubic (4-point Lagrange) interpolation of f in alpha and in beta, and of log f
+    in x, about 0.1 ms. f, not log f, is interpolated in alpha because near alpha = 2 the tail mass grows linearly
+    in 2 - alpha while log f does not. Beyond |x| = X_SWITCH (25 for alpha < 1.2) the tail series is used as
+    before, and for alpha < 1 with |beta| > BETA_MAX, where the density approaches a one-sided support, the exact
+    FFT density. Largest |log f| difference from the exact density over |x| <= 50: 5e-5 (alpha 0.6 to 2, beta
+    -0.9 to 0.9; 3e-4 at alpha 1.1, beta -0.999). tests/test_stable.py checks the fits against the exact density's.
+    """
+
+    A0, A1, DA = 0.6, 2.0, 0.01
+    B0, B1, DB = -1.0, 1.0, 0.05
+    BETA_MAX = 0.9          # with alpha < EXACT_BELOW_ALPHA: exact FFT density
+    EXACT_BELOW_ALPHA = 1.0
+    VERSION = 1
+
+    def __init__(self, base: _StdDensity, path=None):
+        self.base = base
+        self.alphas = np.round(np.arange(self.A0, self.A1 + self.DA / 2, self.DA), 10)
+        self.betas = np.round(np.arange(self.B0, self.B1 + self.DB / 2, self.DB), 10)
+        self.idx = np.flatnonzero(base.inner)
+        self.x0 = float(base.x[self.idx[0]])
+        self.dx = base.dx
+        self.path = Path(path) if path else self.default_path()
+        self.f = self._load_or_build()
+
+    @classmethod
+    def default_path(cls) -> Path:
+        b = _StdDensity
+        tag = f"v{cls.VERSION}_N{b.N}_L{b.L:g}_X{b.X_SWITCH:g}_a{cls.A0:g}-{cls.A1:g}-{cls.DA:g}_b{cls.B0:g}-{cls.B1:g}-{cls.DB:g}"
+        return Path(__file__).resolve().parent.parent / ".cache" / f"stable_grid_{tag}.npy"
+
+    def _load_or_build(self):
+        shape = (len(self.alphas), len(self.betas), len(self.idx))
+        if self.path.exists():
+            f = np.load(self.path, mmap_mode="r")
+            if f.shape == shape:
+                return f
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        f = np.empty(shape)
+        for i, a in enumerate(self.alphas):
+            for j, b in enumerate(self.betas):
+                f[i, j] = self.base.values(float(a), float(b))[self.idx]
+        tmp = self.path.with_name(f"{self.path.stem}.{os.getpid()}.tmp.npy")
+        np.save(tmp, f)
+        os.replace(tmp, self.path)
+        return np.load(self.path, mmap_mode="r")
+
+    @staticmethod
+    def _stencil(v, v0, h, n):
+        t = (v - v0) / h
+        i0 = int(min(max(math.floor(t) - 1, 0), n - 4))
+        return i0, _lagrange4(t - i0)
+
+    def _inner(self, z, alpha, beta):
+        ia, wa = self._stencil(alpha, self.A0, self.DA, len(self.alphas))
+        ib, wb = self._stencil(beta, self.B0, self.DB, len(self.betas))
+        t = (z - self.x0) / self.dx
+        lo = max(int(math.floor(t.min())) - 2, 0)
+        hi = min(int(math.ceil(t.max())) + 3, len(self.idx))
+        block = np.asarray(self.f[ia:ia + 4, ib:ib + 4, lo:hi])
+        row = np.tensordot(np.outer(wa, wb), block, axes=([0, 1], [0, 1]))
+        lrow = np.log(np.maximum(row, 1e-300))
+        j0 = np.clip(np.floor(t).astype(int) - 1 - lo, 0, hi - lo - 4)
+        w = _lagrange4(t - lo - j0)
+        return w[0] * lrow[j0] + w[1] * lrow[j0 + 1] + w[2] * lrow[j0 + 2] + w[3] * lrow[j0 + 3]
+
+    def logpdf(self, z, alpha, beta):
+        if alpha < self.EXACT_BELOW_ALPHA and abs(beta) > self.BETA_MAX:
+            return self.base.logpdf(z, alpha, beta)
+        z = np.asarray(z, dtype=float)
+        out = np.empty_like(z)
+        switch = self.base.X_SWITCH if alpha >= 1.2 else 25.0
+        inner = np.abs(z) <= switch
+        if inner.any():
+            out[inner] = self._inner(z[inner], alpha, beta)
+        if (~inner).any():
+            out[~inner] = _tail_logpdf(z[~inner], alpha, beta)
+        return out
+
+
+_ACTIVE = _DENSITY
+_GRID: _GridDensity | None = None
+
+
+def set_density(name: str, path=None) -> str:
+    """'fft' (default: a new FFT table for every (alpha, beta)) or 'grid' (_GridDensity, built or loaded on first
+    use). Applies to logpdf, fit_stable and everything built on them in this process; returns the previous name."""
+    global _ACTIVE, _GRID
+    prev = density_name()
+    if name == "grid":
+        if _GRID is None or (path is not None and Path(path) != _GRID.path):
+            _GRID = _GridDensity(_DENSITY, path)
+        _ACTIVE = _GRID
+    elif name == "fft":
+        _ACTIVE = _DENSITY
+    else:
+        raise ValueError(f"unknown stable density {name!r} (fft or grid)")
+    return prev
+
+
+def density_name() -> str:
+    return "grid" if _ACTIVE is not _DENSITY else "fft"
+
+
+@contextlib.contextmanager
+def using_density(name: str, path=None):
+    prev = set_density(name, path)
+    try:
+        yield
+    finally:
+        set_density(prev)
+
+
 def logpdf(x, alpha, beta, gamma, delta, param: int = 1):
     """Log density of S(alpha, beta, gamma, delta; param) for param in {0, 1}."""
     d0 = delta if param == 0 else s1_to_s0_delta(alpha, beta, gamma, delta)
     z = (np.asarray(x, dtype=float) - d0) / gamma
     if alpha >= 2.0 - 1e-9:
         return stats.norm.logpdf(z, scale=math.sqrt(2.0)) - math.log(gamma)
-    return _DENSITY.logpdf(z, alpha, beta) - math.log(gamma)
+    return _ACTIVE.logpdf(z, alpha, beta) - math.log(gamma)
 
 
 # ----------------------------------------------------------------------------- fitting
@@ -217,8 +350,12 @@ def quantile_start(x: np.ndarray):
         return a, 0.0, float((q75 - q25) / 2.0), float(q50)
 
 
-def fit_stable(x: np.ndarray, symmetric: bool = False, maxiter: int = 600) -> StableFit:
-    """Maximum-likelihood fit of all four stable parameters (beta = 0 if symmetric)."""
+def fit_stable(x: np.ndarray, symmetric: bool = False, maxiter: int = 600, restarts: int | None = None) -> StableFit:
+    """Maximum-likelihood fit of all four stable parameters (beta = 0 if symmetric).
+
+    restarts: Nelder-Mead runs again from its best point (a fresh simplex), kept if the likelihood is higher;
+    Nelder-Mead can report convergence at a point that is not a local optimum (its simplex collapses). Default:
+    1 with the grid density (about 50 ms per fit), 0 with the FFT density (as in the runs before 2026-11-16)."""
     x = np.asarray(x, dtype=float)
     x = x[np.isfinite(x)]
     n = len(x)
@@ -251,6 +388,13 @@ def fit_stable(x: np.ndarray, symmetric: bool = False, maxiter: int = 600) -> St
                                 options={"maxiter": maxiter, "xatol": 1e-4, "fatol": 1e-6})
         if best is None or res.fun < best.fun:
             best = res
+    if restarts is None:
+        restarts = 1 if density_name() == "grid" else 0
+    for _ in range(restarts):
+        res = optimize.minimize(nll, best.x, method="Nelder-Mead",
+                                options={"maxiter": maxiter, "xatol": 1e-4, "fatol": 1e-6})
+        if res.fun < best.fun:
+            best = res
     a, b, g, d = unpack(best.x)
     # Gaussian boundary: compare with the alpha = 2 fit explicitly.
     gn, dn = np.std(xs) / math.sqrt(2.0), np.mean(xs)
@@ -258,6 +402,8 @@ def fit_stable(x: np.ndarray, symmetric: bool = False, maxiter: int = 600) -> St
     ll = -best.fun
     if ll_norm > ll:
         a, b, g, d, ll = 2.0, 0.0, gn, dn, ll_norm
+    if a >= 2.0 - 1e-9:
+        b = 0.0   # the normal law has no skewness: Nelder-Mead may end at alpha = 2 with any beta (no effect there)
     gamma = g * scale
     delta0 = d * scale + d00
     delta1 = s0_to_s1_delta(a, b, gamma, delta0)

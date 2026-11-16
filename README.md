@@ -498,6 +498,58 @@ the probe set per checkpoint) is minutes. Pass (b) adds up to 9 seeds × 12 chec
 disk holds about one checkpoint at a time (`--keep-cache` turns this off). `--pin-only` reads the exact file sizes
 from the Hub and writes the total for the main grid and for pass (a) to `run.json` (`results.download`).
 
+### P1's GPU pass, CPU statistics in a pool, and results after every checkpoint
+
+Each checkpoint has a GPU pass in the main process (load, probe loss, the SVD of every layer, hidden states and
+activation moments, token losses, the JVP projections and the H7.1 pool, eval loss) that saves what the statistics
+need to `checkpoints/<pass>/<repo>@<revision>/samples/` and writes `row.json`. The statistics run in a pool of
+processes (`common/p1_tasks.py`) while the GPU goes on to the next checkpoint: the stable fit and CSN tails with
+Vuong tests of the gradient noise, α_ESD per layer, act_zeta per layer, Δh_rep (on the CPU), H_tok with its
+shuffled surrogates, and per H7.1 direction the fits at each B and the bootstrap in chunks of 25 replicates. A
+checkpoint whose statistics are all saved gets `result.json`, and `checkpoints.csv` and `h71_summary.csv` are
+rewritten from all of them (the per-layer and per-B CSVs at most every 10 minutes and at the end).
+
+- **Resume.** Run the same command again: checkpoints with `result.json` are read back, checkpoints with only
+  `row.json` run their missing statistics, and the rest are measured. A crash or a stop loses at most the GPU pass
+  in progress and the statistics then running. Every statistic has its own random generator, seeded from the run
+  seed, the checkpoint and the statistic's name, so the results do not depend on the number of processes, the
+  order in which they finish, or a restart (a killed-and-resumed smoke run gives the same CSVs as an uninterrupted
+  one). The bootstrap draws differ from runs before 2026-11-16, which used one generator for the whole run.
+  `checkpoints/fingerprint.json` records the config, seed, `--skip` and stable density; a run with other settings
+  refuses to resume in that folder.
+- **CPUs.** One pool process per CPU the job may use (its `taskset`), at lower priority than the GPU pass, one
+  thread each. `--cpus-after p3_fractional=all` (or `P1_CPUS_AFTER`, which `run_lane.sh` sets) widens this to every
+  CPU once `logs/progress.txt` shows P3 ended; a file `logs/p1_cpus` (e.g. `0-10`) sets the CPUs at any time and is
+  read every minute. `--workers N` fixes the number of processes.
+- **Progress.** `logs/<job>.log` gets a line per GPU measurement (seconds, and seconds into the checkpoint), per
+  finished statistic (seconds, tasks queued and running) and per completed checkpoint (n of N); `timings.csv` holds
+  the same seconds per checkpoint and measurement.
+- **Samples kept.** The JVP projections, the H7.1 pools, the token-loss series and the ESD eigenvalues stay (about
+  2 MB per checkpoint, 20 MB per Pythia-14M H7.1 pool); the hidden-state points and activation samples are deleted
+  once their statistic is saved (`--keep-samples` keeps them).
+- **H7.1 stages.** Each stage is the one checkpoint nearest to 1, 10, 50 or 100% of training (steps 1,000, 14,000,
+  71,000 or 72,000, and 143,000 for Pythia). Before 2026-11-16 a checkpoint counted as a stage when its fraction
+  of training was within 0.02 of a stage, which made every Pythia step up to 4,000 a 1% stage and 16,000 a 10%
+  stage: ten H7.1 tests per size and direction instead of four.
+- **Stable density.** The fits use a density precomputed on an (α, β) grid (`--stable-density grid`, default;
+  `common/stable.py`, built once in about 35 s into `.cache/`, about 310 MB, memory-mapped by every process) and
+  one Nelder-Mead restart: about 0.09 s per fit instead of 1.5 s. On 240 simulated samples (n = 200 and 1,600;
+  α 1.2 to 2, β up to ±0.6, Student t3, Gaussian) α̂ agreed with the FFT density's fit to 0.0008 in 99% of fits;
+  the two larger differences (0.010 and 0.028) are fits where the FFT fit's Nelder-Mead stopped short (the grid
+  fit's likelihood is higher). Two full H7.1 tests (1,600 blocks, B = 8 to 1,024, 50 bootstrap replicates; SαS
+  1.8 and Student t3 pools) agreed to 1e-5 in every α̂(B), in b and in its interval, 17 times faster.
+  `--stable-density fft` restores the FFT density without the restart.
+
+Stopping and restarting the lane with new code (the lane stops its job with SIGTERM, which stops the pool, and
+writes END with exit 130):
+
+```bash
+kill -TERM "$(pgrep -f 'bash run_lane.sh')"     # stops the job; its finished checkpoints stay on disk
+# pull as in "Pulling on the L40S" below, then start the lane again: finished jobs (.done) are skipped and the
+# interrupted one resumes from its checkpoints
+nohup taskset -c 7-10 bash run_lane.sh p1_pythia p1_polypythia p1_olmo > logs/run_lane.out 2>&1 &
+```
+
 ### Datasets
 
 Every Hub dataset is read through `common/hf.py` at a commit pinned in `pins.json`, like the models (key
@@ -620,7 +672,7 @@ before the run.
 
 ## Unit tests
 
-`python -m pytest -q` (154 tests, about 2 min on a CPU; `-m "not slow"` skips the two slowest). Synthetic data with
+`python -m pytest -q` (165 tests, about 3 min on a CPU; `-m "not slow"` skips the two slowest). Synthetic data with
 known parameters:
 
 - stable density against the Gaussian and Cauchy closed forms and against SciPy; ML fit recovers α ∈ {1.2, 1.5, 1.8},
@@ -649,6 +701,12 @@ known parameters:
   run falls back for a dataset only when the Hub is unreachable; `check_data.py` lists every split and smoke reads
   the same ones; no `load_dataset` call outside `common/hf.py`; blank WikiText rows are skipped by `load_texts`
   and by `check_data.py`; `merge_pins.py` and the pull recipe keep every local and committed pin;
+- P1's pool: one H7.1 checkpoint per stage (four for Pythia-14M, where the old rule gave ten); the pool's CPUs
+  (the start set, widened after a job's END, and `logs/p1_cpus`); task seeds depend only on names; the tasks'
+  results merge into the rows and columns written before, a failing statistic is recorded and a bug stops the
+  run; a pool runs a checkpoint's tasks and a restart reads `result.json` back; other settings refuse to resume;
+- the grid stable density against the FFT density (log f within 1e-4 for |x| <= 50) and its fits against the FFT
+  fits (α̂ within 0.01 and γ̂ within 1%, unless the grid fit's likelihood is higher);
 - `run_lane.sh`: run_all.sh's job order and P1 commands; its records next to a running run_all.sh (a stand-in
   Python), refusal of jobs run_all.sh will still run and of non-P1 jobs, one lane at a time; P1's GPU lock makes
   a second P1 job wait; two jobs saving `pins.json` keep each other's entries;

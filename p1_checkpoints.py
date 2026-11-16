@@ -33,9 +33,18 @@ Loss-spike check (PolyPythias 410M seeds 3 and 4 had loss spikes), two passes:
       and is more than 3.5 robust z above them. spike_check.csv holds both passes and the jump steps.
 Each checkpoint is deleted from the Hugging Face cache after it is read (--keep-cache keeps them).
 
+GPU pass and CPU statistics (2026-11-16): the main process runs each checkpoint's GPU measurements, saves what the
+statistics need under checkpoints/<pass>/<repo>@<revision>/ and goes on to the next checkpoint; the statistics
+(stable and CSN fits, alpha_ESD, act_zeta, Delta h_rep, H_tok surrogates, H7.1 fits and bootstrap) run in a pool of
+processes (common/p1_tasks.py), one per CPU the job may use (--workers, --cpus-after, logs/p1_cpus). A checkpoint
+whose statistics are saved gets result.json; checkpoints.csv and h71_summary.csv are rewritten after each one. The
+same command resumes: finished checkpoints are read back, the rest measured. Progress lines per measurement in the
+log, seconds in timings.csv. H7.1 runs at one checkpoint per stage (the nearest to 1, 10, 50, 100% of training).
+
 Outputs (results/p1_checkpoints/[smoke/]): checkpoints.csv, esd_layers.csv, activations_layers.csv,
 h71_per_B.csv, h71_summary.csv, scaling.csv, seed_variance.csv, spike_check.csv, coupling_pairs.csv,
-coupling.json, run.json; with --pin-only: name_switch_check.csv and run.json
+coupling.json, timings.csv, checkpoints/ (per checkpoint: samples/, stats/, row.json, result.json), run.json;
+with --pin-only: name_switch_check.csv and run.json
 
 Commands:
   python p1_checkpoints.py --pin-only            # resolve and record every commit first (CPU is enough);
@@ -50,18 +59,27 @@ Commands:
 
 from __future__ import annotations
 
+import collections
+import concurrent.futures as cf
+import contextlib
 import datetime as dt
+import hashlib
 import json
-import math
+import multiprocessing as mp
+import os
+import shutil
+import signal
+import threading
 import time
+from concurrent.futures.process import BrokenProcessPool
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
 
 import config
-from common import batch as batchmod
-from common import coupling, gradients, hf, hurst, lm, multifractal, runtime, spectra, stable, tails
+from common import coupling, gradients, hf, lm, p1_tasks, runtime, spectra, stable
 
 
 def suite_models(cfg, suite):
@@ -270,25 +288,7 @@ def directions(model, ids_hess, device, n_random, n_hessian, seed):
     return params, dirs
 
 
-def noise_quantities(values: np.ndarray, B: int, n_blocks: int, T: dict, rng) -> dict:
-    noise = stable.block_noise(values, B, max_blocks=n_blocks)
-    out = {"n_blocks": len(noise)}
-    if len(noise) < 20:
-        return out
-    f = stable.fit_stable(noise)
-    out.update({"alpha": f.alpha, "beta": f.beta, "gamma": f.gamma})
-    for side, v in (("right", noise[noise > 0]), ("left", -noise[noise < 0])):
-        try:
-            rd = tails.read_tail(v, n_boot=T["n_boot"], min_tail=min(T["min_tail"], max(10, len(v) // 10)),
-                                 max_candidates=T["max_candidates"], hill_reps=T["hill_reps"],
-                                 hill_tol=T["hill_tol"], hill_eps=T["hill_eps"], n_jobs=T["n_jobs"], rng=rng)
-            out[f"zeta_{side}"] = rd.fit.zeta
-            out[f"tail_label_{side}"] = rd.label
-            out[f"tail_reason_{side}"] = rd.reason
-            out[f"p_ks_{side}"] = rd.p_ks
-        except ValueError:
-            pass
-    return out
+noise_quantities = p1_tasks.noise_quantities   # moved to common/p1_tasks.py (runs in the pool)
 
 
 def gpu_lock(args):
@@ -314,6 +314,386 @@ def gpu_lock(args):
     return f, time.perf_counter() - t0
 
 
+
+
+# ----------------------------------------------------------------------------- H7.1 stages
+def h71_stages(cfg, suite: str, size: str, steps_avail: dict) -> dict[int, float]:
+    """step -> H7.1 stage for the checkpoints that carry the H7.1 test: for each stage, the available step nearest to
+    round(stage * final) (the step wanted_steps adds); {} for models without the test. Until 2026-11-16 a checkpoint
+    counted as a stage when |step / final - stage| < 0.02, which made every Pythia step up to 4,000 (of 143,000) a
+    1% stage and 16,000 a 10% stage: ten H7.1 tests per size and direction instead of four."""
+    h71 = cfg["h71"]
+    if suite != "pythia" or size not in h71["full_res_sizes"] + h71["coarse_sizes"]:
+        return {}
+    final = max(steps_avail)
+    out: dict[int, float] = {}
+    for st in h71.get("stages", cfg["stages"]):
+        step, _ = hf.nearest_steps(steps_avail, [int(round(st * final))])[0]
+        out.setdefault(step, st)
+    return out
+
+
+# ----------------------------------------------------------------------------- CPUs for the statistics pool
+def parse_cpus(text: str) -> set[int]:
+    """'0-6,8' -> {0, ..., 6, 8}; 'all' -> every CPU of the machine."""
+    text = text.strip()
+    if text == "all":
+        return set(range(os.cpu_count() or 1))
+    out: set[int] = set()
+    for part in filter(None, text.replace(" ", "").split(",")):
+        lo, _, hi = part.partition("-")
+        out.update(range(int(lo), int(hi or lo) + 1))
+    return out
+
+
+def job_ended(progress_txt: Path, job: str) -> bool:
+    """True if run_all.sh's progress.txt shows `job` ended: its last START or END line is an END."""
+    if not progress_txt.exists():
+        return False
+    last = None
+    for line in progress_txt.read_text().splitlines():
+        f = line.split()
+        if len(f) >= 3 and f[2] == job and f[1] in ("START", "END"):
+            last = f[1]
+    return last == "END"
+
+
+def cpu_rule(cpus_after: str | None, start: set[int], root: Path = runtime.PILOT_ROOT):
+    """The CPUs the statistics may use now: logs/p1_cpus if that file exists (e.g. '0-10', read every minute),
+    else after `JOB=CPUS` (--cpus-after or P1_CPUS_AFTER, e.g. p3_fractional=all) once progress.txt shows JOB ended,
+    else the CPUs this process started on (taskset)."""
+    def now() -> set[int]:
+        f = root / "logs" / "p1_cpus"
+        if f.exists():
+            try:
+                c = parse_cpus(f.read_text())
+                if c:
+                    return c
+            except ValueError:
+                pass
+        if cpus_after:
+            job, _, spec = cpus_after.partition("=")
+            if job_ended(root / "logs" / "progress.txt", job.strip()):
+                return parse_cpus(spec or "all")
+        return set(start)
+    return now
+
+
+def fmt_cpus(c) -> str:
+    c = sorted(c)
+    parts, i = [], 0
+    while i < len(c):
+        j = i
+        while j + 1 < len(c) and c[j + 1] == c[j] + 1:
+            j += 1
+        parts.append(f"{c[i]}-{c[j]}" if j > i else f"{c[i]}")
+        i = j + 1
+    return ",".join(parts)
+
+
+def utc() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class Progress:
+    """Progress lines (stdout, i.e. logs/<job>.log) and timings.csv: one row per measurement of the GPU pass and
+    per statistic of the pool, with its seconds."""
+    COLS = ["utc", "checkpoint", "measurement", "where", "seconds"]
+
+    def __init__(self, out_dir: Path):
+        self.path = Path(out_dir) / "timings.csv"
+        if not self.path.exists():
+            self.path.write_text(",".join(self.COLS) + "\n")
+        self.lock = threading.Lock()
+
+    def say(self, msg: str) -> None:
+        print(f"{utc()} [p1_checkpoints] {msg}", flush=True)
+
+    def record(self, key: str, what: str, where: str, seconds: float) -> None:
+        line = f"{utc()},{key},{what},{where},{seconds:.3f}\n"
+        with self.lock:
+            fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+            try:
+                os.write(fd, line.encode())
+            finally:
+                os.close(fd)
+
+
+class StatPool:
+    """p1_tasks.run_task in a pool of 'spawn' processes (no CUDA state is inherited), one task per allowed CPU at a
+    time. A thread refills free slots as soon as a task ends, so the pool keeps working while the main thread runs
+    a GPU pass; finished tasks are handed to the main thread by collect(). A pool process that dies (killed, e.g.
+    out of memory) breaks the pool: it is started again and the interrupted tasks run again (twice at most, then
+    recorded as failed)."""
+
+    def __init__(self, cpus_fn, n_fixed: int, density: str, grid_path, prog: Progress, labels: dict):
+        self.cpus_fn, self.n_fixed, self.density, self.grid_path = cpus_fn, n_fixed, density, grid_path
+        self.prog, self.labels = prog, labels
+        self.max_workers = max(os.cpu_count() or 1, n_fixed or 1)
+        self.cv = threading.Condition()
+        self.pending: collections.deque = collections.deque()
+        self.running: dict = {}
+        self.finished: list = []
+        self.tries: collections.Counter = collections.Counter()
+        self.error: BaseException | None = None
+        self.ex = None
+        self.cpus, self.cpus_t = None, -1e18
+        self.n_done, self.cpu_seconds = 0, 0.0
+        self.stop = False
+        self.thread = threading.Thread(target=self._loop, name="p1-stat-pool", daemon=True)
+        self.thread.start()
+
+    # -- main thread
+    def submit(self, spec: dict) -> None:
+        with self.cv:
+            self.pending.append(spec)
+            self.cv.notify_all()
+
+    def collect(self) -> list[dict]:
+        with self.cv:
+            if self.error is not None:
+                raise self.error
+            out, self.finished = self.finished, []
+        return out
+
+    def busy(self) -> int:
+        with self.cv:
+            return len(self.pending) + len(self.running)
+
+    def wait_all(self, on_record, status_every: float = 600.0) -> None:
+        t = time.monotonic()
+        while True:
+            for rec in self.collect():
+                on_record(rec)
+            with self.cv:
+                if self.error is None and not self.pending and not self.running and not self.finished:
+                    return
+                self.cv.wait(timeout=5.0)
+            if time.monotonic() - t > status_every:
+                t = time.monotonic()
+                self.prog.say(f"pool: waiting for {self.busy()} CPU tasks ({len(self.running)} running)")
+
+    def shutdown(self) -> None:
+        with self.cv:
+            self.stop = True
+            self.cv.notify_all()
+        self.thread.join(timeout=10)
+        self._kill_executor()
+
+    # -- pool thread
+    def _allowed(self) -> list[int]:
+        if time.monotonic() - self.cpus_t > 60:
+            new = sorted(self.cpus_fn())
+            if self.cpus is not None and new != self.cpus:
+                self.prog.say(f"pool: CPUs {fmt_cpus(self.cpus)} -> {fmt_cpus(new)}")
+            self.cpus, self.cpus_t = new, time.monotonic()
+        return self.cpus
+
+    def _executor(self):
+        if self.ex is None:
+            self.ex = cf.ProcessPoolExecutor(max_workers=self.max_workers, mp_context=mp.get_context("spawn"),
+                                             initializer=p1_tasks.init_worker,
+                                             initargs=(self.density, str(self.grid_path) if self.grid_path else None))
+        return self.ex
+
+    def _kill_executor(self) -> None:
+        ex, self.ex = self.ex, None
+        if ex is None:
+            return
+        procs = list((getattr(ex, "_processes", None) or {}).values())
+        ex.shutdown(wait=False, cancel_futures=True)
+        for p in procs:
+            try:
+                p.terminate()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _dispatch(self) -> None:   # under self.cv
+        cpus = self._allowed()
+        slots = self.n_fixed or len(cpus)
+        while self.pending and len(self.running) < slots:
+            spec = {**self.pending.popleft(), "cpus": cpus}
+            self.running[self._executor().submit(p1_tasks.run_task, spec)] = (spec, time.monotonic())
+
+    def _failed(self, spec: dict, why: str) -> dict:
+        rec = {"key": spec.get("key"), "name": spec["name"], "kind": spec["kind"], "result": None, "error": why,
+               "seconds": 0.0, "pid": None, "finished_utc": utc()}
+        path = p1_tasks.stats_path(spec["dir"], spec["name"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        p1_tasks.atomic_json(path, rec)
+        return rec
+
+    def _loop(self) -> None:
+        while True:
+            with self.cv:
+                if self.stop:
+                    return
+                try:
+                    self._dispatch()
+                except Exception as e:  # noqa: BLE001  e.g. no process could start: the main thread raises it
+                    self.error = e
+                    self.cv.notify_all()
+                    return
+                futs = list(self.running)
+                if not futs:
+                    self.cv.wait(timeout=1.0)
+                    continue
+            done, _ = cf.wait(futs, timeout=1.0, return_when=cf.FIRST_COMPLETED)
+            if not done:
+                continue
+            with self.cv:
+                broken = []
+                for fut in done:
+                    spec, t0 = self.running.pop(fut)
+                    try:
+                        rec = fut.result()
+                    except BrokenProcessPool:
+                        broken.append(spec)
+                        continue
+                    except BaseException as e:  # noqa: BLE001  a bug in a statistic (p1_tasks.CODE_ERRORS): stop
+                        self.error = RuntimeError(f"CPU task {spec['name']} of {spec.get('key')} failed: "
+                                                  f"{type(e).__name__}: {e}")
+                        self.error.__cause__ = e
+                        self.cv.notify_all()
+                        return
+                    rec["key"] = spec.get("key")
+                    self.finished.append(rec)
+                    self.n_done += 1
+                    self.cpu_seconds += rec.get("seconds") or 0.0
+                    self.prog.record(spec.get("key", ""), spec["name"], "pool", rec.get("seconds") or 0.0)
+                    err = f"  ERROR {rec['error']}" if rec.get("error") else ""
+                    self.prog.say(f"pool: {self.labels.get(spec.get('key'), spec.get('key'))} {spec['name']} "
+                                  f"{rec.get('seconds', 0):.1f} s{err}  ({len(self.pending)} queued, "
+                                  f"{len(self.running)} running)")
+                if broken:   # every running task fails with the pool: start a new pool, run them again
+                    broken += [sp for sp, _ in self.running.values()]
+                    self.running.clear()
+                    self._kill_executor()
+                    for spec in broken:
+                        self.tries[(spec.get("key"), spec["name"])] += 1
+                        if self.tries[(spec.get("key"), spec["name"])] > 2:
+                            self.finished.append(self._failed(spec, "a pool process died three times running it "
+                                                                    "(killed, e.g. out of memory)"))
+                        else:
+                            self.pending.appendleft({k: v for k, v in spec.items() if k != "cpus"})
+                    self.prog.say(f"pool: a pool process died; restarted the pool, {len(broken)} task(s) again")
+                self.cv.notify_all()
+
+
+class Store:
+    """Per-checkpoint results: result.json in each checkpoint's folder once its CPU tasks are done (the saved state
+    a restart resumes from), and the CSVs rewritten from them (checkpoints.csv and h71_summary.csv after every
+    checkpoint, the per-layer and per-B CSVs at most every 10 minutes and at the end)."""
+
+    LAYER_EVERY = 600.0
+
+    def __init__(self, out_dir: Path, prog: Progress, run, keep_samples: bool):
+        self.out_dir, self.prog, self.run, self.keep = Path(out_dir), prog, run, keep_samples
+        self.order: list[str] = []
+        self.cks: dict = {}
+        self.records: dict = {}
+        self.left: dict = {}
+        self.results: dict = {}
+        self.layers_t = time.monotonic()
+        self.n_complete_here = 0
+
+    def register(self, c: dict) -> None:
+        if c["key"] not in self.cks:
+            self.order.append(c["key"])
+        self.cks[c["key"]] = c
+
+    def load_result(self, c: dict) -> dict:
+        res = json.loads((c["dir"] / "result.json").read_text())
+        self.results[c["key"]] = res
+        return res
+
+    def pending(self, c: dict, record: dict, pool) -> None:
+        key, d = c["key"], c["dir"]
+        self.records[key] = record
+        left = [t for t in record["tasks"] if not p1_tasks.stats_path(d, t["name"]).exists()]
+        self.left[key] = {t["name"] for t in left}
+        for t in left:
+            pool.submit({**t, "dir": str(d), "key": key})
+        if not left:
+            self.complete(key)
+
+    def task_done(self, rec: dict) -> None:
+        key = rec.get("key")
+        if key not in self.left:
+            return
+        self.left[key].discard(rec["name"])
+        if not self.left[key]:
+            self.complete(key)
+
+    def complete(self, key: str) -> None:
+        c, record = self.cks[key], self.records.pop(key)
+        self.left.pop(key, None)
+        d = c["dir"]
+        stats = {}
+        for t in record["tasks"]:
+            p = p1_tasks.stats_path(d, t["name"])
+            stats[t["name"]] = json.loads(p.read_text()) if p.exists() else {"error": "no result"}
+        res = p1_tasks.assemble(record, stats, self.h71_kw)
+        for name, e in res["errors"].items():
+            self.run.note(f"{c['label']}: {name} failed: {e}")
+        p1_tasks.atomic_json(d / "result.json", res)
+        self.results[key] = res
+        self.n_complete_here += 1
+        if not self.keep:
+            for f in ("act.npz", "dh.npy"):          # the large samples; grad, h71, htok and esd ones stay
+                (d / "samples" / f).unlink(missing_ok=True)
+        self.write()
+        done = sum(k in self.results for k in self.order)
+        self.prog.say(f"complete: {c['label']} ({done} of {len(self.order)} checkpoints so far)")
+
+    h71_kw: dict = {}
+
+    def rows(self, part: str = "row") -> list[dict]:
+        out = []
+        for k in self.order:
+            r = self.results.get(k)
+            if r is not None:
+                out += [r[part]] if part == "row" else r[part]
+        return out
+
+    def write(self, final: bool = False) -> None:
+        def w(name, rows):
+            tmp = self.out_dir / f".{name}.tmp"
+            runtime.write_csv(tmp, rows)
+            os.replace(tmp, self.out_dir / name)
+        w("checkpoints.csv", self.rows())
+        w("h71_summary.csv", self.rows("h71_summ"))
+        if final or time.monotonic() - self.layers_t > self.LAYER_EVERY:
+            self.layers_t = time.monotonic()
+            w("esd_layers.csv", self.rows("esd_rows"))
+            w("activations_layers.csv", self.rows("act_rows"))
+            w("h71_per_B.csv", self.rows("h71_rows"))
+
+
+def fingerprint(cfg, seed, skip, density, boot_chunk) -> dict:
+    """What a resumed checkpoint must share with this run: the P1 config, seed, skipped parts and stable density."""
+    blob = json.dumps(runtime.to_jsonable(cfg), sort_keys=True, default=str)
+    return {"format": 1, "config_sha256": hashlib.sha256(blob.encode()).hexdigest(), "seed": int(seed),
+            "skip": sorted(skip), "stable_density": density, "h71_boot_chunk": int(boot_chunk)}
+
+
+def check_fingerprint(root: Path, fp: dict) -> None:
+    path = root / "fingerprint.json"
+    if path.exists():
+        old = json.loads(path.read_text())
+        diff = [k for k in fp if old.get(k) != fp[k]]
+        if diff:
+            raise SystemExit(f"{root} holds checkpoints measured with other settings ({', '.join(diff)} differ). "
+                             f"Use another --out, or move {root} away to measure every checkpoint again.")
+        return
+    root.mkdir(parents=True, exist_ok=True)
+    p1_tasks.atomic_json(path, fp)
+
+
+def ck_key(tag: str, repo: str, rev: str) -> str:
+    return f"{tag}/{repo.replace('/', '__')}@{rev}"
+
+
 def main():
     ap = runtime.base_parser(__doc__)
     ap.add_argument("--suite", default=None, help="comma-separated suites from config.py (default: every suite "
@@ -329,6 +709,18 @@ def main():
                                                "grad,esd,act,dh,htok,h71,scaling,spike,coupling")
     ap.add_argument("--jvp-batch", type=int, default=None,
                     help="sequences per JVP micro-batch (default: the suite's jvp_batch in config.py, else 32)")
+    ap.add_argument("--workers", type=int, default=int(os.environ.get("P1_WORKERS", "0")),
+                    help="processes for the CPU statistics (default: one per CPU this job may use, see --cpus-after)")
+    ap.add_argument("--cpus-after", default=os.environ.get("P1_CPUS_AFTER") or None,
+                    help="JOB=CPUS: once logs/progress.txt shows JOB ended, the statistics use CPUS ('all' or e.g. "
+                         "'0-10'; default from P1_CPUS_AFTER). A file logs/p1_cpus (e.g. '0-10') overrides both")
+    ap.add_argument("--stable-density", choices=["grid", "fft"], default="grid",
+                    help="stable density for the fits: grid (precomputed, about 17x faster; common/stable.py) or "
+                         "fft (a new FFT table per evaluation, as before 2026-11-16)")
+    ap.add_argument("--h71-boot-chunk", type=int, default=25,
+                    help="bootstrap replicates of one H7.1 test per pool task")
+    ap.add_argument("--keep-samples", action="store_true",
+                    help="keep every saved sample (default: delete dh.npy and act.npz once their statistic is saved)")
     args = ap.parse_args()
     cfg = config.get("p1_checkpoints", args.smoke)
     _held, waited = gpu_lock(args)               # before CUDA starts: a waiting job holds no GPU memory; the lock
@@ -337,7 +729,6 @@ def main():
     if waited > 1:
         run.note(f"waited {waited / 3600:.2f} h for the P1 GPU lock (logs/.p1_gpu.lock); progress.txt's elapsed "
                  f"hours for this job include the wait")
-    rng = runtime.rng(run.seed)
     dev = run.device
     dtype = getattr(torch, cfg.get("dtype", "float32"))
     skip = set(filter(None, args.skip.split(",")))
@@ -349,119 +740,10 @@ def main():
         raise SystemExit(f"unknown suite(s) {unknown}; config.py has {list(cfg['suites'])}")
     h71cfg = cfg["h71"]
     sc = cfg.get("spike_check") or {}
-    h71_Bs = h71cfg.get("batch_sizes", cfg["batch_sizes_h71"])
-    stages = h71cfg.get("stages", cfg["stages"])
-
-    rows, esd_rows, act_rows, h71_rows, h71_summ, scale_rows = [], [], [], [], [], []
+    h71_Bs = [int(b) for b in h71cfg.get("batch_sizes", cfg["batch_sizes_h71"])]
+    n_boot_h71 = int(h71cfg.get("n_boot", config.H71["n_boot"]))
     data_cache: dict = {}
-
-    def read_checkpoint(suite, size, seed, repo, variant, step, rev, final, skip_here, tag):
-        """Load one checkpoint, measure everything not in skip_here, append and return its row."""
-        model, tok, src = hf.load_causal_lm(repo, rev, run, dtype=dtype, device=dev)
-        # micro-batches: sequences per no-grad forward (losses, hidden states) and per JVP; olmo7b sets smaller
-        # ones so that 27 GiB of float32 weights plus activations stay well under the L40S's 44 GiB
-        eb = int(cfg["suites"][suite].get("eval_batch", 4))
-        jb = int(args.jvp_batch or cfg["suites"][suite].get("jvp_batch", 32))
-        pin = (hf.PINS.entry(repo, rev) or {}) if src == "hub" else {}
-        key = type(tok).__name__ + str(getattr(tok, "name_or_path", ""))
-        if key not in data_cache:  # same examples for every checkpoint of a tokenizer
-            need_pool = cfg["coupling_blocks"] * cfg["coupling_B"]
-            n_h71 = h71cfg.get("n_blocks", config.H71["n_blocks"]) * max(h71_Bs)
-            n_pool = max(need_pool, n_h71 if h71cfg["full_res_sizes"] else 0)
-            pool_texts, _ = hf.load_texts(cfg["pool_dataset"], n=max(64, n_pool * cfg["example_len"] // 400 + 64),
-                                          run=run, seed=run.seed)
-            pool = hf.tokenize_stream(pool_texts, tok, cfg["example_len"], n_pool)
-            ev_texts, _ = hf.load_texts(cfg["eval_dataset"], n=max(16, cfg["eval_seqs"] * cfg["eval_len"] // 400 + 16),
-                                        run=run, seed=run.seed + 1)
-            probe = hf.tokenize_stream(ev_texts, tok, cfg["probe_len"], cfg["probe_seqs"])
-            evals = hf.tokenize_stream(ev_texts, tok, cfg["eval_len"], cfg["eval_seqs"])
-            sur = hf.tokenize_stream(ev_texts[::-1], tok, cfg["surprisal_len"], cfg["surprisal_docs"])
-            data_cache[key] = (pool, probe, evals, sur)
-        pool, probe, evals, sur = data_cache[key]
-        vocab = model.get_output_embeddings().weight.shape[0]
-        pool_v, probe_v, evals_v, sur_v = (t.clamp(max=vocab - 1) for t in (pool, probe, evals, sur))
-        row = {"suite": suite, "variant": variant, "size": size, "seed": seed, "repo": repo, "step": step,
-               "revision": rev, "commit": pin.get("commit"), "commit_date": pin.get("commit_date"),
-               "name_switch_check": name_switch_flag(cfg, repo, pin.get("commit_date")) if src == "hub" else "",
-               "source": src, "pass": tag,
-               "loss_spike_seed": bool(suite == sc.get("suite") and size == sc.get("size")
-                                       and seed in sc.get("flagged_seeds", [])),
-               "n_params": sum(p.numel() for p in model.parameters()),
-               "n_nonembed": lm.non_embedding_params(model)}
-        if src == "hub":
-            row.update(content_check(cfg, repo, rev, hf.PINS, hf.hub_lfs))
-        for col in ("dedup_check", "name_switch_check"):
-            if str(row.get(col, "")).startswith("CHECK"):
-                run.note(f"{repo}@{rev} ({row['commit']}): {col} {row[col]}")
-        frac = step / final if final else 1.0
-        row["probe_loss"] = float(lm.token_losses(model, probe_v, dev, batch=eb).mean())   # locates loss spikes
-
-        if "esd" not in skip_here:
-            a_esd, lrows = spectra.model_alpha_esd(model, rng=rng)
-            row["alpha_esd"] = a_esd
-            esd_rows.extend({**r, "repo": repo, "step": step} for r in lrows)
-        if "act" not in skip_here or "dh" not in skip_here:
-            hs = lm.hidden_states(model, probe_v, dev, batch=eb)
-            if "act" not in skip_here:
-                ks = []
-                for li, H in enumerate(hs):
-                    st = spectra.activation_stats(H)
-                    act_rows.append({**st, "layer": li, "repo": repo, "step": step})
-                    ks.append(st)
-                row["K"] = float(np.median([s["K"] for s in ks]))
-                row["K_max"] = float(np.max([s["K"] for s in ks]))
-                row["Kurt0"] = float(np.median([s["Kurt0"] for s in ks]))
-                row["n_outlier_channels"] = int(np.sum([s["n_outlier_channels"] for s in ks]))
-                row["act_zeta"] = float(np.nanmedian([s.get("act_zeta", np.nan) for s in ks]))
-            if "dh" not in skip_here:
-                X = hs[-1].numpy()
-                if len(X) > cfg["dh_points"]:
-                    X = X[rng.choice(len(X), cfg["dh_points"], replace=False)]
-                d = multifractal.delta_h_rep(X, S["q_lo"], S["q_hi"], rng=rng,
-                                             n_centres=min(5000, len(X)))
-                row.update({"dh_rep": d["delta_h_rep"], "dh_scope": d["scope"], "dh_D2": d["D2"],
-                            "dh_clause_ok": d["clause_ok"], "dh_decades": d["decades_r"]})
-            del hs
-        if "htok" not in skip_here:
-            series = lm.token_losses(model, sur_v, dev, batch=eb).reshape(-1).numpy()
-            m = hurst.memory_claim(series, n_surr=S["n_surr"], rng=rng, wavelet_j1=S["wavelet_j1"])
-            row.update({f"Htok_{k}": v for k, v in m.items()})
-            row["H_dep"] = m["H_dep_dfa"]  # exploratory stand-in in the coupling matrix
-        if "grad" not in skip_here:
-            B = cfg["coupling_B"]
-            n = cfg["coupling_blocks"] * B
-            params, dirs = directions(model, pool_v[:cfg["hessian_batch"]], dev, cfg["n_random_dirs"], 0, run.seed)
-            P = jvp_projections(model, pool_v[:n], params, [d for _, _, d in dirs], dev, jb)
-            q = noise_quantities(P[:, 0], B, cfg["coupling_blocks"], T, rng)
-            row.update(q)
-        # H7.1 at the four training stages
-        h71_size = size in h71cfg["full_res_sizes"] or size in h71cfg["coarse_sizes"]
-        stage_hit = any(abs(frac - st) < 0.02 or (st >= 0.999 and step == final) for st in stages)
-        if "h71" not in skip_here and h71_size and stage_hit and suite == "pythia":
-            nb = h71cfg.get("n_blocks", config.H71["n_blocks"]) if size in h71cfg["full_res_sizes"] else h71cfg["coarse_blocks"]
-            n_pool = nb * max(h71_Bs)
-            params, dirs = directions(model, pool_v[:cfg["hessian_batch"]], dev,
-                                      cfg["n_random_dirs"], cfg["n_hessian_dirs"], run.seed)
-            P = jvp_projections(model, pool_v[:n_pool], params, [d for _, _, d in dirs], dev, jb)
-            for j, (kind, i, _) in enumerate(dirs):
-                res = batchmod.h71_test(P[:, j], h71_Bs, nb, n_boot=h71cfg.get("n_boot", config.H71["n_boot"]),
-                                        rng=rng)
-                meta = {"repo": repo, "commit": row["commit"], "size": size, "step": step, "stage": round(frac, 3),
-                        "direction": f"{kind}{i}"}
-                h71_rows.extend({**meta, **r} for r in res["per_B"])
-                h71_summ.append({**meta, **res["summary"]})
-        if step == final and "scaling" not in skip_here:
-            row["eval_loss"] = float(lm.token_losses(model, evals_v, dev, batch=eb).mean())
-        rows.append(row)
-        run.note(f"{repo}@{rev} [{tag}]: done")
-        del model
-        if dev.startswith("cuda"):
-            torch.cuda.empty_cache()
-        if src == "hub" and not (args.keep_cache or run.smoke):   # smoke re-reads small checkpoints: keep them
-            hf.purge_revision(repo, pin.get("commit"), run)   # disk holds about one checkpoint at a time
-        reads[tag] = reads.get(tag, 0) + 1
-        return row
-
+    counts = collections.Counter()
 
     def available(suite, repo):
         """step -> branch of one repo (offline stand-in: the configured steps plus the spike scan grid)."""
@@ -479,9 +761,9 @@ def main():
                 run.note(f"PIN FAILED {repo}@{rev}: {type(e).__name__}: {str(e)[:160]}")
 
     pinned: dict = {"grid": [], "spike_a": []}
-    reads: dict = {}
 
-    # ---- main grid
+    # ---- the main grid, planned first (so that progress lines can count)
+    plan = []
     if not args.spike_only:
         for suite in suites:
             for size, seed, repo, variant in suite_models(cfg, suite):
@@ -493,28 +775,247 @@ def main():
                 if args.pin_only:
                     pin_all(repo, [rev for _, rev in chosen], "grid")
                     continue
+                stages = h71_stages(cfg, suite, size, steps_avail)
                 for step, rev in chosen:
-                    read_checkpoint(suite, size, seed, repo, variant, step, rev, final, skip, "grid")
+                    plan.append(dict(suite=suite, size=size, seed=seed, repo=repo, variant=variant, step=step, rev=rev,
+                                     final=final, skip=skip, tag="grid", stage=stages.get(step)))
 
-    # ---- loss-spike check, pass (a): probe loss at every scan step, flagged seeds and the stable reference
-    spike_rows, windows = [], []
     do_spike = bool(sc) and "spike" not in skip and sc["suite"] in suites and (
         not args.sizes or sc["size"] in args.sizes.split(","))
-    if do_spike:
-        variant = cfg["suites"][sc["suite"]].get("variant", "base")
-        repo_of = {seed: repo for size, seed, repo, _ in suite_models(cfg, sc["suite"]) if size == sc["size"]}
-        skip_a = skip | {"esd", "act", "dh", "htok", "grad", "h71", "scaling"}
-        for seed in list(sc["flagged_seeds"]) + list(sc["reference_seeds"]):
-            repo = repo_of[seed]
-            avail = available(sc["suite"], repo)
-            steps = scan_steps(avail, sc)
-            if args.pin_only:
-                pin_all(repo, [avail[st] for st in steps], "spike_a")
-                continue
-            for st in steps:
-                read_checkpoint(sc["suite"], sc["size"], seed, repo, variant, st, avail[st], max(avail), skip_a, "spike_a")
-        if not args.pin_only:
-            df_a = pd.DataFrame([r for r in rows if r["pass"] == "spike_a"])
+    if args.pin_only:
+        if do_spike:
+            repo_of = {seed: repo for size, seed, repo, _ in suite_models(cfg, sc["suite"]) if size == sc["size"]}
+            for seed in list(sc["flagged_seeds"]) + list(sc["reference_seeds"]):
+                avail = available(sc["suite"], repo_of[seed])
+                pin_all(repo_of[seed], [avail[st] for st in scan_steps(avail, sc)], "spike_a")
+        pin_only_report(cfg, run, pinned)
+        return
+
+    # ---- statistics pool, results store, resume
+    density = args.stable_density
+    grid_path = None
+    if density == "grid":
+        t0 = time.perf_counter()
+        stable.set_density("grid")
+        grid_path = stable._GRID.path
+        if time.perf_counter() - t0 > 2:
+            run.note(f"built the stable density grid in {time.perf_counter() - t0:.0f} s: {grid_path}")
+    prog = Progress(run.out_dir)
+    ck_root = run.out_dir / "checkpoints"
+    boot_chunk = max(1, int(args.h71_boot_chunk))
+    check_fingerprint(ck_root, fingerprint(cfg, run.seed, skip, density, boot_chunk))
+    start_cpus = os.sched_getaffinity(0) if hasattr(os, "sched_getaffinity") else set(range(os.cpu_count() or 1))
+    cpus_now = cpu_rule(args.cpus_after, start_cpus)
+    torch.set_num_threads(torch.get_num_threads())        # keep this process's thread pools as they are, then
+    for v in p1_tasks.THREAD_VARS:                         # one thread per library in the pool processes
+        os.environ[v] = "1"
+    labels: dict = {}
+    pool = StatPool(cpus_now, max(0, args.workers), density, grid_path, prog, labels)
+    store = Store(run.out_dir, prog, run, args.keep_samples)
+    store.h71_kw = {"level": config.H71["level"], "inv_tol": config.H71["inv_tol"],
+                    "drift_tol": config.H71["drift_tol"]}
+    run.note(f"CPU statistics: {density} stable density; pool of {args.workers or 'one per CPU'} process(es) on "
+             f"CPUs {fmt_cpus(cpus_now())}" + (f", then {args.cpus_after} once that job has ended"
+                                               if args.cpus_after else ""))
+
+    def on_signal(signum, frame):
+        raise SystemExit(128 + signum)
+    signal.signal(signal.SIGTERM, on_signal)
+
+    def task(c, name, kind, params, seed_parts=()):
+        return {"name": name, "kind": kind, "params": params,
+                "seed": p1_tasks.seed_for(run.seed, c["key"], name, *seed_parts)}
+
+    def gpu_pass(c) -> dict:
+        """Load one checkpoint, run every GPU measurement not in its skip set, save the samples the CPU statistics
+        need and write row.json (last, so that a folder without it is a pass that did not finish)."""
+        d, label, skip_here = c["dir"], c["label"], c["skip"]
+        if d.exists():
+            shutil.rmtree(d)                     # an earlier pass that did not finish: measure again
+        sd = d / "samples"
+        sd.mkdir(parents=True)
+        t_ck = time.perf_counter()
+        parts: dict = {}
+
+        @contextlib.contextmanager
+        def timed(what):
+            t = time.perf_counter()
+            yield
+            sec = time.perf_counter() - t
+            parts[what] = sec
+            prog.record(c["key"], what, "gpu", sec)
+            prog.say(f"{label}: {what} {sec:.1f} s ({time.perf_counter() - t_ck:.0f} s into the checkpoint)")
+
+        suite, size, seed, repo, variant, step, rev, final, tag = (c[k] for k in (
+            "suite", "size", "seed", "repo", "variant", "step", "rev", "final", "tag"))
+        with timed("load"):
+            model, tok, src = hf.load_causal_lm(repo, rev, run, dtype=dtype, device=dev)
+        # micro-batches: sequences per no-grad forward (losses, hidden states) and per JVP; olmo7b sets smaller
+        # ones so that 27 GiB of float32 weights plus activations stay well under the L40S's 44 GiB
+        eb = int(cfg["suites"][suite].get("eval_batch", 4))
+        jb = int(args.jvp_batch or cfg["suites"][suite].get("jvp_batch", 32))
+        pin = (hf.PINS.entry(repo, rev) or {}) if src == "hub" else {}
+        key = type(tok).__name__ + str(getattr(tok, "name_or_path", ""))
+        if key not in data_cache:  # same examples for every checkpoint of a tokenizer
+            with timed("data (first checkpoint of this tokenizer)"):
+                need_pool = cfg["coupling_blocks"] * cfg["coupling_B"]
+                n_h71 = h71cfg.get("n_blocks", config.H71["n_blocks"]) * max(h71_Bs)
+                n_pool = max(need_pool, n_h71 if h71cfg["full_res_sizes"] else 0)
+                pool_texts, _ = hf.load_texts(cfg["pool_dataset"], n=max(64, n_pool * cfg["example_len"] // 400 + 64),
+                                              run=run, seed=run.seed)
+                pool_ids = hf.tokenize_stream(pool_texts, tok, cfg["example_len"], n_pool)
+                ev_texts, _ = hf.load_texts(cfg["eval_dataset"], n=max(16, cfg["eval_seqs"] * cfg["eval_len"] // 400 + 16),
+                                            run=run, seed=run.seed + 1)
+                probe = hf.tokenize_stream(ev_texts, tok, cfg["probe_len"], cfg["probe_seqs"])
+                evals = hf.tokenize_stream(ev_texts, tok, cfg["eval_len"], cfg["eval_seqs"])
+                sur = hf.tokenize_stream(ev_texts[::-1], tok, cfg["surprisal_len"], cfg["surprisal_docs"])
+                data_cache[key] = (pool_ids, probe, evals, sur)
+        pool_ids, probe, evals, sur = data_cache[key]
+        vocab = model.get_output_embeddings().weight.shape[0]
+        pool_v, probe_v, evals_v, sur_v = (t.clamp(max=vocab - 1) for t in (pool_ids, probe, evals, sur))
+        ck_rng = p1_tasks.rng_for(p1_tasks.seed_for(run.seed, c["key"], "gpu pass"))
+        row = {"suite": suite, "variant": variant, "size": size, "seed": seed, "repo": repo, "step": step,
+               "revision": rev, "commit": pin.get("commit"), "commit_date": pin.get("commit_date"),
+               "name_switch_check": name_switch_flag(cfg, repo, pin.get("commit_date")) if src == "hub" else "",
+               "source": src, "pass": tag,
+               "loss_spike_seed": bool(suite == sc.get("suite") and size == sc.get("size")
+                                       and seed in sc.get("flagged_seeds", [])),
+               "n_params": sum(p.numel() for p in model.parameters()),
+               "n_nonembed": lm.non_embedding_params(model)}
+        if src == "hub":
+            row.update(content_check(cfg, repo, rev, hf.PINS, hf.hub_lfs))
+        for col in ("dedup_check", "name_switch_check"):
+            if str(row.get(col, "")).startswith("CHECK"):
+                run.note(f"{repo}@{rev} ({row['commit']}): {col} {row[col]}")
+        if c.get("window"):
+            row["spike_window"] = c["window"]
+        tasks: list = []
+        record = {"row": row, "tasks": tasks}
+        with timed("probe_loss"):
+            row["probe_loss"] = float(lm.token_losses(model, probe_v, dev, batch=eb).mean())   # locates loss spikes
+
+        if "esd" not in skip_here:
+            with timed("esd (SVD of every layer)"):
+                esds = spectra.layer_esds(model)
+                arrays = {f"ev_{i}": ev for i, (_, _, ev) in enumerate(esds)}
+                p1_tasks.atomic_npz(sd / "esd.npz", names=np.array([n for n, _, _ in esds]),
+                                    shapes=np.array([s for _, s, _ in esds]), **arrays)
+            tasks.append(task(c, "esd", "esd", {}))
+        if "act" not in skip_here or "dh" not in skip_here:
+            with timed("hidden states"):
+                hs = lm.hidden_states(model, probe_v, dev, batch=eb)
+            if "act" not in skip_here:
+                with timed("activation moments"):
+                    moments, subs = [], {}
+                    for li, H in enumerate(hs):
+                        Hd = H.to(dev)
+                        moments.append(spectra.activation_moments(Hd))
+                        sub = spectra.activation_tail_sample(Hd)
+                        if sub is not None:
+                            subs[f"sub_{li}"] = sub
+                        del Hd
+                    p1_tasks.atomic_npz(sd / "act.npz", **subs)
+                record["act_moments"] = moments
+                tasks.append(task(c, "act", "act", {"n_layers": len(hs)}))
+            if "dh" not in skip_here:
+                X = hs[-1].numpy()
+                if len(X) > cfg["dh_points"]:
+                    X = X[ck_rng.choice(len(X), cfg["dh_points"], replace=False)]
+                p1_tasks.atomic_npy(sd / "dh.npy", np.ascontiguousarray(X, dtype=np.float32))
+                tasks.append(task(c, "dh", "dh", {"q_lo": S["q_lo"], "q_hi": S["q_hi"]}))
+            del hs
+        if "htok" not in skip_here:
+            with timed("token losses (H_tok series)"):
+                series = lm.token_losses(model, sur_v, dev, batch=eb).reshape(-1).numpy()
+                p1_tasks.atomic_npy(sd / "htok.npy", series)
+            tasks.append(task(c, "htok", "htok", {"n_surr": S["n_surr"], "wavelet_j1": S["wavelet_j1"]}))
+        if "grad" not in skip_here:
+            with timed("gradient projections (JVP)"):
+                B = cfg["coupling_B"]
+                n = cfg["coupling_blocks"] * B
+                params, dirs = directions(model, pool_v[:cfg["hessian_batch"]], dev, cfg["n_random_dirs"], 0, run.seed)
+                P = jvp_projections(model, pool_v[:n], params, [d_ for _, _, d_ in dirs], dev, jb)
+                p1_tasks.atomic_npy(sd / "grad.npy", P)
+            tasks.append(task(c, "grad", "grad", {"B": B, "n_blocks": cfg["coupling_blocks"], "T": T}))
+        # H7.1 at the four training stages
+        if "h71" not in skip_here and c.get("stage") is not None:
+            nb = h71cfg.get("n_blocks", config.H71["n_blocks"]) if size in h71cfg["full_res_sizes"] else h71cfg["coarse_blocks"]
+            n_pool = nb * max(h71_Bs)
+            with timed(f"H7.1 projections ({n_pool} examples)"):
+                params, dirs = directions(model, pool_v[:cfg["hessian_batch"]], dev,
+                                          cfg["n_random_dirs"], cfg["n_hessian_dirs"], run.seed)
+                P = jvp_projections(model, pool_v[:n_pool], params, [d_ for _, _, d_ in dirs], dev, jb)
+                p1_tasks.atomic_npy(sd / "h71.npy", P)
+            names = [f"{kind}{i}" for kind, i, _ in dirs]
+            chunks = [min(boot_chunk, n_boot_h71 - s0) for s0 in range(0, n_boot_h71, boot_chunk)]
+            record["h71"] = {"directions": names, "stage": c["stage"], "frac": round(step / final if final else 1.0, 4),
+                             "nb": nb, "Bs": h71_Bs, "n_pool": int(len(P)), "n_boot": n_boot_h71,
+                             "n_chunks": len(chunks)}
+            for j, dname in enumerate(names):
+                tasks.append(task(c, f"h71_fit.{dname}", "h71_fit", {"j": j, "Bs": h71_Bs, "nb": nb}))
+                for ci, nbt in enumerate(chunks):
+                    tasks.append(task(c, f"h71_boot.{dname}.{ci}", "h71_boot",
+                                      {"j": j, "Bs": h71_Bs, "nb": nb, "n_boot": nbt}))
+        if step == final and "scaling" not in skip_here:
+            with timed("eval loss"):
+                row["eval_loss"] = float(lm.token_losses(model, evals_v, dev, batch=eb).mean())
+        del model
+        if dev.startswith("cuda"):
+            torch.cuda.empty_cache()
+        if src == "hub" and not (args.keep_cache or run.smoke):   # smoke re-reads small checkpoints: keep them
+            hf.purge_revision(repo, pin.get("commit"), run)   # disk holds about one checkpoint at a time
+        row["gpu_pass_seconds"] = round(time.perf_counter() - t_ck, 1)
+        p1_tasks.atomic_json(d / "row.json", record)
+        counts[f"read_{tag}"] += 1
+        run.note(f"{label}: GPU pass {row['gpu_pass_seconds']:.0f} s ("
+                 + ", ".join(f"{k} {v:.0f}" for k, v in parts.items()) + f"); {len(tasks)} CPU tasks queued")
+        return record
+
+    def process(c) -> None:
+        c["key"] = ck_key(c["tag"], c["repo"], c["rev"])
+        c["dir"] = ck_root / c["key"]
+        c["label"] = f"{c['repo']}@{c['rev']} [{c['tag']}]" + (f" {c['i']}/{c['n']}" if "n" in c else "")
+        labels[c["key"]] = f"{c['repo'].split('/')[-1]}@{c['rev']} [{c['tag']}]"
+        store.register(c)
+        for rec in pool.collect():
+            store.task_done(rec)
+        if (c["dir"] / "result.json").exists():
+            store.load_result(c)
+            counts["resumed_complete"] += 1
+            prog.say(f"{c['label']}: complete in an earlier run (result.json)")
+            return
+        rj = c["dir"] / "row.json"
+        if rj.exists():
+            record = json.loads(rj.read_text())
+            counts["resumed_gpu_pass"] += 1
+            left = sum(not p1_tasks.stats_path(c["dir"], t["name"]).exists() for t in record["tasks"])
+            prog.say(f"{c['label']}: GPU pass done in an earlier run; {left} of {len(record['tasks'])} CPU tasks to run")
+        else:
+            record = gpu_pass(c)
+        store.pending(c, record, pool)
+
+    spike_rows, windows = [], []
+    try:
+        for i, c in enumerate(plan, 1):
+            c.update(i=i, n=len(plan))
+            process(c)
+
+        # ---- loss-spike check, pass (a): probe loss at every scan step, flagged seeds and the stable reference
+        if do_spike:
+            variant = cfg["suites"][sc["suite"]].get("variant", "base")
+            repo_of = {seed: repo for size, seed, repo, _ in suite_models(cfg, sc["suite"]) if size == sc["size"]}
+            skip_a = skip | {"esd", "act", "dh", "htok", "grad", "h71", "scaling"}
+            plan_a = []
+            for seed in list(sc["flagged_seeds"]) + list(sc["reference_seeds"]):
+                repo = repo_of[seed]
+                avail = available(sc["suite"], repo)
+                plan_a += [dict(suite=sc["suite"], size=sc["size"], seed=seed, repo=repo, variant=variant, step=st,
+                                rev=avail[st], final=max(avail), skip=skip_a, tag="spike_a")
+                           for st in scan_steps(avail, sc)]
+            for i, c in enumerate(plan_a, 1):
+                c.update(i=i, n=len(plan_a))
+                process(c)
+            df_a = pd.DataFrame([r for r in store.rows() if r["pass"] == "spike_a"])
             a_out = loss_jumps(df_a, sc)
             spike_rows += a_out
             jumps = [(r["step_from"], r["step_to"]) for r in a_out if r["jump"]]
@@ -526,68 +1027,83 @@ def main():
 
             # ---- pass (b): alpha, alpha_ESD and K for every seed of that size around each jump
             skip_b = skip | {"dh", "htok", "h71", "scaling"}
+            plan_b = []
             for seed, repo in repo_of.items():
                 avail = available(sc["suite"], repo)
                 for lo, hi, js in windows:
-                    for st in [x for x in scan_steps(avail, sc) if lo <= x <= hi]:
-                        row = read_checkpoint(sc["suite"], sc["size"], seed, repo, variant, st, avail[st], max(avail),
-                                              skip_b, "spike_b")
-                        row["spike_window"] = f"{lo}-{hi}"
-            df_b = pd.DataFrame([r for r in rows if r["pass"] == "spike_b"])
-            for lo, hi, js in windows:
-                w = df_b[df_b.spike_window == f"{lo}-{hi}"] if len(df_b) else df_b
-                if not len(w):
-                    continue
-                for r in spike_check(w, sc):
-                    spike_rows.append({"pass": "b", "window": f"{lo}-{hi}",
-                                       "loss_jump_steps": ";".join(f"{a}-{b}" for a, b in js), **r})
+                    plan_b += [dict(suite=sc["suite"], size=sc["size"], seed=seed, repo=repo, variant=variant, step=st,
+                                    rev=avail[st], final=max(avail), skip=skip_b, tag="spike_b", window=f"{lo}-{hi}")
+                               for st in scan_steps(avail, sc) if lo <= st <= hi]
+            for i, c in enumerate(plan_b, 1):
+                c.update(i=i, n=len(plan_b))
+                process(c)
 
-    extra = {}
-    if args.pin_only:
-        failed = [m for m in run.notes if m.startswith("PIN FAILED")]
-        # name switch: content check (cached in pins.json) and date check for every pinned pythia-14m/31m name
-        ns_rows = []
-        for k in dict.fromkeys(k for keys in pinned.values() for k in keys):
-            repo, rev = k.rsplit("@", 1)
-            if repo not in (cfg.get("name_switch") or {}).get("repos", []):
+        prog.say(f"GPU passes finished; waiting for {pool.busy()} CPU tasks")
+        pool.wait_all(store.task_done)
+    finally:
+        pool.shutdown()
+    store.write(final=True)
+    rows = store.rows()
+
+    extra = {"stable_density": density, "cpu_tasks_run": pool.n_done,
+             "cpu_task_hours": round(pool.cpu_seconds / 3600, 3), **{k: v for k, v in counts.items()}}
+    if do_spike:
+        df_b = pd.DataFrame([r for r in rows if r["pass"] == "spike_b"])
+        for lo, hi, js in windows:
+            w = df_b[df_b.spike_window == f"{lo}-{hi}"] if len(df_b) else df_b
+            if not len(w):
                 continue
-            entry = hf.PINS.data.get(k) or {}
-            r = {"repo": repo, "revision": rev, "commit": entry.get("commit"), "commit_date": entry.get("commit_date"),
-                 "name_switch_check": name_switch_flag(cfg, repo, entry.get("commit_date")),
-                 **content_check(cfg, repo, rev, hf.PINS, hf.hub_lfs)}
-            ns_rows.append(r)
-            for col in ("dedup_check", "name_switch_check"):
-                if str(r.get(col, "")).startswith("CHECK"):
-                    run.note(f"{k} ({r['commit']}): {col} {r[col]}")
-        if ns_rows:
-            runtime.write_csv(run.out_dir / "name_switch_check.csv", ns_rows)
-            def verdict(v):  # CHECK / differs / unknown / after switch
-                v = str(v)
-                return "differs" if v.startswith("differs") else v.split(":")[0]
-            extra["name_switch"] = {col: pd.Series([verdict(r.get(col, "")) for r in ns_rows]).value_counts().to_dict()
-                                    for col in ("dedup_check", "name_switch_check")}
-            run.note(f"name switch, {len(ns_rows)} pinned names: content {extra['name_switch']['dedup_check']}, "
-                     f"date {extra['name_switch']['name_switch_check']}")
-        extra["pins_resolved"] = len(run.pins)
-        extra["download"] = {}
-        for tag, keys in pinned.items():
-            sizes = [(hf.PINS.data.get(k) or {}).get("weights_bytes") for k in dict.fromkeys(keys)]
-            known = [b for b in sizes if b]
-            extra["download"][tag] = {"checkpoints": len(sizes), "with_size": len(known),
-                                      "GB": round(sum(known) / 1e9, 1)}
-            run.note(f"download for {tag}: {len(sizes)} checkpoints, {sum(known) / 1e9:.1f} GB "
-                     f"({len(known)} with a known size)")
-        runtime.finish_run(run, extra=extra)
-        if failed:
-            raise SystemExit(f"{len(failed)} name(s) could not be pinned; see run.json notes")
-        return
+            for r in spike_check(w, sc):
+                spike_rows.append({"pass": "b", "window": f"{lo}-{hi}",
+                                   "loss_jump_steps": ";".join(f"{a}-{b}" for a, b in js), **r})
+    analyse(cfg, run, rows, skip, do_spike, sc, spike_rows, windows, extra)
 
+
+def pin_only_report(cfg, run, pinned) -> None:
+    extra = {}
+    failed = [m for m in run.notes if m.startswith("PIN FAILED")]
+    # name switch: content check (cached in pins.json) and date check for every pinned pythia-14m/31m name
+    ns_rows = []
+    for k in dict.fromkeys(k for keys in pinned.values() for k in keys):
+        repo, rev = k.rsplit("@", 1)
+        if repo not in (cfg.get("name_switch") or {}).get("repos", []):
+            continue
+        entry = hf.PINS.data.get(k) or {}
+        r = {"repo": repo, "revision": rev, "commit": entry.get("commit"), "commit_date": entry.get("commit_date"),
+             "name_switch_check": name_switch_flag(cfg, repo, entry.get("commit_date")),
+             **content_check(cfg, repo, rev, hf.PINS, hf.hub_lfs)}
+        ns_rows.append(r)
+        for col in ("dedup_check", "name_switch_check"):
+            if str(r.get(col, "")).startswith("CHECK"):
+                run.note(f"{k} ({r['commit']}): {col} {r[col]}")
+    if ns_rows:
+        runtime.write_csv(run.out_dir / "name_switch_check.csv", ns_rows)
+        def verdict(v):  # CHECK / differs / unknown / after switch
+            v = str(v)
+            return "differs" if v.startswith("differs") else v.split(":")[0]
+        extra["name_switch"] = {col: pd.Series([verdict(r.get(col, "")) for r in ns_rows]).value_counts().to_dict()
+                                for col in ("dedup_check", "name_switch_check")}
+        run.note(f"name switch, {len(ns_rows)} pinned names: content {extra['name_switch']['dedup_check']}, "
+                 f"date {extra['name_switch']['name_switch_check']}")
+    extra["pins_resolved"] = len(run.pins)
+    extra["download"] = {}
+    for tag, keys in pinned.items():
+        sizes = [(hf.PINS.data.get(k) or {}).get("weights_bytes") for k in dict.fromkeys(keys)]
+        known = [b for b in sizes if b]
+        extra["download"][tag] = {"checkpoints": len(sizes), "with_size": len(known),
+                                  "GB": round(sum(known) / 1e9, 1)}
+        run.note(f"download for {tag}: {len(sizes)} checkpoints, {sum(known) / 1e9:.1f} GB "
+                 f"({len(known)} with a known size)")
+    runtime.finish_run(run, extra=extra)
+    if failed:
+        raise SystemExit(f"{len(failed)} name(s) could not be pinned; see run.json notes")
+
+
+def analyse(cfg, run, rows, skip, do_spike, sc, spike_rows, windows, extra) -> None:
+    """Scaling fits, seed variance, the spike check and the coupling matrix from the checkpoints' rows."""
+    rng = p1_tasks.rng_for(p1_tasks.seed_for(run.seed, "analysis"))
+    scale_rows = []
     df = pd.DataFrame(rows)
-    runtime.write_csv(run.out_dir / "checkpoints.csv", rows)
-    runtime.write_csv(run.out_dir / "esd_layers.csv", esd_rows)
-    runtime.write_csv(run.out_dir / "activations_layers.csv", act_rows)
-    runtime.write_csv(run.out_dir / "h71_per_B.csv", h71_rows)
-    runtime.write_csv(run.out_dir / "h71_summary.csv", h71_summ)
     if not len(df):
         extra["n_checkpoints"] = 0
         runtime.finish_run(run, extra=extra)
@@ -639,7 +1155,6 @@ def main():
         else:
             run.note("coupling matrix skipped: needs >= 3 seeds in one (suite, size) cell and >= 2 quantities")
     extra["n_checkpoints"] = len(rows)
-    extra["checkpoints_read"] = reads
     runtime.finish_run(run, extra=extra)
 
 

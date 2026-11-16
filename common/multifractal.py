@@ -64,7 +64,10 @@ def choose_radii(X: np.ndarray, n_radii: int = 32, p_lo: float | None = None, p_
     i = rng.integers(0, n, n_pairs)
     j = rng.integers(0, n, n_pairs)
     keep = i != j
-    d = np.sqrt(((X[i[keep]] - X[j[keep]]) ** 2).sum(-1))
+    i, j = i[keep], j[keep]
+    # pair distances in chunks: the same values, without three (n_pairs x dim) arrays at once (10 GB at dim 2,048)
+    d = np.concatenate([np.sqrt(((X[i[s:s + 8192]] - X[j[s:s + 8192]]) ** 2).sum(-1))
+                        for s in range(0, len(i), 8192)]) if len(i) else np.empty(0)
     p_lo = p_lo if p_lo is not None else min(1.0 / n, p_hi / 100)
     lo, hi = np.quantile(d, [p_lo, p_hi])
     lo = max(lo, 1e-12)

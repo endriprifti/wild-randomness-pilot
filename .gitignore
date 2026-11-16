@@ -5,3 +5,4 @@ results/
 .venv*/
 pins.json.lock
 pins.json.*.tmp
+.cache/

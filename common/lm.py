@@ -34,12 +34,11 @@ def token_losses(model, ids: torch.Tensor, device, batch: int = 4) -> torch.Tens
 @torch.no_grad()
 def hidden_states(model, ids: torch.Tensor, device, batch: int = 4) -> list[torch.Tensor]:
     """Per layer output [tokens, hidden] on the probe set (embedding output excluded)."""
-    acc = None
+    parts = []
     for s in range(0, len(ids), batch):
         out = model(input_ids=ids[s:s + batch].to(device).long(), output_hidden_states=True)
-        hs = [h.float().reshape(-1, h.shape[-1]).cpu() for h in out.hidden_states[1:]]
-        acc = hs if acc is None else [torch.cat([a, h]) for a, h in zip(acc, hs)]
-    return acc
+        parts.append([h.float().reshape(-1, h.shape[-1]).cpu() for h in out.hidden_states[1:]])
+    return [torch.cat(layer) for layer in zip(*parts)]   # one copy per layer (not one per micro-batch)
 
 
 def non_embedding_params(model) -> int:

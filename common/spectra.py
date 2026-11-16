@@ -40,8 +40,9 @@ def esd(W: torch.Tensor) -> np.ndarray:
     return (s.double() ** 2 / N).cpu().numpy()
 
 
-def alpha_esd_layer(W: torch.Tensor, min_tail: int = 10, n_boot: int = 0, rng=None) -> dict:
-    x = esd(W)
+def alpha_esd_values(x: np.ndarray, min_tail: int = 10, n_boot: int = 0, rng=None) -> dict:
+    """alpha_ESD of one layer from its ESD eigenvalues (the CPU part of alpha_esd_layer)."""
+    x = np.asarray(x, dtype=float)
     x = x[x > 0]
     try:
         r = tails.read_tail(x, n_boot=n_boot, min_tail=min(min_tail, max(5, len(x) // 10)),
@@ -56,19 +57,33 @@ def alpha_esd_layer(W: torch.Tensor, min_tail: int = 10, n_boot: int = 0, rng=No
             "esd_label": r.label}
 
 
-def model_alpha_esd(model, min_dim: int = 32, rng=None) -> tuple[float, list[dict]]:
+def alpha_esd_layer(W: torch.Tensor, min_tail: int = 10, n_boot: int = 0, rng=None) -> dict:
+    return alpha_esd_values(esd(W), min_tail=min_tail, n_boot=n_boot, rng=rng)
+
+
+def layer_esds(model, min_dim: int = 32) -> list[tuple[str, list, np.ndarray]]:
+    """(name, shape, ESD eigenvalues) of every layer matrix: the GPU part of model_alpha_esd."""
+    return [(name, list(W.shape), esd(W)) for name, W in layer_matrices(model, min_dim).items()]
+
+
+def alpha_esd_rows(esds, rng=None) -> tuple[float, list[dict]]:
+    """model_alpha_esd from layer_esds' output: median alpha_ESD over layers and one row per layer."""
     rows = []
-    for name, W in layer_matrices(model, min_dim).items():
-        d = alpha_esd_layer(W, rng=rng)
+    for name, shape, x in esds:
+        d = alpha_esd_values(x, rng=rng)
         d["layer"] = name
-        d["shape"] = list(W.shape)
+        d["shape"] = list(shape)
         rows.append(d)
     vals = [r["alpha_esd"] for r in rows if np.isfinite(r.get("alpha_esd", np.nan))]
     return (float(np.median(vals)) if vals else np.nan), rows
 
 
-def activation_stats(H: torch.Tensor, outlier_threshold: float = 6.0, tail_n_boot: int = 0, rng=None) -> dict:
-    """H: [tokens, hidden] activations of one layer on the probe set."""
+def model_alpha_esd(model, min_dim: int = 32, rng=None) -> tuple[float, list[dict]]:
+    return alpha_esd_rows(layer_esds(model, min_dim), rng=rng)
+
+
+def activation_moments(H: torch.Tensor, outlier_threshold: float = 6.0) -> dict:
+    """Moment statistics of one layer's activations [tokens, hidden], on H's device (the GPU in P1)."""
     x = H.float().reshape(-1)
     m = x.mean()
     c = x - m
@@ -77,14 +92,36 @@ def activation_stats(H: torch.Tensor, outlier_threshold: float = 6.0, tail_n_boo
     kurt0 = float((x ** 4).mean() / (x ** 2).mean() ** 2)
     chan_max = H.float().abs().amax(dim=0)
     n_out = int((chan_max > outlier_threshold).sum())
-    out = {"K": K, "Kurt0": kurt0, "n_outlier_channels": n_out, "max_abs": float(chan_max.max())}
-    a = x.abs().cpu().numpy()
+    return {"K": K, "Kurt0": kurt0, "n_outlier_channels": n_out, "max_abs": float(chan_max.max())}
+
+
+ACT_TAIL_SAMPLE = 200_000
+
+
+def activation_tail_sample(H: torch.Tensor) -> np.ndarray | None:
+    """The values whose tail gives act_zeta: up to ACT_TAIL_SAMPLE nonzero |activations|, drawn without replacement
+    with a fixed seed (None if there are 200 or fewer). The filtering runs on H's device; only the draw leaves it."""
+    a = H.float().reshape(-1).abs()
     a = a[a > 0]
-    if len(a) > 200:
-        sub = np.random.default_rng(0).choice(a, min(len(a), 200_000), replace=False)
-        try:
-            f = tails.fit_power_law(sub, min_tail=100)
-            out.update({"act_zeta": f.zeta, "act_xmin": f.xmin, "act_n_tail": f.n_tail, "act_decades": f.decades_x})
-        except ValueError:
-            pass
+    if len(a) <= 200:
+        return None
+    idx = np.random.default_rng(0).choice(len(a), min(len(a), ACT_TAIL_SAMPLE), replace=False)
+    return a[torch.as_tensor(idx, device=a.device)].cpu().numpy()
+
+
+def activation_tail_fit(sub: np.ndarray | None) -> dict:
+    """act_zeta: CSN Pareto fit (no bootstrap) of activation_tail_sample's values."""
+    if sub is None:
+        return {}
+    try:
+        f = tails.fit_power_law(sub, min_tail=100)
+    except ValueError:
+        return {}
+    return {"act_zeta": f.zeta, "act_xmin": f.xmin, "act_n_tail": f.n_tail, "act_decades": f.decades_x}
+
+
+def activation_stats(H: torch.Tensor, outlier_threshold: float = 6.0, tail_n_boot: int = 0, rng=None) -> dict:
+    """H: [tokens, hidden] activations of one layer on the probe set."""
+    out = activation_moments(H, outlier_threshold)
+    out.update(activation_tail_fit(activation_tail_sample(H)))
     return out

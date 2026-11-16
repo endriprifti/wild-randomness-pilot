@@ -20,11 +20,17 @@
 #   - the GPU must have the job's peak (python memory_check.py p1) plus LANE_HEADROOM_GIB free (default 4);
 #     otherwise the lane waits, checking every minute.
 # Until the lane has finished, start any new run_all.sh with --skip for the lane's jobs.
+#
+# P1's CPU statistics run in a pool of processes next to the GPU pass, one per CPU of the lane (taskset), and on
+# every CPU once run_all.sh's progress.txt shows p3_fractional ended (P1_CPUS_AFTER, passed in the environment so
+# the commands stay run_all.sh's; P1_CPUS_AFTER= turns it off). A file logs/p1_cpus (e.g. 0-10) sets the CPUs
+# at any time; the job reads it every minute.
 set -u
 cd "$(dirname "$0")"
 PY=${PYTHON:-python}
 THREADS=${LANE_THREADS:-4}
 HEADROOM=${LANE_HEADROOM_GIB:-4}
+export P1_CPUS_AFTER="${P1_CPUS_AFTER-p3_fractional=all}"
 export PYTHONUNBUFFERED=1 OMP_NUM_THREADS="$THREADS" MKL_NUM_THREADS="$THREADS" OPENBLAS_NUM_THREADS="$THREADS" \
        NUMEXPR_NUM_THREADS="$THREADS" LOKY_MAX_CPU_COUNT="$THREADS"
 mkdir -p logs results results_archive

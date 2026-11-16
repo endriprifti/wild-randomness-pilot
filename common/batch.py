@@ -51,14 +51,11 @@ def _slopes(rows):
     return float(b), float(s), abar
 
 
-def h71_test(pool: np.ndarray, batch_sizes=(8, 16, 32, 64, 128, 256, 512, 1024), n_blocks: int = 1600,
-             n_boot: int = 200, level: float = 0.90, inv_tol: float = 0.03, drift_tol: float = 0.05,
-             rng: np.random.Generator | None = None, symmetric: bool = False) -> dict:
-    rng = rng if rng is not None else np.random.default_rng(0)
+def h71_bootstrap(pool: np.ndarray, batch_sizes, n_blocks: int, n_boot: int, rng: np.random.Generator,
+                  symmetric: bool = False) -> tuple[list[float], list[float]]:
+    """n_boot resamples of the pool: the slope b and the scale gap s - (1/alpha-bar - 1) of each (finite ones only).
+    Split into chunks with their own generators, the replicates can run in separate processes (P1)."""
     pool = np.asarray(pool, dtype=float)
-    need = n_blocks * max(batch_sizes)
-    rows = fit_over_batches(pool, batch_sizes, n_blocks, symmetric)
-    b, s, abar = _slopes(rows)
     boots_b, boots_gap = [], []
     for _ in range(n_boot):
         res = rng.choice(pool, len(pool), replace=True)
@@ -67,8 +64,16 @@ def h71_test(pool: np.ndarray, batch_sizes=(8, 16, 32, 64, 128, 256, 512, 1024),
         if np.isfinite(bb):
             boots_b.append(bb)
             boots_gap.append(ss - (1 / aa - 1))
+    return boots_b, boots_gap
+
+
+def h71_summary(rows: list[dict], boots_b, boots_gap, n_pool: int, batch_sizes, n_blocks: int,
+                level: float = 0.90, inv_tol: float = 0.03, drift_tol: float = 0.05) -> dict:
+    """The H7.1 summary from the per-B fits of the pool and the bootstrap replicates."""
+    b, s, abar = _slopes(rows)
+    need = n_blocks * max(batch_sizes)
     lo_q, hi_q = (1 - level) / 2, 1 - (1 - level) / 2
-    if boots_b:
+    if len(boots_b):
         b_lo, b_hi = np.quantile(boots_b, [lo_q, hi_q])
         g_lo, g_hi = np.quantile(boots_gap, [lo_q, hi_q])
     else:
@@ -84,13 +89,24 @@ def h71_test(pool: np.ndarray, batch_sizes=(8, 16, 32, 64, 128, 256, 512, 1024),
         "scale_exponent": s, "alpha_mean": abar, "predicted_scale_exponent": (1 / abar - 1) if abar else np.nan,
         "scale_gap_lo": float(g_lo), "scale_gap_hi": float(g_hi),
         "scale_exponent_excludes_prediction": bool(np.isfinite(g_lo) and (g_lo > 0 or g_hi < 0)),
-        "n_pool": int(len(pool)), "n_pool_needed": int(need), "pool_sufficient": bool(len(pool) >= need),
+        "n_pool": int(n_pool), "n_pool_needed": int(need), "pool_sufficient": bool(n_pool >= need),
         "n_boot": len(boots_b), "n_blocks": n_blocks,
     }
     # truncated-Levy hint: first B at which alpha-hat exceeds alpha-hat(B_min) by 0.2
     a = [r["alpha"] for r in rows]
     cross = next((r["B"] for r in rows if np.isfinite(r["alpha"]) and np.isfinite(a[0]) and r["alpha"] - a[0] > 0.2), None)
     summary["B_cross_hint"] = cross
+    return summary
+
+
+def h71_test(pool: np.ndarray, batch_sizes=(8, 16, 32, 64, 128, 256, 512, 1024), n_blocks: int = 1600,
+             n_boot: int = 200, level: float = 0.90, inv_tol: float = 0.03, drift_tol: float = 0.05,
+             rng: np.random.Generator | None = None, symmetric: bool = False) -> dict:
+    rng = rng if rng is not None else np.random.default_rng(0)
+    pool = np.asarray(pool, dtype=float)
+    rows = fit_over_batches(pool, batch_sizes, n_blocks, symmetric)
+    boots_b, boots_gap = h71_bootstrap(pool, batch_sizes, n_blocks, n_boot, rng, symmetric)
+    summary = h71_summary(rows, boots_b, boots_gap, len(pool), batch_sizes, n_blocks, level, inv_tol, drift_tol)
     return {"per_B": rows, "summary": summary}
 
 
