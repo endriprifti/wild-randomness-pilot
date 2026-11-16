@@ -47,7 +47,7 @@ from common import hf, lm, popqa, quant, runtime, spectra
 
 def popqa_items(cfg, run, rng):
     pq = cfg["popqa"]
-    ds, src = hf.load_rows(pq["dataset"], None, pq["split"], run, limit=pq["limit"])
+    ds, src = hf.load_rows(popqa.spec(pq), run, limit=pq["limit"])
     if ds is None:
         run.fallback("PopQA: synthetic question set with random popularity")
         items = []
@@ -133,10 +133,10 @@ def main():
     for name in models:
         model, tok, src = hf.load_causal_lm(name, None, run, dtype=dtype, device=dev)
         vocab = model.get_output_embeddings().weight.shape[0]
-        ppl_texts, _ = hf.load_texts(*cfg["ppl"]["dataset"], n=4000, run=run, field="text", min_chars=1, seed=run.seed)
+        ppl_texts, _ = hf.load_texts(cfg["ppl"]["dataset"], n=4000, run=run, field="text", min_chars=1, seed=run.seed)
         all_ids = hf.tokenize_stream(["\n".join(ppl_texts)], tok, cfg["ppl"]["ctx"], 10 ** 9 if not cfg["ppl"]["max_windows"] else cfg["ppl"]["max_windows"])
         windows = all_ids.clamp(max=vocab - 1)
-        cal_texts, _ = hf.load_texts(*cfg["calib"]["dataset"], n=2000, run=run, min_chars=50, seed=run.seed + 1)
+        cal_texts, _ = hf.load_texts(cfg["calib"]["dataset"], n=2000, run=run, min_chars=50, seed=run.seed + 1)
         calib = hf.tokenize_stream(cal_texts, tok, cfg["calib"]["len"], cfg["calib"]["n_seqs"]).clamp(max=vocab - 1)
         probe = hf.tokenize_stream(cal_texts[::-1], tok, cfg["probe"]["len"], cfg["probe"]["n_seqs"]).clamp(max=vocab - 1)
         items, isrc = popqa_items(cfg, run, rng)

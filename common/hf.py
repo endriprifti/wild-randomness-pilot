@@ -1,13 +1,18 @@
 """Hugging Face loading with explicit, recorded fallbacks.
 
-Real runs load models, checkpoints (revisions) and datasets from the Hub and fail loudly.
-Under --smoke (or --offline-ok) a failed download is replaced by a stand-in of the same
-shape (a randomly initialized GPT-NeoX of Pythia-14M shape, a byte tokenizer, synthetic
-Zipfian text or random images); every replacement is written to run.json under "fallbacks".
+Real runs load models, checkpoints (revisions) and datasets from the Hub, each at a commit pinned in
+pins.json, and fail loudly. Hub calls are retried only after transient failures (network, timeouts,
+HTTP 408/429/5xx); a wrong split, a missing file or repository, or any other 4xx fails at once.
+Under --smoke (or --offline-ok) a failed model download is replaced by a stand-in of the same
+shape (a randomly initialized GPT-NeoX of Pythia-14M shape, a byte tokenizer). A dataset is replaced
+(synthetic Zipfian text or random images) only when the Hub cannot be reached at all: with the Hub up,
+a smoke run reads the same datasets, splits and files as the full run, so a wrong split fails there
+too. Every replacement is written to run.json under "fallbacks".
 """
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as _dt
 import json
 import os
@@ -20,30 +25,102 @@ import numpy as np
 import torch
 
 PINS_PATH = Path(__file__).resolve().parent.parent / "pins.json"
-HUB_RETRIES = (10, 30, 90, 270)   # seconds between attempts at a Hub call in a real run (smoke: no retry)
+HUB_RETRIES = (10, 30, 90, 270)   # seconds between attempts at a Hub call after a transient failure
+TRANSIENT_STATUS = {408, 425, 429, 500, 502, 503, 504}
+# exception classes (matched by name, so that the check does not depend on which HTTP library a version of
+# huggingface_hub or datasets uses) that mean the network or the server failed, not the request
+_TRANSIENT_NAMES = {"ConnectionError", "TimeoutError", "TransportError", "TimeoutException", "NetworkError",
+                    "RemoteProtocolError", "ChunkedEncodingError", "IncompleteRead", "ReadTimeoutError",
+                    "NewConnectionError", "ProtocolError", "ClientConnectionError", "ServerDisconnectedError",
+                    "ClientPayloadError", "FSTimeoutError", "RemoteDisconnected"}
+# ... except these, which a retry cannot fix: offline mode, a proxy that refuses the host, a bad URL
+_PERMANENT_NAMES = {"OfflineModeIsEnabled", "ProxyError", "UnsupportedProtocol", "LocalProtocolError", "InvalidURL"}
+_NET_MESSAGE = re.compile(r"couldn'?t connect|connection (reset|aborted|refused|error)|timed out|read timeout|"
+                          r"temporary failure|name resolution|max retries exceeded|server disconnected|"
+                          r"remote end closed|incomplete read|too many requests|\b(502|503|504) server error", re.I)
 
 
-def _permanent(e: Exception) -> bool:
-    """Errors a retry cannot fix: unpinned under --require-pins, missing repository, revision or file."""
-    if isinstance(e, KeyError):
+class DataSpecError(ValueError):
+    """A dataset request that no retry can fix (no document with the field, a split without data_files)."""
+
+
+def _chain(e: BaseException, limit: int = 12) -> list[BaseException]:
+    out, x = [], e
+    while x is not None and len(out) < limit and all(x is not y for y in out):
+        out.append(x)
+        x = x.__cause__ or x.__context__
+    return out
+
+
+def _status(e: BaseException) -> int | None:
+    for obj in (getattr(e, "response", None), e):
+        st = getattr(obj, "status_code", None)
+        if isinstance(st, int):
+            return st
+    return None
+
+
+def is_transient(e: BaseException) -> bool:
+    """True for failures a retry can fix: the network or the server (timeouts, dropped connections, HTTP
+    408/429/5xx), looked up along the exception's cause chain (huggingface_hub, datasets and transformers wrap
+    them). False for everything else: a wrong split (ValueError), a missing repository, revision or file, any
+    other HTTP 4xx, an unpinned name under --require-pins (KeyError), offline mode, a refusing proxy."""
+    chain = _chain(e)
+    for x in chain:
+        if {c.__name__ for c in type(x).__mro__} & _PERMANENT_NAMES:
+            return False
+        st = _status(x)
+        if st is not None:
+            return st in TRANSIENT_STATUS
+    if any({c.__name__ for c in type(x).__mro__} & _TRANSIENT_NAMES for x in chain):
         return True
-    try:
-        from huggingface_hub.errors import EntryNotFoundError, RepositoryNotFoundError, RevisionNotFoundError
-        return isinstance(e, (RepositoryNotFoundError, RevisionNotFoundError, EntryNotFoundError))
-    except ImportError:
-        return False
+    # wrapped errors that kept only a message, e.g. transformers' OSError "We couldn't connect to ..."
+    return (isinstance(e, (OSError, RuntimeError)) and not isinstance(e, (FileNotFoundError, KeyError))
+            and bool(_NET_MESSAGE.search(str(e))))
+
+
+_HUB_UP: bool | None = None
+
+
+def hub_reachable() -> bool:
+    """Whether the Hugging Face Hub answers at all (one small API call, cached for the process)."""
+    global _HUB_UP
+    if _HUB_UP is None:
+        if os.environ.get("HF_HUB_OFFLINE", "").lower() in ("1", "true", "yes", "on"):
+            _HUB_UP = False
+        else:
+            try:
+                from huggingface_hub import HfApi
+                HfApi().dataset_info("Salesforce/wikitext", timeout=20)
+                _HUB_UP = True
+            except Exception:  # noqa: BLE001  any failure: the Hub is not usable from here
+                _HUB_UP = False
+    return _HUB_UP
+
+
+CODE_ERRORS = (AttributeError, TypeError, NameError, ImportError, KeyError)
+
+
+def data_fallback_ok(run, e: BaseException | None = None) -> bool:
+    """A synthetic stand-in for a dataset is allowed only in smoke / --offline-ok runs, and only when the Hub
+    cannot be reached at all; never for an unpinned name under --require-pins (KeyError) or a bug in our own
+    code or setup (AttributeError, TypeError, NameError, ImportError such as a missing zstandard)."""
+    return (run is not None and bool(getattr(run, "offline_ok", False)) and not isinstance(e, CODE_ERRORS)
+            and not hub_reachable())
 
 
 def hub_retry(fn, run=None, what: str = "Hub call"):
     """fn() with retries after transient failures (network, rate limit, 5xx), so that one dropped connection
-    in a run of hundreds of downloads does not end the job. No retry in smoke or --offline-ok runs, which
-    fall back to stand-ins instead, or for errors a retry cannot fix."""
-    waits = () if (run is not None and getattr(run, "offline_ok", False)) else HUB_RETRIES
+    in a run of hundreds of downloads does not end the job. Any other error is raised at once. Smoke and
+    --offline-ok runs do not retry when the Hub is unreachable (they fall back to stand-ins instead)."""
+    waits = HUB_RETRIES
+    if run is not None and getattr(run, "offline_ok", False) and not hub_reachable():
+        waits = ()
     for i in range(len(waits) + 1):
         try:
             return fn()
         except Exception as e:  # noqa: BLE001
-            if i == len(waits) or _permanent(e):
+            if i == len(waits) or not is_transient(e):
                 raise
             msg = f"{what} failed ({type(e).__name__}: {str(e)[:120]}); retry {i + 1}/{len(waits)} in {waits[i]} s"
             if run is not None:
@@ -71,14 +148,15 @@ class Pins:
         self.data = json.loads(self.path.read_text()) if self.path.exists() else {}
 
     @staticmethod
-    def key(repo: str, revision: str | None) -> str:
-        return f"{repo}@{revision or 'main'}"
+    def key(repo: str, revision: str | None, repo_type: str = "model") -> str:
+        """'repo@revision' for models; 'datasets/repo@revision' for datasets."""
+        return ("datasets/" if repo_type == "dataset" else "") + f"{repo}@{revision or 'main'}"
 
-    def entry(self, repo: str, revision: str | None) -> dict | None:
-        return self.data.get(self.key(repo, revision))
+    def entry(self, repo: str, revision: str | None, repo_type: str = "model") -> dict | None:
+        return self.data.get(self.key(repo, revision, repo_type))
 
-    def resolve(self, repo: str, revision: str | None, run=None) -> str:
-        k = self.key(repo, revision)
+    def resolve(self, repo: str, revision: str | None, run=None, repo_type: str = "model") -> str:
+        k = self.key(repo, revision, repo_type)
         if re.fullmatch(r"[0-9a-f]{40}", revision or ""):
             sha = revision                       # already a commit
         elif k in self.data:
@@ -88,14 +166,18 @@ class Pins:
                 raise KeyError(f"{k} is not pinned in {self.path.name} (run once without --require-pins to pin it)")
             from huggingface_hub import HfApi
             api = HfApi()
-            info = hub_retry(lambda: api.model_info(repo, revision=revision, files_metadata=True), run,
-                             f"pinning {k}")
+            if repo_type == "dataset":
+                info = hub_retry(lambda: api.dataset_info(repo, revision=revision), run, f"pinning {k}")
+            else:
+                info = hub_retry(lambda: api.model_info(repo, revision=revision, files_metadata=True), run,
+                                 f"pinning {k}")
             sha = info.sha
             entry = {"commit": sha, "resolved_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")}
-            entry["weights_bytes"] = weights_bytes(info.siblings or [])
-            entry["weights_sha256"] = {f: h for f, h in lfs_sha256s(info.siblings).items() if f in WEIGHTS_FILES}
+            if repo_type != "dataset":
+                entry["weights_bytes"] = weights_bytes(info.siblings or [])
+                entry["weights_sha256"] = {f: h for f, h in lfs_sha256s(info.siblings).items() if f in WEIGHTS_FILES}
             try:  # the revision's last commit; fall back to the commit list if the Hub omits it
-                date = info.last_modified or api.list_repo_commits(repo, revision=sha)[0].created_at
+                date = info.last_modified or api.list_repo_commits(repo, revision=sha, repo_type=repo_type)[0].created_at
                 entry["commit_date"] = date.isoformat()
             except Exception:  # noqa: BLE001  the date is informative only
                 pass
@@ -236,7 +318,9 @@ def load_causal_lm(name: str, revision: str | None, run, dtype=torch.float32, de
             tok.pad_token = tok.eos_token
         return model.to(device).eval(), tok, "hub"
     except Exception as e:  # network, auth, missing revision
-        if not run.offline_ok or isinstance(e, KeyError):
+        # a stand-in for a model the Hub cannot give us (smoke-only names, no network), never for a bug in our
+        # code (until 2026-11-16 an AttributeError in emmy_check's worker became a stand-in this way)
+        if not run.offline_ok or isinstance(e, CODE_ERRORS):
             raise
         run.fallback(f"model {name}@{revision}: random-init GPT-NeoX stand-in ({type(e).__name__}: {str(e)[:120]})")
         cfg = dict(fallback_cfg or TINY_NEOX)
@@ -286,30 +370,96 @@ def zipf_text(n_docs: int, words_per_doc: int, seed: int, vocab: int = 5000, phi
     return [" ".join(words[j] for j in rng.choice(vocab, words_per_doc, p=p)) for _ in range(n_docs)]
 
 
-def load_texts(dataset: str, config: str | None, split: str, n: int, run, field: str = "text",
-               min_chars: int = 200, seed: int = 0) -> tuple[list[str], str]:
-    """First n documents (streaming) with at least min_chars characters. A stream that breaks off is restarted
-    from the beginning (same documents) in a real run."""
-    def stream():
-        from datasets import load_dataset
-        ds = load_dataset(dataset, config, split=split, streaming=True)
-        out = []
-        for ex in ds:
-            t = ex.get(field) or ""
-            if len(t) >= min_chars:
-                out.append(t)
-            if len(out) >= n:
-                break
-        if not out:
-            raise RuntimeError("empty stream")
-        return out
+# ----------------------------------------------------------------------------- datasets
+@dataclasses.dataclass
+class DataSpec:
+    """One dataset split as a job reads it. data_files maps split names to the files that make up each split
+    (as in load_dataset); None leaves the split to the builder's own detection, which can miss files: in
+    monology/pile-uncopyrighted it finds only the train/ folder, not val.jsonl.zst and test.jsonl.zst at the top
+    level. revision is a branch or tag, loaded at the commit pins.json records for it (pinned on first use, like
+    the models); field is the text column (None for datasets read row by row)."""
+    repo: str
+    split: str
+    config: str | None = None
+    data_files: dict | None = None
+    revision: str = "main"
+    field: str | None = "text"
+
+    def __post_init__(self):
+        if self.data_files is not None and self.split not in self.data_files:
+            raise DataSpecError(f"{self.repo}: split {self.split!r} has no entry in data_files {self.data_files}")
+
+    @property
+    def label(self) -> str:
+        files = f" {self.data_files[self.split]}" if self.data_files else ""
+        return f"{self.repo}{'/' + self.config if self.config else ''}:{self.split}{files}@{self.revision}"
+
+
+def data_spec(x, **override) -> DataSpec:
+    """A DataSpec from a config entry: a dict of DataSpec fields, or the list [repo, config, split]."""
+    if isinstance(x, DataSpec):
+        s = x
+    elif isinstance(x, dict):
+        s = DataSpec(**x)
+    else:
+        repo, config, split = x
+        s = DataSpec(repo=repo, config=config, split=split)
+    return dataclasses.replace(s, **override) if override else s
+
+
+def _open(spec: DataSpec, sha: str | None, streaming: bool):
+    from datasets import load_dataset
+    kw = {"name": spec.config, "split": spec.split, "streaming": streaming}
+    if sha:
+        kw["revision"] = sha
+    if spec.data_files:
+        kw["data_files"] = dict(spec.data_files)
+    return load_dataset(spec.repo, **kw)
+
+
+def pin_dataset(spec: DataSpec, run=None) -> str:
+    return PINS.resolve(spec.repo, spec.revision, run, repo_type="dataset")
+
+
+def first_item(spec, run=None) -> tuple[dict, str]:
+    """The first row of a split at its pinned commit (streaming), and the commit. Used by check_data.py."""
+    spec = data_spec(spec)
+    sha = pin_dataset(spec, run)
+    return hub_retry(lambda: next(iter(_open(spec, sha, True))), run, f"first item of {spec.label}"), sha
+
+
+def load_texts(spec, n: int, run, field: str | None = None, min_chars: int = 200,
+               seed: int = 0) -> tuple[list[str], str]:
+    """First n documents (streaming) with at least min_chars characters, at the pinned commit. A stream that
+    breaks off with a transient error is restarted from the beginning (same documents)."""
+    spec = data_spec(spec)
+    field = field or spec.field or "text"
     try:
-        return hub_retry(stream, run, f"stream of {dataset}:{split}"), "hub"
+        sha = pin_dataset(spec, run)
+
+        def stream():
+            out = []
+            for ex in _open(spec, sha, True):
+                t = ex.get(field) or ""
+                if len(t) >= min_chars:
+                    out.append(t)
+                if len(out) >= n:
+                    break
+            if not out:
+                raise DataSpecError(f"{spec.label}: no document with a {field!r} field of {min_chars}+ characters")
+            return out
+        texts = hub_retry(stream, run, f"stream of {spec.label}")
+        if run is not None:
+            run.note(f"{spec.label} at {sha[:10] if sha else '?'}: {len(texts)} documents")
+        return texts, "hub"
     except Exception as e:
-        if not run.offline_ok:
+        if not data_fallback_ok(run, e):
             raise
-        run.fallback(f"dataset {dataset}/{config}:{split}: synthetic Zipfian text ({type(e).__name__})")
+        run.fallback(f"dataset {spec.label}: synthetic Zipfian text (Hub unreachable; {type(e).__name__})")
         return zipf_text(n, 400, seed), "fallback"
+
+
+CIFAR10 = {"repo": "uoft-cs/cifar10", "split": "train", "field": "img"}
 
 
 def load_cifar10(run, root: str, limit_train: int | None = None, limit_test: int | None = None):
@@ -321,23 +471,30 @@ def load_cifar10(run, root: str, limit_train: int | None = None, limit_test: int
     Raises RuntimeError if neither works; the caller decides on a stand-in."""
     errors = []
     try:
-        from datasets import load_dataset
         out = []
         for split, lim in (("train", limit_train), ("test", limit_test)):
-            imgs, labels = [], []
-            if lim:
-                for ex in load_dataset("uoft-cs/cifar10", split=split, streaming=True):
-                    imgs.append(np.asarray(ex["img"].convert("RGB"), dtype=np.uint8))
-                    labels.append(int(ex["label"]))
-                    if len(imgs) >= lim:
-                        break
-            else:
-                ds = load_dataset("uoft-cs/cifar10", split=split)
-                imgs = [np.asarray(im.convert("RGB"), dtype=np.uint8) for im in ds["img"]]
-                labels = list(ds["label"])
+            spec = data_spec(CIFAR10, split=split)
+            sha = pin_dataset(spec, run)
+
+            def read():
+                imgs, labels = [], []
+                if lim:
+                    for ex in _open(spec, sha, True):
+                        imgs.append(np.asarray(ex["img"].convert("RGB"), dtype=np.uint8))
+                        labels.append(int(ex["label"]))
+                        if len(imgs) >= lim:
+                            break
+                else:
+                    ds = _open(spec, sha, False)
+                    imgs = [np.asarray(im.convert("RGB"), dtype=np.uint8) for im in ds["img"]]
+                    labels = list(ds["label"])
+                return imgs, labels
+            imgs, labels = hub_retry(read, run, f"CIFAR-10 {split}")
             out += [np.stack(imgs), np.asarray(labels, dtype=np.int64)]
         return (*out, "hf:uoft-cs/cifar10")
     except Exception as e:  # noqa: BLE001
+        if isinstance(e, KeyError):
+            raise
         errors.append(f"Hugging Face: {type(e).__name__}: {str(e)[:120]}")
     try:
         import torchvision
@@ -351,15 +508,20 @@ def load_cifar10(run, root: str, limit_train: int | None = None, limit_test: int
     raise RuntimeError("CIFAR-10 unavailable: " + "; ".join(errors))
 
 
-def load_rows(dataset: str, config: str | None, split: str, run, limit: int | None = None):
-    from datasets import load_dataset
+def load_rows(spec, run, limit: int | None = None):
+    """A whole split (downloaded, not streamed) at its pinned commit, optionally its first `limit` rows; (None,
+    'fallback') only when data_fallback_ok (the caller builds the stand-in)."""
+    spec = data_spec(spec)
     try:
-        ds = load_dataset(dataset, config, split=split)
+        sha = pin_dataset(spec, run)
+        ds = hub_retry(lambda: _open(spec, sha, False), run, f"download of {spec.label}")
         if limit is not None:
             ds = ds.select(range(min(limit, len(ds))))
+        if run is not None:
+            run.note(f"{spec.label} at {sha[:10] if sha else '?'}: {len(ds)} rows")
         return ds, "hub"
-    except Exception:
-        if not run.offline_ok:
+    except Exception as e:
+        if not data_fallback_ok(run, e):
             raise
         return None, "fallback"
 

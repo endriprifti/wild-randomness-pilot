@@ -59,9 +59,9 @@ def transformer_data(cfg, run):
         tok = hf.ByteTokenizer(512)
     n_train = c["tokens"] // c["seq_len"]
     n_eval = c["eval_seqs"]
-    texts, src = hf.load_texts(*c["dataset"], n=max(64, (n_train + n_eval) * c["seq_len"] // 300 + 64), run=run, seed=run.seed)
+    texts, src = hf.load_texts(c["dataset"], n=max(64, (n_train + n_eval) * c["seq_len"] // 300 + 64), run=run, seed=run.seed)
     ids = hf.tokenize_stream(texts, tok, c["seq_len"], n_train + n_eval)
-    ood_texts, _ = hf.load_texts(*c["ood_dataset"], n=2000, run=run, min_chars=1, seed=run.seed + 7)
+    ood_texts, _ = hf.load_texts(c["ood_dataset"], n=2000, run=run, min_chars=1, seed=run.seed + 7)
     ood = hf.tokenize_stream(["\n".join(ood_texts)], tok, c["seq_len"], n_eval)
     return {"train": ids[:-n_eval], "test": ids[-n_eval:], "ood": ood, "vocab": tokenizer_vocab(tok), "source": src}
 

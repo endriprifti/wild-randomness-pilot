@@ -167,13 +167,20 @@ def analyze(item_rows: pd.DataFrame, n_dec: int, props: pd.Series | None = None)
     return pd.DataFrame(trends), cat(decs), cat(rels)
 
 
+def spec(pq: dict | None = None) -> dict:
+    """The PopQA split a P2 config reads (config popqa: dataset, split), as a dataset spec for common.hf."""
+    pq = pq or {"dataset": "akariasai/PopQA", "split": "test"}
+    return {"repo": pq["dataset"], "split": pq["split"], "field": None}
+
+
 def load_props(shots: int, tsv: str | None = None, dataset: str = "akariasai/PopQA", split: str = "test") -> pd.Series:
     """Relation type of each evaluated item, indexed like popqa_items.csv's i (items after the shots)."""
     if tsv:
         prop = pd.read_csv(tsv, sep="\t")["prop"]
     else:
-        from datasets import load_dataset
-        prop = pd.Series(load_dataset(dataset, split=split)["prop"])
+        from common import hf
+        ds, _ = hf.load_rows(spec({"dataset": dataset, "split": split}), None)
+        prop = pd.Series(ds["prop"])
     return pd.Series(prop.iloc[shots:].to_numpy(), index=range(len(prop) - shots))
 
 

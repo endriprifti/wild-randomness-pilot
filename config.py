@@ -154,8 +154,14 @@ CONFIG = {
                             "deduped_suffix": "-deduped", "content_files": ["model.safetensors", "pytorch_model.bin"]},
             "final_step": 143000,
             "dtype": "float32",
-            "pool_dataset": ["monology/pile-uncopyrighted", None, "train"],  # Pile text without the copyrighted subsets
-            "eval_dataset": ["monology/pile-uncopyrighted", None, "validation"],
+            # Pile text without the copyrighted subsets. The split names come with explicit data_files: the
+            # datasets builder detects only the train/ folder of this repository and misses val.jsonl.zst and
+            # test.jsonl.zst at its top level ("Bad split: validation", L40S, 2026-11-16). Both are read at the
+            # commit pins.json records for datasets/monology/pile-uncopyrighted@main (python check_data.py)
+            "pool_dataset": {"repo": "monology/pile-uncopyrighted", "split": "train",
+                             "data_files": {"train": "train/*.jsonl.zst"}},
+            "eval_dataset": {"repo": "monology/pile-uncopyrighted", "split": "validation",
+                             "data_files": {"validation": "val.jsonl.zst"}},   # eval, probe and surprisal sets
             "example_len": 128,         # OURS: tokens per example for per-example gradients
             "grad_layers": ["layers.{last}.attention.query_key_value.weight", "layers.{last}.mlp.dense_4h_to_h.weight"],
             "n_random_dirs": 2, "n_hessian_dirs": 1, "hessian_batch": 64,

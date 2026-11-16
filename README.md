@@ -43,7 +43,10 @@ Jobs 0 to 6 all fit the RTX 5090. Job 7 is the only one that needs the L40S, and
 Stage 1 runs on an L40S with `run_all.sh` (below).
 
 Every script takes `--smoke`, `--seed N`, `--device cuda|cpu`, `--out DIR` and `--offline-ok` (allow the recorded
-stand-ins outside smoke mode; off by default, so a real run fails loudly if a download fails). Run the Emmy check
+stand-ins outside smoke mode; off by default, so a real run fails loudly if a download fails). Smoke runs read the
+same datasets, splits and files as the full settings, only fewer items; a dataset stand-in is used only when the
+Hub cannot be reached at all. Before a cloud run, `python check_data.py` opens one item of every dataset split
+that the full settings read (below, "Datasets"). Run the Emmy check
 after P1 if you want it to add the three checkpoints with the largest K from P1's `checkpoints.csv` (it reads
 `results/p1_checkpoints/` and the `results/p1_<suite>/` folders that `run_all.sh` writes).
 
@@ -216,9 +219,11 @@ tail -f logs/progress.txt
 - **Pins.** The jobs run without `--require-pins`: a name that is not pinned yet (pass (b)'s checkpoints, OLMo 2
   7B) is resolved on first use and written to `pins.json`, so no job fails for that. At the end the script says
   how many names were added; upload `results_archive/pins.json` so it can be committed.
-- **Network.** In a real run, a Hub call or download that fails for a transient reason (dropped connection, rate
-  limit, server error) is retried four times, 10 s to 270 s apart, before the job gives up. A missing repository,
-  revision or file fails at once.
+- **Network.** A Hub call or download that fails for a transient reason (dropped connection, timeout, HTTP 408,
+  429 or 5xx, looked up along the exception's causes) is retried four times, 10 s to 270 s apart, before the job
+  gives up. Anything else fails at once: a wrong split (ValueError), a missing repository, revision or file, any
+  other 4xx, an unpinned name under `--require-pins` (until 2026-11-16 a ValueError was retried four times, about
+  7 minutes per job).
 - **Output folders.** Each job writes to `results/<job>/` (`--out`), so the three P1 suites and the two P4 models do
   not overwrite each other.
 
@@ -395,7 +400,11 @@ On the laptop (2026-11-13, with Hub access) three problems showed up and are fix
   The full runs are unchanged: Pythia-14M's config already has 50,304 slots.
 - **The Pile copy did not load.** `monology/pile-uncopyrighted` is stored as `.jsonl.zst`, and without the
   `zstandard` package `datasets` fails with a ValueError, so P1 fell back to synthetic text (and a full run would
-  have stopped). `zstandard` is now in `requirements.txt`.
+  have stopped). `zstandard` is now in `requirements.txt`. Its validation split was a second problem that smoke
+  hid: the "Bad split" ValueError also became a synthetic-text fallback. Since 2026-11-16 a smoke run falls back
+  for a dataset only when the Hub is unreachable (see "Datasets"), and no stand-in (model or dataset) covers an
+  error in our own code: that rule exposed one more hidden failure, in `emmy_check.py`'s worker, whose run object
+  lacked the `pins` record, so a real Emmy run would have stopped at the first model load.
 - **Smoke timing.** Almost all of P3's 22 minutes went to downloading CIFAR-10 from torchvision's mirror at 130 kB/s.
   P3 and P4 now load CIFAR-10 from Hugging Face (`uoft-cs/cifar10`) first, and smoke runs stream only the 320
   images they use. P1's smoke reads fewer checkpoints (one main-grid step, H7.1 at the last stage, a four-step
@@ -459,6 +468,30 @@ the probe set per checkpoint) is minutes. Pass (b) adds up to 9 seeds × 12 chec
 98 GB, per jump window. Every checkpoint is deleted from the Hugging Face cache right after it is read, so the
 disk holds about one checkpoint at a time (`--keep-cache` turns this off). `--pin-only` reads the exact file sizes
 from the Hub and writes the total for the main grid and for pass (a) to `run.json` (`results.download`).
+
+### Datasets
+
+Every Hub dataset is read through `common/hf.py` at a commit pinned in `pins.json`, like the models (key
+`datasets/<repo>@main`, pinned on first use; `--require-pins` applies). Each config entry names the repository,
+config, split and, where the builder's own split detection is not enough, the files of the split (`data_files`).
+`monology/pile-uncopyrighted` needs them: the builder finds only its `train/` folder and misses `val.jsonl.zst` and
+`test.jsonl.zst` at the top level, so the validation split (P1's evaluation, probe and surprisal text, in every
+suite, the loss-spike passes and OLMo 2 7B) failed on the L40S with "Bad split: validation" (2026-11-16). P1 now
+reads `train/*.jsonl.zst` for the gradient pool and `val.jsonl.zst` for validation.
+
+| Dataset | Splits | Read by |
+|---|---|---|
+| `monology/pile-uncopyrighted` | train (`train/*.jsonl.zst`), validation (`val.jsonl.zst`) | P1 (every suite) |
+| `Salesforce/wikitext` `wikitext-2-raw-v1` | test, train | P2 (perplexity, calibration), P4 (out-of-distribution text), Emmy check |
+| `akariasai/PopQA` | test | P2 |
+| `HuggingFaceFW/fineweb-edu` `sample-10BT` | train | P4 transformer |
+| `uoft-cs/cifar10` | train, test | P3 (LRA image), P4 ResNet-18 |
+| Fashion-MNIST (torchvision) | train, test | P5 |
+
+`python check_data.py` (a few minutes, CPU) streams the first row of each of these splits exactly as the job reads
+it, pins new dataset revisions in `pins.json` (`--no-pin` leaves the file alone), writes
+`results/check_data/check_data.csv` and exits 1 if any split fails. The list comes from `config.py`, so a new
+dataset entry is checked without editing the script.
 
 ### Pinned commits
 
@@ -535,7 +568,7 @@ before the run.
 
 ## Unit tests
 
-`python -m pytest -q` (139 tests, about 2 min on a CPU; `-m "not slow"` skips the two slowest). Synthetic data with
+`python -m pytest -q` (146 tests, about 2 min on a CPU; `-m "not slow"` skips the two slowest). Synthetic data with
 known parameters:
 
 - stable density against the Gaussian and Cauchy closed forms and against SciPy; ML fit recovers α ∈ {1.2, 1.5, 1.8},
@@ -559,6 +592,10 @@ known parameters:
   window unchanged (the cell's seed repeats its trajectories); saved runs get k_lo and g_max quantiles; floor
   cells (at least one first-check exit; α = 1.2 left to its own rerun); H3.1 flags (diverged above ln 10,
   λ_max < 0 or λ_min < −0.01 λ_max is not a minimum, sharpness kept only for converged runs);
+- dataset loading: a folder laid out like `monology/pile-uncopyrighted` reproduces "Bad split: validation" and
+  reads `val.jsonl.zst` with `data_files`; only transient errors are retried (a ValueError is tried once); a smoke
+  run falls back for a dataset only when the Hub is unreachable; `check_data.py` lists every split and smoke reads
+  the same ones; no `load_dataset` call outside `common/hf.py`;
 - P2's outlier scheme: a kept channel 1000 times larger leaves every other channel's activation error, the other
   weight columns and the layer's output error unchanged (before the fix it rounded most of them to zero); the
   rotation arm in bfloat16 adds no rounding beyond bfloat16 storage;

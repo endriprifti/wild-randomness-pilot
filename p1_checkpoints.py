@@ -339,10 +339,10 @@ def main():
             need_pool = cfg["coupling_blocks"] * cfg["coupling_B"]
             n_h71 = h71cfg.get("n_blocks", config.H71["n_blocks"]) * max(h71_Bs)
             n_pool = max(need_pool, n_h71 if h71cfg["full_res_sizes"] else 0)
-            pool_texts, _ = hf.load_texts(*cfg["pool_dataset"], n=max(64, n_pool * cfg["example_len"] // 400 + 64),
+            pool_texts, _ = hf.load_texts(cfg["pool_dataset"], n=max(64, n_pool * cfg["example_len"] // 400 + 64),
                                           run=run, seed=run.seed)
             pool = hf.tokenize_stream(pool_texts, tok, cfg["example_len"], n_pool)
-            ev_texts, _ = hf.load_texts(*cfg["eval_dataset"], n=max(16, cfg["eval_seqs"] * cfg["eval_len"] // 400 + 16),
+            ev_texts, _ = hf.load_texts(cfg["eval_dataset"], n=max(16, cfg["eval_seqs"] * cfg["eval_len"] // 400 + 16),
                                         run=run, seed=run.seed + 1)
             probe = hf.tokenize_stream(ev_texts, tok, cfg["probe_len"], cfg["probe_seqs"])
             evals = hf.tokenize_stream(ev_texts, tok, cfg["eval_len"], cfg["eval_seqs"])

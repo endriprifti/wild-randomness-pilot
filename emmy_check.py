@@ -187,6 +187,8 @@ class _WorkerRun:
 
     def __init__(self, offline_ok: bool):
         self.offline_ok = offline_ok
+        self.require_pins = False
+        self.pins: dict[str, str] = {}            # hf.PINS.resolve records the commits it loads here
         self.fallbacks: list[str] = []
         self.notes: list[str] = []
 
@@ -516,7 +518,7 @@ def main():
 
     ds = cfg["dataset"]
     n_docs = max(50, cfg["seq_len"] * cfg["n_seqs"] // 40)
-    texts, text_src = hf.load_texts(ds[0], ds[1], ds[2], n_docs, run, seed=run.seed)
+    texts, text_src = hf.load_texts(ds, n_docs, run, seed=run.seed)
     work = run.out_dir / "_work"
     work.mkdir(exist_ok=True)
     (work / "texts.json").write_text(json.dumps(texts))
