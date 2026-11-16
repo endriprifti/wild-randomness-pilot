@@ -53,6 +53,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import math
+import time
 
 import numpy as np
 import pandas as pd
@@ -290,6 +291,29 @@ def noise_quantities(values: np.ndarray, B: int, n_blocks: int, T: dict, rng) ->
     return out
 
 
+def gpu_lock(args):
+    """One P1 job on the GPU at a time (an exclusive lock on logs/.p1_gpu.lock, held until the process ends).
+    run_lane.sh runs P1 suites next to run_all.sh; the lock keeps them from overlapping each other or run_all.sh's
+    p1_olmo7b (31.5 GiB by memory_check.py, which with a 17.3 GiB suite would exceed the L40S's 44 GiB): the later
+    job waits. Not taken under --smoke, --pin-only or --device cpu. Returns (open lock file, seconds waited)."""
+    if args.smoke or args.pin_only or (args.device or "").startswith("cpu"):
+        return None, 0.0
+    try:
+        import fcntl
+    except ImportError:
+        return None, 0.0
+    path = runtime.PILOT_ROOT / "logs" / ".p1_gpu.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(path, "a")
+    t0 = time.perf_counter()
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print(f"[p1_checkpoints] another P1 job holds {path}; waiting for it to finish", flush=True)
+        fcntl.flock(f, fcntl.LOCK_EX)
+    return f, time.perf_counter() - t0
+
+
 def main():
     ap = runtime.base_parser(__doc__)
     ap.add_argument("--suite", default=None, help="comma-separated suites from config.py (default: every suite "
@@ -307,7 +331,12 @@ def main():
                     help="sequences per JVP micro-batch (default: the suite's jvp_batch in config.py, else 32)")
     args = ap.parse_args()
     cfg = config.get("p1_checkpoints", args.smoke)
+    _held, waited = gpu_lock(args)               # before CUDA starts: a waiting job holds no GPU memory; the lock
+                                                 # lasts as long as this process (and _held)
     run = runtime.start_run("p1_checkpoints", cfg, args)
+    if waited > 1:
+        run.note(f"waited {waited / 3600:.2f} h for the P1 GPU lock (logs/.p1_gpu.lock); progress.txt's elapsed "
+                 f"hours for this job include the wait")
     rng = runtime.rng(run.seed)
     dev = run.device
     dtype = getattr(torch, cfg.get("dtype", "float32"))

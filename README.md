@@ -227,6 +227,35 @@ tail -f logs/progress.txt
 - **Output folders.** Each job writes to `results/<job>/` (`--out`), so the three P1 suites and the two P4 models do
   not overwrite each other.
 
+### A second lane for P1 next to run_all.sh: `run_lane.sh`
+
+P1's suites are mostly download-bound, so they can run next to another GPU job. `run_lane.sh` runs P1 jobs one
+after another with the same commands and `--out` folders as `run_all.sh`, and writes the same records (START/END
+lines in `logs/progress.txt`, tagged "(lane)", `logs/<job>.log`, `logs/<job>.done` on success, and atomically
+`results_archive/<job>.tar.gz` and `results_archive/pins.json`), so a later `run_all.sh` skips the finished jobs.
+It does not change `run_all.sh`; pull first (see "Pulling on the L40S" below), then:
+
+```bash
+nohup taskset -c 7-10 bash run_lane.sh p1_pythia p1_polypythia p1_olmo > logs/run_lane.out 2>&1 &
+```
+
+- **GPU memory.** By `python memory_check.py p1` the suites peak at 16.3 (pythia), 7.7 (polypythia) and 17.3 GiB
+  (olmo); with P3's 13 GiB that is at most about 30.6 GiB of tensors, plus about 0.5 GiB of CUDA context per
+  process, against 44.4 GiB. Before each job the lane waits until the GPU has the job's peak plus 4 GiB free
+  (`nvidia-smi`; `LANE_HEADROOM_GIB`).
+- **One P1 job at a time.** `p1_checkpoints.py` holds an exclusive lock (`logs/.p1_gpu.lock`) for its whole run,
+  taken before CUDA starts. So `run_all.sh`'s `p1_olmo7b` (31.5 GiB) never overlaps a lane suite: whichever comes
+  second waits, holding no GPU memory, and notes the wait in its `run.json` (its elapsed hours in progress.txt
+  include the wait).
+- **Shared files.** `pins.json` is written under a lock (`pins.json.lock`) from a per-process temporary file and
+  renamed into place; entries only grow, and the file on disk wins where two jobs carry the same field, so no job
+  undoes another's additions. progress.txt lines are appended one write each, so lines from the two scripts never
+  mix. Each job has its own log, `.done` file and archive.
+- **Checks.** Only P1 jobs are accepted; a job with a `.done` file is skipped; a job that progress.txt shows as
+  running is refused; while `run_all.sh` runs, only jobs before its current job in its order are accepted (it
+  will not run those again); a second lane does not start (`logs/.run_lane.lock`). `--dry-run` shows what would
+  run. Until the lane has finished, start any new `run_all.sh` with `--skip` for the lane's jobs.
+
 ### GPU memory on the L40S
 
 The first full P4 transformer job (2026-11-15) ran out of memory after training, in `measure()`: the Hessian-vector
@@ -591,7 +620,7 @@ before the run.
 
 ## Unit tests
 
-`python -m pytest -q` (149 tests, about 2 min on a CPU; `-m "not slow"` skips the two slowest). Synthetic data with
+`python -m pytest -q` (154 tests, about 2 min on a CPU; `-m "not slow"` skips the two slowest). Synthetic data with
 known parameters:
 
 - stable density against the Gaussian and Cauchy closed forms and against SciPy; ML fit recovers α ∈ {1.2, 1.5, 1.8},
@@ -620,6 +649,9 @@ known parameters:
   run falls back for a dataset only when the Hub is unreachable; `check_data.py` lists every split and smoke reads
   the same ones; no `load_dataset` call outside `common/hf.py`; blank WikiText rows are skipped by `load_texts`
   and by `check_data.py`; `merge_pins.py` and the pull recipe keep every local and committed pin;
+- `run_lane.sh`: run_all.sh's job order and P1 commands; its records next to a running run_all.sh (a stand-in
+  Python), refusal of jobs run_all.sh will still run and of non-P1 jobs, one lane at a time; P1's GPU lock makes
+  a second P1 job wait; two jobs saving `pins.json` keep each other's entries;
 - P2's outlier scheme: a kept channel 1000 times larger leaves every other channel's activation error, the other
   weight columns and the layer's output error unchanged (before the fix it rounded most of them to zero); the
   rotation arm in bfloat16 adds no rounding beyond bfloat16 storage;

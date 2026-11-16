@@ -188,12 +188,26 @@ class Pins:
         return sha
 
     def save(self):
-        on_disk = json.loads(self.path.read_text()) if self.path.exists() else {}
-        on_disk.update(self.data)                # merge: another job may have pinned other names
-        self.data = on_disk
-        tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(dict(sorted(on_disk.items())), indent=1) + "\n")
-        os.replace(tmp, self.path)
+        """Merge into the file on disk and write it atomically, under an exclusive lock (pins.json.lock), so two
+        jobs that pin names at the same time (a run_lane.sh job next to run_all.sh) lose nothing. Entries only
+        grow: a name keeps its commit, and a job adds names and fields (deduped_check). So the file on disk wins
+        where both carry a field, which keeps another job's newer entries over this job's older copy (read at
+        import), and this job's new names and fields are added."""
+        try:
+            import fcntl
+        except ImportError:                       # not Linux: no lock (the cloud run and WSL are Linux)
+            fcntl = None
+        with open(self.path.with_name(self.path.name + ".lock"), "a") as lock:
+            if fcntl is not None:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+            on_disk = json.loads(self.path.read_text()) if self.path.exists() else {}
+            for k, v in self.data.items():
+                d = on_disk.get(k)
+                on_disk[k] = {**v, **d} if isinstance(d, dict) and isinstance(v, dict) else (v if d is None else d)
+            self.data = on_disk
+            tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(dict(sorted(on_disk.items())), indent=1) + "\n")
+            os.replace(tmp, self.path)
 
 
 PINS = Pins()
