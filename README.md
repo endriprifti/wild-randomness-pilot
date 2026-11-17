@@ -195,8 +195,10 @@ multifractal.
 **Series.** Only what the jobs saved, read without changing anything:
 
 - (a) the token-surprisal series of every P1 checkpoint whose GPU pass is done (`row.json` present):
-  `checkpoints/<pass>/<checkpoint>/samples/htok.npy`, 16 documents of 2,048 tokens one after another
-  (n = 32,768);
+  `checkpoints/<pass>/<checkpoint>/samples/htok.npy`, 16 "documents" one after another, each a window of 2,048
+  tokens with 2,047 surprisals (n = 32,752). The windows are cut from Pile validation documents joined with EOS
+  (`hf.tokenize_stream`), so a window can hold several documents or part of one, and each is a separate forward
+  pass;
 - (b) the gradient-noise series of every finished P4 run (a row in `runs/<tag>.json` or `runs.csv`):
   `hgrad_series/<tag>.npy`, the unclipped minibatch gradient projected on 8 fixed random directions at every step,
   after warm-up as for H_grad (transformer 9,064 steps, ResNet-18 about 11,500). A run's statistics are means over
@@ -221,8 +223,27 @@ rows). There the transformer series fail the two-decade clause and cannot pass: 
 `decades_flag` reads "below 2 decades (DFA 1.96, wavelet 2.11)". `pass_ignoring_decades` (reported only) gives
 the p-value part without that clause.
 
-**Calibration** (`python h_link.py --calibrate`, run first; 100 series per kind and length, at P1's length 32,768
-and at the shortest P4 length 9,064, scales 8 to n/10; parameters ours, fixed before the calibration ran: SαS
+**Confound controls** (Endri, 2026-11-17, fixed before any H_link value on real data was computed; part of the same
+test, reported beside the main rows; the pass rule is unchanged):
+
+- **Documents joined (P1).** 99 within-document shuffles: the surprisals are shuffled inside each of the 16
+  documents and the documents stay in place, so each keeps its level and spread and loses any clustering inside it.
+  `p_doc_dfa`, `p_doc_wav` (H of the magnitudes against these) and `p_doc_width` (MFDFA width), with
+  `memory_beyond_documents` (both H p-values < 0.05, over two decades), `width_beyond_documents` (`p_doc_width`
+  < 0.05) and `beyond_documents` (both). The shuffles are drawn after the other surrogates, so the main columns are
+  what they would be without the control.
+- **Drifting full-batch gradient (P4).** Extra rows with `scales` = "detrended": the same test (scales 8 to n/10) on
+  the projections minus their centred moving median of **201 steps** (`hlink.DETREND_WIDTH`; reflected at the ends;
+  each direction on its own). Why 201: P4's learning rate is constant after warm-up, so the full-batch gradient
+  drifts as the loss falls. A median of x removes that level and keeps the spread, where volatility clustering
+  lives, so the window can be short without removing the effect under test. 201 steps follow a drift with periods
+  of 3,000 steps or more to within 1% (1,000 steps: 6%; measured on a cosine plus Gaussian noise). The median's own
+  noise is about 0.08 noise SDs (under 1% of the variance). The window is odd, so centred, and fixed in steps for
+  every run, below the largest DFA scale (906): linear memory slower than about 200 steps goes with the drift, the
+  memory of the magnitudes does not.
+
+**Calibration** (`python h_link.py --calibrate`, run first; 100 series per kind and length, at 32,768 (P1's series
+have 32,752) and at the shortest P4 length 9,064, scales 8 to n/10; parameters ours, fixed before the calibration ran: SαS
 α = 1.5; fGn H = 0.75; multifractal random walk with λ² = 0.05 and integral scale n, Δh = 0.0875 in theory;
 random-order binomial cascade with a = 0.75, Δh = 0.439 in theory). This environment's CPU, 4 workers at nice 19,
 57 min. Shipped as `reference/h_link_calibration.csv` (one row per series and scale range) and
@@ -252,6 +273,42 @@ random-order binomial cascade with a = 0.75, Δh = 0.439 in theory). This enviro
 - **10 to n/10.** No series of 9,064 values can pass there (1.96 decades); without that clause the rates are those
   of the main rows.
 
+**Control calibration** (`python h_link.py --calibrate` runs it after the calibration above; 100 series per kind;
+parameters ours, fixed before it ran; about 1 h here on 4 workers; shipped as
+`reference/h_link_calibration_controls.csv` and `reference/h_link_calibration_controls_summary.csv`):
+
+- shifted documents: 16 documents of 2,047 i.i.d. values (standardized Gamma(2), skewed like surprisal), each with
+  a level drawn from N(0, 0.5²) and a spread multiplied by exp(N(0, 0.3²)), in within-document SDs (chosen large,
+  so the control meets a strong confound);
+- MRW in documents: the MRW above (λ² = 0.05), 32,752 values cut into 16 documents of 2,047;
+- drift (`hlink.drift`): exp(−t/500) plus cosines of periods n, n/2 and n/3 with random amplitudes and phases,
+  scaled to the SD of the series it is added to (a relaxation as fast as 500 steps and slow swings, as large as the
+  noise), added to i.i.d. N(0, 1) (the drift alone), to fGn with H = 0.75 and to the MRW, at n = 9,064.
+
+Documents (n = 32,752, main rows):
+
+| Series (expected) | Pass | Memory part | Width part | Memory beyond documents | Width beyond documents | `beyond_documents` | H(\|x\|) DFA: series / shuffled / within-document |
+|---|---|---|---|---|---|---|---|
+| shifted i.i.d. documents (beyond_documents: fail) | 0.00 | 1.00 | 0.00 | 0.01 | 0.03 | 0.00 | 0.76 / 0.50 / 0.75 |
+| MRW in 16 documents (beyond_documents: pass) | 0.92 | 1.00 | 0.92 | 1.00 | 0.90 | 0.90 | 0.88 / 0.50 / 0.70 |
+
+Drift (n = 9,064):
+
+| Series (expected) | Main: pass / memory part / width part | Detrended: pass / memory part / width part | H(\|x\|) DFA, main / detrended (shuffled: 0.50) |
+|---|---|---|---|
+| i.i.d. plus drift (detrended: fail, the drift alone) | 0.02 / 0.97 / 0.02 | 0.00 / 0.01 / 0.04 | 0.69 / 0.50 |
+| fGn plus drift (detrended: fail) | 0.05 / 1.00 / 0.05 | 0.02 / 0.58 / 0.06 | 0.79 / 0.54 |
+| MRW plus drift (detrended: pass) | 0.69 / 1.00 / 0.69 | 0.81 / 1.00 / 0.81 | 0.84 / 0.84 |
+
+- **Documents.** Shifted documents fool the memory part against shuffled surrogates in every series (H(|x|) 0.76
+  against 0.50); against within-document shuffles (0.75) they are beyond documents in none. Their main pass stays
+  at 0 only because their width is negative (Δh −0.10). The MRW cut into the same documents is beyond documents in
+  90% of series (its H(|x|) 0.88 against 0.70 within documents).
+- **Drift.** The drift alone makes the memory part pass in 97% of i.i.d. series (H(|x|) 0.69) and in 1% once
+  detrended. Detrended, fGn with the drift passes in 2%: its memory part still passes in 58% (its own linear memory
+  within 200 steps), and the width part stops it. The MRW with the drift passes in 69% (the drift lowers its width)
+  and, detrended, in 81%, its rate without any drift.
+
 **Commands** (in the pilot folder inside the venv, after pulling; the lanes, the queue and olmo7b keep the code they
 loaded, and this job only reads their folders):
 
@@ -265,21 +322,24 @@ processes (`--workers`) run at nice 19 with one thread each. It finds every `res
 `*_recomputed` copies, which share their source's samples) and every `results/p4_*/` with `hgrad_series/`.
 Series that do not exist yet (the queued p4_transformer, checkpoints still to come) are not listed; the same
 command later computes only the new series (and any whose file changed) and rewrites the CSVs. It writes
-`results/h_link/`: `p1_tokens.csv` and `p4_grad.csv` (two rows per series, `scales` main and sensitivity, with
-every H, surrogate mean and 95% quantile, p-value and flag), `summary.csv` (pass rates per folder, model size in P1
-or model in P4, and scale range; diverged P4 runs are in `p4_grad.csv` only), `data/units/` (one JSON per series)
-and `progress.json` (measured hours per series and hours left, summed over workers). On this environment's CPU a
-P1 series takes about 30 s and a P4 transformer run (8 directions) about 85 s per worker; the server's own times
-are in `progress.json` once the first series are saved.
+`results/h_link/`: `p1_tokens.csv` (two rows per checkpoint, `scales` main and sensitivity, each with the documents
+control's columns) and `p4_grad.csv` (three rows per run: main, sensitivity and detrended), with every H,
+surrogate mean and 95% quantile, p-value and flag; `summary.csv` (rates per folder, model size in P1 or model in P4,
+and `scales`, including `beyond_documents_rate`; diverged P4 runs are in `p4_grad.csv` only); `data/units/` (one
+JSON per series) and `progress.json` (measured hours per series and hours left, summed over workers). On this
+environment's CPU a P1 series takes about 35 s and a P4 transformer run (8 directions, with its detrended rows)
+about 3 min per worker; the server's own times are in `progress.json` once the first series are saved.
 
 **Caveats.**
 
-- P1's series joins 16 documents. A change of surprisal level from one document to the next is a slow change in
-  the magnitudes, which DFA and the wavelet estimator read as memory and shuffling removes, so the memory part
-  cannot tell document-level shifts from clustering within documents (one document, 2,048 tokens, spans only 1.4
-  decades from 8 to n/10).
-- P4's projections include the full-batch gradient, which changes slowly over training; that drift also raises H
-  of the magnitudes. The series are H_grad's, by the same definition.
+- P1's series joins 16 documents, and a change of surprisal level or spread between them reads as memory against
+  shuffled surrogates (the shifted documents above pass the memory part every time); `beyond_documents` is the
+  reading that controls for it. What the within-document shuffle cannot remove is structure inside a window that
+  is not clustering: surprisal falls with the position in the context (each window is a fresh forward pass, so its
+  first tokens are surprising), and a window can contain the boundary between two Pile documents.
+- P4's projections include the full-batch gradient, which drifts as the loss falls; the detrended rows remove its
+  level. A drift of the noise's spread (the minibatch noise shrinking or growing over training) is not a level, so
+  the median leaves it, and it raises H of the magnitudes as clustering would.
 - Linear memory alone passes the memory part (fGn above), so read `memory_beyond_linear` beside `memory_pass`; and a
   failed width part does not rule out cascade-type multifractality with a very broad marginal (the cascade above).
 - Rates are per series; the checkpoints of one run, and the runs of one seed, are not independent.
@@ -949,7 +1009,7 @@ before the run.
 
 ## Unit tests
 
-`python -m pytest -q` (203 tests, about 6 min on a 4-core CPU; `-m "not slow"` skips the slowest). Synthetic data with
+`python -m pytest -q` (208 tests, about 7 min on a 4-core CPU; `-m "not slow"` skips the slowest). Synthetic data with
 known parameters:
 
 - stable density against the Gaussian and Cauchy closed forms and against SciPy; ML fit recovers α ∈ {1.2, 1.5, 1.8},
@@ -1041,7 +1101,11 @@ known parameters:
   i.i.d. Gaussian magnitudes near 1/2, a matrix's statistics as the mean over its columns, and `h_link.py` on stand-in
   P1 and P4 folders: only finished checkpoints and runs, warm-up cut as for H_grad, `*_recomputed` and empty
   folders skipped, the folders left unchanged, resume without recomputing, a changed file computed again, short
-  series skipped, diverged runs left out of the summary.
+  series skipped, diverged runs left out of the summary; the confound controls: a within-document shuffle keeps
+  each document's values in place, the documents control leaves the main columns unchanged, shifted documents
+  fool the shuffled baseline and not the within-document one while an MRW in documents is beyond them, the
+  moving median removes a slow drift and keeps the noise, P1 rows carry the control (document layout from
+  `run.json`) and P4 runs get detrended rows.
 
 ## Deviations, choices of ours, and items to verify
 

@@ -6,17 +6,22 @@ at nice 19, one thread each; the jobs' folders are only read.
 
 Series:
   P1   the token-surprisal series of every P1 checkpoint whose GPU pass is done (row.json):
-       checkpoints/<pass>/<repo>@<revision>/samples/htok.npy, 16 documents of 2,048 tokens one after another
+       checkpoints/<pass>/<repo>@<revision>/samples/htok.npy, 16 windows ("documents") of 2,048 tokens, 2,047
+       surprisals each, one after another (the layout from the folder's run.json)
   P4   the gradient-noise series of every finished P4 run (a row in runs.csv or runs/<tag>.json):
        hgrad_series/<tag>.npy, the unclipped minibatch gradient projected on 8 fixed random directions per step,
        after warm-up as for H_grad (P4's measure); the run's statistics are means over the 8 directions
-  calibration  synthetic series of known state (common/hlink.SYNTHETIC) at the lengths of the real series
+  calibration  synthetic series of known state (common/hlink.SYNTHETIC) at the lengths of the real series, and the
+       control calibration (hlink.CONTROL_N: shifted documents, MRW in documents, i.i.d., fGn and MRW plus a drift)
 Test per series (common/hlink.hlink_rows): H of |x - median| by DFA and wavelet against shuffled and phase-randomized
 surrogates; MFDFA Delta h of x against IAAFT surrogates; pass = p_shuf < 0.05 by both estimators over two decades
 AND p_iaaft < 0.05 (99 surrogates each). Two rows per series, on the same surrogates: scales "main" (DFA and MFDFA on
 8 ... n/10, fixed before any value was computed) and "sensitivity" (10 ... n/10, the s7.2 range; P4's transformer
 series fall below two decades there, see decades_flag). Series not saved yet (a run still queued or running, a
 checkpoint without its GPU pass) are not listed; run the command again later and only the new ones are computed.
+Confound controls (reported beside the main rows, the pass rule unchanged): P1 rows carry p_doc_* and
+beyond_documents (99 within-document shuffles); P4 runs get a third row, scales "detrended": the same test on the
+projections minus their centred moving median of 201 steps (hlink.DETREND_WIDTH).
 
 Outputs (results/h_link/, --out): calibration.csv and calibration_summary.csv (pass rates per kind and length),
 p1_tokens.csv, p4_grad.csv, summary.csv (pass rates per folder and group: model size in P1, model in P4, without
@@ -44,6 +49,7 @@ import argparse
 import concurrent.futures as cf
 import json
 import multiprocessing as mp
+import shutil
 import time
 from pathlib import Path
 
@@ -55,7 +61,8 @@ from common import hlink, runtime
 from common import units as units_mod
 
 ROOT = Path(__file__).resolve().parent
-CAL_LENGTHS = [32768, 9064]      # P1's token series (16 x 2,048); the shortest P4 series (transformer after warm-up)
+CAL_LENGTHS = [32768, 9064]      # about P1's token series (16 x 2,047 = 32,752); the shortest P4 series (transformer
+#                                  after warm-up)
 CAL_REPS = 100
 MIN_LEN = 100                    # shorter series are skipped (smoke: 50)
 
@@ -67,8 +74,35 @@ def stamp(f: Path) -> str:
     return f"{st.st_size}:{st.st_mtime_ns}"
 
 
+def _find(d, key):
+    """The first value of `key` in a nested dict (P1's run.json config)."""
+    if isinstance(d, dict):
+        if key in d:
+            return d[key]
+        for v in d.values():
+            r = _find(v, key)
+            if r is not None:
+                return r
+    return None
+
+
+def p1_docs(folder: Path) -> tuple[int, int]:
+    """(documents, surprisals per document) of the folder's H_tok series: rows of surprisal_len tokens give
+    surprisal_len - 1 losses each (run.json's config; the full settings if run.json is missing)."""
+    cfg = {}
+    if (folder / "run.json").exists():
+        try:
+            cfg = json.loads((folder / "run.json").read_text()).get("config", {})
+        except (ValueError, OSError):
+            cfg = {}
+    n_docs = _find(cfg, "surprisal_docs") or hlink.N_DOCS
+    length = _find(cfg, "surprisal_len") or hlink.DOC_LEN + 1
+    return int(n_docs), int(length) - 1
+
+
 def p1_series(folder: Path) -> list[dict]:
     out = []
+    n_docs, doc_len = p1_docs(folder)
     for rj in sorted((folder / "checkpoints").glob("*/*/row.json")):
         d = rj.parent
         f = d / "samples" / "htok.npy"
@@ -78,6 +112,7 @@ def p1_series(folder: Path) -> list[dict]:
         meta = {k: row.get(k) for k in ("suite", "variant", "size", "seed", "repo", "step", "revision")}
         out.append({"source": "p1", "folder": folder.name, "key": f"{folder.name}/{d.parent.name}/{d.name}",
                     "path": str(f), "stamp": stamp(f), "warm": 0, "p1_pass": row.get("pass"), "group": row.get("size"),
+                    "n_docs": n_docs, "doc_len": doc_len,
                     **meta})
     return out
 
@@ -143,15 +178,29 @@ def load_series(spec: dict) -> np.ndarray:
 def run_unit(spec: dict, test: dict, min_len: int = MIN_LEN) -> dict:
     t0 = time.perf_counter()
     rng = units_mod.rng_for(units_mod.seed_for(config.SEED, "h_link", spec["key"]))
+    how = {}                                                 # the confound control: {"doc_len": ..} or {"detrend": 1}
+    meta = {k: v for k, v in spec.items() if k not in ("path",)}
     if spec["source"] == "calibration":
         x = hlink.synthetic(spec["kind"], int(spec["n"]), rng)
+    elif spec["source"] == "control":
+        x, how = hlink.synthetic_control(spec["kind"], rng)
     else:
         x = load_series(spec)
-    meta = {k: v for k, v in spec.items() if k not in ("path",)}
+        if spec["source"] == "p4":
+            how = {"detrend": True}
+        elif len(x) == int(spec["n_docs"]) * int(spec["doc_len"]):
+            how = {"doc_len": int(spec["doc_len"])}
+        else:
+            meta["doc_note"] = f"{len(x)} values, not {spec['n_docs']} documents of {spec['doc_len']}: no control"
     if len(x) < min_len:
         return {**meta, "skipped": f"series of {len(x)} values (< {min_len})", "rows": [],
                 "seconds": round(time.perf_counter() - t0, 2)}
-    rows = hlink.hlink_rows(x, rng, **test)                  # main (s_min 8) and sensitivity (s_min 10) rows
+    # main (s_min 8) and sensitivity (s_min 10) rows; the documents control draws its surrogates after the others
+    rows = hlink.hlink_rows(x, rng, doc_len=how.get("doc_len"), **test)
+    if how.get("detrend"):                                   # then the same test on x minus its moving median
+        r = hlink.hlink_rows(hlink.detrend(x, hlink.DETREND_WIDTH), rng, **{**test, "s_min_sensitivity": None})[0]
+        r.update(scales="detrended", detrend_width=hlink.DETREND_WIDTH)
+        rows.append(r)
     return {**meta, "rows": rows, "seconds": round(time.perf_counter() - t0, 2)}
 
 
@@ -187,19 +236,35 @@ def run_all(specs: list[dict], units: units_mod.Units, test: dict, workers: int,
             save(f.result())
 
 
+FLAGS = ["pass", "memory_pass", "width_pass", "memory_beyond_linear", "pass_ignoring_decades", "two_decades",
+         "memory_beyond_documents", "width_beyond_documents", "beyond_documents"]
+MEDIANS = [("H_abs_dfa_median", "H_abs_dfa"), ("H_abs_dfa_shuf_median", "H_abs_dfa_shuf_mean"),
+           ("H_abs_dfa_doc_median", "H_abs_dfa_doc_mean"), ("H_abs_wav_median", "H_abs_wav"),
+           ("H_abs_wav_shuf_median", "H_abs_wav_shuf_mean"), ("H_abs_wav_doc_median", "H_abs_wav_doc_mean"),
+           ("delta_h_median", "delta_h"), ("delta_h_iaaft_median", "delta_h_iaaft_mean"),
+           ("delta_h_doc_median", "delta_h_doc_mean")]
+
+
+def _flag(v) -> float:
+    if isinstance(v, (bool, np.bool_)):
+        return float(v)
+    return {"True": 1.0, "False": 0.0, "true": 1.0, "false": 0.0}.get(str(v), np.nan)
+
+
 def rates(df: pd.DataFrame, by: list[str]) -> pd.DataFrame:
-    d = df[df.get("skipped", pd.Series(index=df.index, dtype=object)).isna()] if "skipped" in df else df
-    if not len(d):
+    """Rates of every flag per group (over the rows that have it; NaN where none has it) and medians."""
+    d = df[df["skipped"].isna()] if "skipped" in df else df
+    if not len(d) or "pass" not in d:
         return pd.DataFrame()
-    agg = d.groupby(by, dropna=False).agg(
-        series=("pass", "size"), pass_rate=("pass", "mean"), memory_pass_rate=("memory_pass", "mean"),
-        width_pass_rate=("width_pass", "mean"), memory_beyond_linear_rate=("memory_beyond_linear", "mean"),
-        pass_ignoring_decades_rate=("pass_ignoring_decades", "mean"), two_decades_rate=("two_decades", "mean"),
-        decades_dfa_min=("decades_dfa", "min"), H_abs_dfa_median=("H_abs_dfa", "median"),
-        H_abs_dfa_shuf_median=("H_abs_dfa_shuf_mean", "median"), H_abs_wav_median=("H_abs_wav", "median"),
-        H_abs_wav_shuf_median=("H_abs_wav_shuf_mean", "median"), delta_h_median=("delta_h", "median"),
-        delta_h_iaaft_median=("delta_h_iaaft_mean", "median"))
-    return agg.reset_index()
+    d = d.copy()
+    spec = {"series": ("pass", "size")}
+    for c in FLAGS:
+        if c in d:
+            d[c] = d[c].map(_flag)
+            spec[f"{c}_rate"] = (c, "mean")
+    spec["decades_dfa_min"] = ("decades_dfa", "min")
+    spec.update({name: (col, "median") for name, col in MEDIANS if col in d})
+    return d.groupby(by, dropna=False).agg(**spec).reset_index()
 
 
 def main(argv=None):
@@ -238,6 +303,9 @@ def main(argv=None):
         log(f"calibration: {len(specs)} synthetic series ({', '.join(hlink.SYNTHETIC)} x lengths {lengths} x {reps})")
         if args.dry_run:
             return 0
+        if args.smoke:                                      # smoke outputs are throwaway: start them afresh
+            for sub in ("calibration", "calibration_controls"):
+                shutil.rmtree(out / sub, ignore_errors=True)
         units = units_mod.Units(out / "calibration", {"test": test, "synthetic": hlink.SYNTHETIC, "seed": config.SEED},
                                 "h_link calibration", log=log)
         units.plan(s["key"] for s in specs)
@@ -249,14 +317,36 @@ def main(argv=None):
         cols = ["scales", "kind", "n", "series", "pass_rate", "memory_pass_rate", "width_pass_rate",
                 "memory_beyond_linear_rate", "pass_ignoring_decades_rate"]
         log("calibration pass rates:\n" + summ[cols].to_string(index=False))
+
+        creps = args.reps or (2 if args.smoke else CAL_REPS)
+        cspecs = [{"source": "control", "key": f"control/{k}/r{r}", "kind": k, "n": hlink.CONTROL_N[k],
+                   "replicate": r, "expected": hlink.CONTROL_EXPECTED[k]}
+                  for k in hlink.CONTROL_N for r in range(creps)]
+        log(f"control calibration: {len(cspecs)} synthetic series ({', '.join(hlink.CONTROL_N)} x {creps})")
+        cunits = units_mod.Units(out / "calibration_controls",
+                                 {"test": test, "controls": hlink.CONTROLS, "synthetic": hlink.CONTROL_SYNTHETIC,
+                                  "seed": config.SEED}, "h_link control calibration", log=log)
+        cunits.plan(s["key"] for s in cspecs)
+        run_all(cspecs, cunits, test, args.workers, args.nice, min_len)
+        cdf = table([cunits.get(s["key"]) for s in cspecs])
+        runtime.write_csv(out / "calibration_controls.csv", cdf.to_dict("records"))
+        csumm = rates(cdf, ["scales", "kind", "expected", "n"])
+        runtime.write_csv(out / "calibration_controls_summary.csv", csumm.to_dict("records"))
+        ccols = [c for c in ["scales", "kind", "n", "series", "pass_rate", "memory_pass_rate", "width_pass_rate",
+                             "memory_beyond_documents_rate", "width_beyond_documents_rate", "beyond_documents_rate"]
+                 if c in csumm]
+        log("control calibration rates:\n" + csumm[ccols].to_string(index=False))
         return 0
 
     found1, found4 = discover(Path(args.results), args.smoke)
     p1_dirs = [Path(p) for p in args.p1] if args.p1 is not None else found1
     p4_dirs = [Path(p) for p in args.p4] if args.p4 is not None else found4
     specs = [s for f in p1_dirs for s in p1_series(f)] + [s for f in p4_dirs for s in p4_series(f)]
+    if args.smoke and not args.dry_run:
+        shutil.rmtree(out / "data", ignore_errors=True)
     units = (None if args.dry_run
-             else units_mod.Units(out / "data", {"test": test, "seed": config.SEED}, "h_link", log=log))
+             else units_mod.Units(out / "data", {"test": test, "controls": hlink.CONTROLS, "seed": config.SEED},
+                                  "h_link", log=log))
     done = sum(units.has(s["key"]) and units.get(s["key"]).get("stamp") == s["stamp"] for s in specs) if units else 0
     for f in p1_dirs:
         log(f"P1 {f}: {sum(s['folder'] == f.name and s['source'] == 'p1' for s in specs)} checkpoint series")
