@@ -151,18 +151,19 @@ def test_main_resume_and_changed_file(tmp_path, capsys):
     assert sorted((p.relative_to(tmp_path), p.stat().st_mtime_ns) for p in (tmp_path / "res").rglob("*")) == before
     p1 = pd.read_csv(out / "p1_tokens.csv")
     p4r = pd.read_csv(out / "p4_grad.csv")
-    assert len(p1) == 4 and len(p4r) == 6                       # two series each: P1 2 rows, P4 3 rows each
-    assert sorted(p1["scales"].unique()) == ["main", "sensitivity"]
-    assert sorted(p4r["scales"].unique()) == ["detrended", "main", "sensitivity"]
+    assert len(p1) == 6 and len(p4r) == 8                       # two series each: P1 3 rows, P4 4 rows each
+    assert sorted(p1["scales"].unique()) == ["main", "sensitivity", "standardized"]
+    assert sorted(p4r["scales"].unique()) == ["detrended", "main", "rescaled", "sensitivity"]
+    assert set(p1["eos_status"]) == {"unverified"} and "p_piece_wav" not in p1      # run.json lacks the data config
     assert set(p1["doc_len"]) == {200} and p1["p_doc_dfa"].between(0, 1).all() and "beyond_documents" in p1
     assert "p_doc_dfa" not in p4r and set(p4r.loc[p4r["scales"] == "detrended", "detrend_width"]) == {201}
     assert set(p4r["n_series"]) == {3} and set(p4r["n"]) == {600}
     assert set(p4r["diverged"].astype(str)) == {"True", "False"}
     summ = pd.read_csv(out / "summary.csv")
-    assert summ.loc[summ["source"] == "p4", "series"].tolist() == [1, 1, 1]       # the diverged run is left out
+    assert summ.loc[summ["source"] == "p4", "series"].tolist() == [1, 1, 1, 1]    # the diverged run is left out
     assert set(zip(summ["source"], summ["group"], summ["scales"])) == {
-        ("p1", "14m", "main"), ("p1", "14m", "sensitivity"), ("p4", "resnet18", "main"),
-        ("p4", "resnet18", "sensitivity"), ("p4", "resnet18", "detrended")}
+        ("p1", "14m", "main"), ("p1", "14m", "sensitivity"), ("p1", "14m", "standardized"), ("p4", "resnet18", "main"),
+        ("p4", "resnet18", "sensitivity"), ("p4", "resnet18", "detrended"), ("p4", "resnet18", "rescaled")}
     assert summ.loc[summ["source"] == "p1", "beyond_documents_rate"].notna().all()
     saved = sorted((out / "data" / "units").glob("*.json"))
     stamps = {p.name: p.stat().st_mtime_ns for p in saved}
@@ -174,7 +175,7 @@ def test_main_resume_and_changed_file(tmp_path, capsys):
     np.save(f4 / "hgrad_series" / f"{tags[0]}.npy", rng.normal(size=(700, 3)))
     assert h_link.main(argv) == 0
     p4r = pd.read_csv(out / "p4_grad.csv")
-    assert sorted(p4r.loc[p4r["tag"] == tags[0], "n"]) == [660, 660, 660]
+    assert sorted(p4r.loc[p4r["tag"] == tags[0], "n"]) == [660, 660, 660, 660]
 
 
 def test_short_series_skipped(tmp_path):
@@ -259,5 +260,5 @@ def test_p4_unit_has_detrended_rows(tmp_path):
     f4, tags = _p4_folder(tmp_path, rng)
     spec = [s for s in h_link.p4_series(f4) if s["tag"] == tags[0]][0]
     res = h_link.run_unit(spec, dict(hlink.TEST_DEFAULTS, n_surr=3))
-    assert [r["scales"] for r in res["rows"]] == ["main", "sensitivity", "detrended"]
+    assert [r["scales"] for r in res["rows"]] == ["main", "sensitivity", "detrended", "rescaled"]
     assert res["rows"][2]["detrend_width"] == hlink.DETREND_WIDTH and res["rows"][2]["s_min"] == 8

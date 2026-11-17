@@ -15,7 +15,7 @@ plus `run.json` (config, git commit, GPU type and memory, library versions, wall
 | `p4_clipping.py` | H6.1, H7.1 control, H_grad | clipping sweep (fixed p_clip, AutoClip, ZClip, AGC), matched update length, flatness and tail measures |
 | `p1_checkpoints.py` | α, α_ESD, K, H, Δh across Pythia, PolyPythias, OLMo | measurement only on public checkpoints; H7.1 at training stages; exploratory coupling |
 | `p3_fractional_memory.py` | H4.1 | fractional block against S4 (LegS), S4D and Mamba at matched parameters and equal tuning budget |
-| `h_link.py` | H_link (exploratory, added 2026-11-17) | memory of the magnitudes and MFDFA width of P1's token-surprisal series and P4's gradient-noise series against surrogates, from saved samples (CPU) |
+| `h_link.py` | H_link (exploratory, added 2026-11-17) | memory of the magnitudes and MFDFA width of P1's token-surprisal series and P4's gradient-noise series against surrogates, with confound controls, from saved samples (CPU; `common/eos_rebuild.py` rebuilds P1's EOS positions) |
 | `memory_check.py` | (tooling) | peak GPU memory of the largest steps of P1, P3 and P4, estimated on the meta device (no GPU, no downloads) |
 
 Notation follows the paper: ζ is the fitted Pareto (survival) exponent, α = min(ζ, 2) only for the stable index.
@@ -309,6 +309,111 @@ Drift (n = 9,064):
   within 200 steps), and the width part stops it. The MRW with the drift passes in 69% (the drift lowers its width)
   and, detrended, in 81%, its rate without any drift.
 
+**Second set of confound controls** (Endri, 2026-11-17, fixed before any H_link value on real data was computed;
+part of the same test, reported beside the main rows; the pass rule is unchanged. The test is frozen after these:
+anything left is in the caveats):
+
+- **Position in the context (P1).** Each window is a fresh forward pass, so surprisal falls with the position in
+  the context, in level and in spread, and the same profile repeats in all 16 windows. Extra rows with `scales` =
+  "standardized": the same test (scales 8 to n/10), with the documents and pieces controls, on the series minus
+  its position profile in level, divided by its profile in spread (`hlink.position_standardize`). The profile is
+  estimated across the 16 windows: the median and the MAD (×1.4826) of all windows' surprisals pooled in
+  log-spaced position bins (24 edges from 1 to 2,048, about 7 per decade, rounded to whole positions: 23 bins;
+  positions 1 to 4 are bins of their own with 16 values each, the last bin has 557 positions and 8,912 values),
+  interpolated linearly in log position between the bins' geometric centres. Why this smoother: the profile is
+  steep over the first tokens and flat later, roughly a power law in position, so log-spaced bins resolve its head
+  and pool many values in its tail; the median and the MAD are robust to the heavy right tail of surprisal; no
+  functional form is assumed; 46 numbers are fitted to 32,752 values.
+- **Document boundaries inside the windows (P1).** `p_piece_dfa`, `p_piece_wav`, `p_piece_width`,
+  `memory_beyond_pieces`, `width_beyond_pieces` and `beyond_pieces`: as the documents control, against 99 shuffles
+  within each document piece (a window cut at the EOS tokens that end its documents), drawn after the
+  within-window shuffles, on the main, sensitivity and standardized rows. The EOS positions are not saved, so
+  `h_link.py` rebuilds them on the CPU (`common/eos_rebuild.py`) and uses them only where they reproduce the job's
+  losses:
+  - P1 built a folder's windows once per tokenizer from the first max(16, eval_seqs × eval_len / 400 + 16) Pile
+    validation documents at the pinned dataset commit, reversed and joined with EOS
+    (`hf.tokenize_stream(ev_texts[::-1], tok, 2048, 16)`). The rebuild repeats this with the dataset commit the run
+    recorded (run.json `pinned_commits`, else pins.json; it pins nothing and never writes pins.json), the folder's
+    run.json config and seed, the tokenizer at each checkpoint's commit, and `hf.tokenize_stream` itself (the
+    rebuilt windows are checked equal to its output).
+  - Checkpoints are grouped by the stream they were given: tokenizer files are identified by their Hub blob ids,
+    and since P1 reused the first tokenizer it loaded for a repo for all of that repo's revisions, a repo whose
+    revisions give different streams is left out as ambiguous.
+  - In each group the checkpoint with the fewest parameters is loaded on the CPU in float32 and its losses on every
+    rebuilt window are compared with its `htok.npy`. The group is verified if every window agrees (median
+    |difference| < 0.02 nats, 99th percentile < 0.25, correlation > 0.999; a stream off by one token differs by
+    nats). A model above `--eos-max-params` (default 2e9: every Pythia size and OLMo 2 1B; OLMo 2 7B needs about
+    29 GB of RAM in float32) is not loaded, and its group stays unverified unless the limit is raised.
+  - Cut rule: a window's losses are l_i = −log p(t_{i+1} | t_0 … t_i), i = 0 … 2,046. An EOS at token position e
+    ends a document and the next starts at token e + 1, whose loss is l_e, so a new piece starts at loss index e
+    (1 ≤ e ≤ 2,046).
+  - Everything is saved in `results/h_link/eos/<folder>.json` (inputs, tokenizer blob ids, stream hashes, the
+    check of each group, the EOS positions and cuts); the rows carry `eos_status`, `eos_reason`, `eos_group` and
+    `n_cuts`. A checkpoint without verified EOS positions has no piece columns, and its reason says why. Verified
+    groups are reused by later runs; failed ones are tried again after an error, with a larger `--eos-max-params`,
+    or with `--eos-retry`. `--no-eos` skips the rebuild; `--eos-threads` (4) sets the torch threads of the check.
+- **Drift in the noise level (P4).** Extra rows with `scales` = "rescaled": the detrended projections divided by
+  their centred moving MAD (×1.4826) over **4,001 steps** (`hlink.MAD_WIDTH`; reflected at the ends; each direction
+  on its own), so a slow change of the noise level is removed and clustering within the DFA range is kept. Why
+  4,001: it is 4.4 times the largest DFA scale of the transformer series (906) and 3.5 times ResNet-18's (about
+  1,150), so a burst of clustering as long as the largest scale analysed fills under a quarter of the window and
+  barely moves its MAD, which is robust to anything that fills less than half of it; and it is under half the
+  shortest series (9,064), so the MAD follows changes of the noise level over the run (as a moving average it
+  would keep 90% of a sinusoidal change with a period of 16,000 steps and 97% at 32,000). It is odd, so centred,
+  and fixed in steps for every run. Changes of the spread on time scales inside the DFA range are what volatility
+  clustering is at those scales and stay in.
+
+**Second control calibration** (`python h_link.py --calibrate` runs it after the first; 100 series per kind;
+parameters ours, fixed before it ran; about 2 h here on 4 workers, next to other work; shipped as
+`reference/h_link_calibration_controls2.csv` and `reference/h_link_calibration_controls2_summary.csv`):
+
+- position profile and document boundaries (`docs_profile`): 16 windows of 2,047 values with level 3 j^−0.5 plus
+  a piece level from N(0, 0.5²), and spread (1 + j^−0.5) times a piece spread exp(N(0, 0.3²)), times standardized
+  Gamma(2) noise (j: position in the window); a document boundary after each value with probability 1/1,000
+  (about two per window, 33 per series in the median), each piece with its own level and spread;
+- the same with the MRW (λ² = 0.05) in place of the i.i.d. noise (`mrw_profile`);
+- spread drift (`iid_spread`, `mrw_spread`): N(0, 1) or the MRW times exp(0.35 g), g the standardized sum of
+  exp(−t/3,000) and a cosine of period 2n with an N(0, 0.5²) amplitude and a random phase: the noise level relaxes
+  over the first few thousand steps and swings once over the run (its extremes differ by a factor of 3.6 in the
+  median series), n = 9,064.
+
+Position profile and boundaries (n = 32,752):
+
+| Series (expected) | Rows | Pass | `beyond_documents` | Memory beyond pieces | Width beyond pieces | `beyond_pieces` | H(\|x\|) DFA: series / within-window / within-piece |
+|---|---|---|---|---|---|---|---|
+| i.i.d. with profile and boundaries (standardized beyond_pieces: fail) | main | 0.01 | 0.92 | 0.09 | 0.66 | 0.07 | 0.80 / 0.68 / 0.80 |
+| i.i.d. with profile and boundaries (standardized beyond_pieces: fail) | standardized | 0.00 | 0.88 | 0.04 | 0.40 | **0.02** | 0.80 / 0.68 / 0.80 |
+| MRW with profile and boundaries (standardized beyond_pieces: pass) | main | 0.94 | 0.99 | 1.00 | 1.00 | 1.00 | 0.90 / 0.73 / 0.84 |
+| MRW with profile and boundaries (standardized beyond_pieces: pass) | standardized | 0.91 | 0.99 | 1.00 | 1.00 | **1.00** | 0.90 / 0.74 / 0.84 |
+
+Spread drift (n = 9,064; pass / memory part / width part):
+
+| Series (expected) | Main | Detrended | Rescaled | H(\|x\|) wavelet: main / rescaled (shuffled: 0.50) |
+|---|---|---|---|---|
+| i.i.d. × spread drift (rescaled: fail) | 0.14 / 0.64 / 0.19 | 0.16 / 0.65 / 0.25 | **0.07** / 0.19 / 0.13 | 0.61 / 0.52 |
+| MRW × spread drift (rescaled: pass) | 0.69 / 1.00 / 0.69 | 0.70 / 1.00 / 0.70 | **0.92** / 1.00 / 0.92 | 0.82 / 0.81 |
+
+- **Boundaries inside windows.** Two document boundaries per window make the i.i.d. series beyond documents in 88
+  to 92% of series: the within-window shuffle does not control for them. The piece shuffle does: `beyond_pieces`
+  2% on the standardized rows, 7% on the main rows (where the position profile, which the piece shuffles also
+  remove, adds to it).
+- **Standardizing.** On the standardized rows the piece control's rule held (2%), but its parts did not hold one by
+  one: against piece shuffles, DFA alone exceeded in 35% of the i.i.d. series, the width in 40%, the wavelet
+  estimator in 9%. The profile is estimated from the same 16 windows, so each bin's median and MAD absorb part of
+  the levels and spreads of the pieces that cover that bin, and subtracting it leaves a small position-dependent
+  level and spread inside each piece, which the shuffles remove. A check outside this calibration (8 series,
+  19 shuffles; not shipped) agrees: without standardizing the piece shuffles are exact, standardizing a series
+  that has no profile at all gives the same bias, coarser bins at the head do not change it, and a three-parameter
+  power-law fit of the profile reduces it by about half but assumes a form. The binned smoother was kept; read
+  only the full rule (`beyond_pieces`, `beyond_documents`) on the standardized rows, not their parts.
+- **MRW.** With the same profile and boundaries the MRW is beyond pieces in every series and passes in 91% on the
+  standardized rows (94% on the main rows).
+- **Spread drift.** The drift alone makes the i.i.d. series pass the whole test in 14% of series (memory part 64%;
+  width part 19%, since a changing variance also widens the MFDFA spectrum beyond IAAFT's). Detrending leaves it
+  (16%); rescaling halves it, to 7% (memory part 19%), but does not remove it: the relaxation over 3,000 steps is
+  faster than a 4,001-step window can follow. The MRW with the drift passes in 69% of the main rows and in 92%
+  rescaled.
+
 **Commands** (in the pilot folder inside the venv, after pulling; the lanes, the queue and olmo7b keep the code they
 loaded, and this job only reads their folders):
 
@@ -317,29 +422,49 @@ python h_link.py --dry-run          # the P1 and P4 folders and the finished ser
 nohup taskset -c 0-10 python h_link.py > logs/h_link.log 2>&1 &
 ```
 
-CPU only: `CUDA_VISIBLE_DEVICES` is emptied before anything is imported, torch is not imported, and 2 worker
-processes (`--workers`) run at nice 19 with one thread each. It finds every `results/p1_*/` with checkpoints (not the
+CPU only: `CUDA_VISIBLE_DEVICES` is emptied before anything is imported, and 2 worker processes (`--workers`) run
+at nice 19 with one thread each, without torch. The main process first rebuilds and checks the EOS positions of
+every P1 folder (torch and transformers on the CPU, `--eos-threads` threads; it downloads the tokenizer files'
+metadata, the tokenizers, the Pile validation documents it needs and one small checkpoint per tokenizer group, and
+removes that checkpoint from the Hugging Face cache again if it was not there before). It finds every `results/p1_*/` with checkpoints (not the
 `*_recomputed` copies, which share their source's samples) and every `results/p4_*/` with `hgrad_series/`.
 Series that do not exist yet (the queued p4_transformer, checkpoints still to come) are not listed; the same
 command later computes only the new series (and any whose file changed) and rewrites the CSVs. It writes
-`results/h_link/`: `p1_tokens.csv` (two rows per checkpoint, `scales` main and sensitivity, each with the documents
-control's columns) and `p4_grad.csv` (three rows per run: main, sensitivity and detrended), with every H,
-surrogate mean and 95% quantile, p-value and flag; `summary.csv` (rates per folder, model size in P1 or model in P4,
-and `scales`, including `beyond_documents_rate`; diverged P4 runs are in `p4_grad.csv` only); `data/units/` (one
-JSON per series) and `progress.json` (measured hours per series and hours left, summed over workers). On this
-environment's CPU a P1 series takes about 35 s and a P4 transformer run (8 directions, with its detrended rows)
-about 3 min per worker; the server's own times are in `progress.json` once the first series are saved.
+`results/h_link/`: `p1_tokens.csv` (three rows per checkpoint, `scales` main, sensitivity and standardized, each
+with the documents control's columns and, where the EOS positions are verified, the pieces control's) and
+`p4_grad.csv` (four rows per run: main, sensitivity, detrended and rescaled), with every H, surrogate mean and 95%
+quantile, p-value and flag; `summary.csv` (rates per folder, model size in P1 or model in P4, and `scales`,
+including `beyond_documents_rate` and `beyond_pieces_rate`; diverged P4 runs are in `p4_grad.csv` only);
+`eos/<folder>.json` (the EOS rebuild); `data/units/` (one JSON per series) and `progress.json` (measured hours per
+series and hours left, summed over workers). A checkpoint whose EOS positions are verified later (after
+`--eos-retry`, say) is computed again. On this
+environment's CPU a P1 series takes about 2 min (three rows, both shuffle controls) and a P4 transformer run (8
+directions, four rows) about 4 min per worker; the server's own times are in `progress.json` once the first series are saved.
 
 **Caveats.**
 
-- P1's series joins 16 documents, and a change of surprisal level or spread between them reads as memory against
-  shuffled surrogates (the shifted documents above pass the memory part every time); `beyond_documents` is the
-  reading that controls for it. What the within-document shuffle cannot remove is structure inside a window that
-  is not clustering: surprisal falls with the position in the context (each window is a fresh forward pass, so its
-  first tokens are surprising), and a window can contain the boundary between two Pile documents.
+- P1's series joins 16 windows, and a change of surprisal level or spread between them reads as memory against
+  shuffled surrogates (the shifted documents above pass the memory part every time); `beyond_documents` controls
+  for it, `beyond_pieces` also for document boundaries inside a window, and the standardized rows also for the
+  position profile. What these leave:
+  - the profile is by position in the window, the context the model saw, not by position in the document: after
+    an EOS inside a window the next document starts with surprising tokens while the previous one is still in the
+    context, and that rise inside a piece is removed by the piece shuffles, so it reads as structure beyond pieces;
+  - one profile is removed for all windows; documents whose profile differs (code against prose, say) keep the
+    difference;
+  - standardizing by a profile estimated from the same 16 windows makes the shuffle controls anti-conservative
+    for the parts of the standardized rows (in the i.i.d. calibration, DFA alone beyond pieces in 35% of series,
+    the width in 40%); only the full rule held (2%), so read `beyond_pieces` and `beyond_documents` there, not
+    their parts;
+  - where the EOS positions cannot be verified (the Hub unreachable, the group's smallest checkpoint above
+    `--eos-max-params`, a mismatch, an ambiguous repo) a checkpoint has no piece columns, and only
+    `beyond_documents` controls for the joins.
 - P4's projections include the full-batch gradient, which drifts as the loss falls; the detrended rows remove its
-  level. A drift of the noise's spread (the minibatch noise shrinking or growing over training) is not a level, so
-  the median leaves it, and it raises H of the magnitudes as clustering would.
+  level and the rescaled rows its slow changes of spread. Changes of the noise level on time scales inside the DFA
+  range (shorter than a few thousand steps) are not removed: at those scales a deterministic change of the noise
+  level and volatility clustering look the same to this test. A relaxation of the noise level over 3,000 steps is
+  only partly removed (false passes 14% to 7% in the calibration). The rescaling also removes the slowest part of
+  real clustering (periods beyond about 16,000 steps), which the main rows include.
 - Linear memory alone passes the memory part (fGn above), so read `memory_beyond_linear` beside `memory_pass`; and a
   failed width part does not rule out cascade-type multifractality with a very broad marginal (the cascade above).
 - Rates are per series; the checkpoints of one run, and the runs of one seed, are not independent.
@@ -1009,7 +1134,7 @@ before the run.
 
 ## Unit tests
 
-`python -m pytest -q` (208 tests, about 7 min on a 4-core CPU; `-m "not slow"` skips the slowest). Synthetic data with
+`python -m pytest -q` (222 tests, about 9 min on a 4-core CPU; `-m "not slow"` skips the slowest). Synthetic data with
 known parameters:
 
 - stable density against the Gaussian and Cauchy closed forms and against SciPy; ML fit recovers α ∈ {1.2, 1.5, 1.8},
@@ -1105,7 +1230,16 @@ known parameters:
   each document's values in place, the documents control leaves the main columns unchanged, shifted documents
   fool the shuffled baseline and not the within-document one while an MRW in documents is beyond them, the
   moving median removes a slow drift and keeps the noise, P1 rows carry the control (document layout from
-  `run.json`) and P4 runs get detrended rows.
+  `run.json`) and P4 runs get detrended rows; the second set: shuffles within pieces keep each piece's values, the
+  pieces control leaves the other columns unchanged, the position profile finds and removes a power-law profile in
+  level and spread, the moving MAD removes a slow spread drift and keeps bursts of 200 steps, P1 units get
+  standardized rows with the documents and pieces controls and P4 units rescaled rows, the second control
+  calibration runs (smoke); the EOS rebuild repeats `hf.tokenize_stream` with the EOS positions and the cut rule,
+  is verified on a smoke-like folder (byte tokenizer, Zipfian texts, stand-in models) with every cut after an EOS,
+  is reused by a later run, refuses losses shifted by one token (checked again only with `--eos-retry`), leaves a
+  group above `--eos-max-params` unverified until the limit is raised, marks a repo whose revisions give
+  different streams as ambiguous, and `h_link.py` attaches the cuts to the P1 rows (and drops them with
+  `--no-eos`).
 
 ## Deviations, choices of ours, and items to verify
 
