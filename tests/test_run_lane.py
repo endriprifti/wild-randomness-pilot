@@ -20,9 +20,9 @@ def _jobs(text):
 def test_lane_uses_run_all_order_and_commands():
     run_all, lane = (ROOT / "run_all.sh").read_text(), (ROOT / "run_lane.sh").read_text()
     assert _jobs(lane) == _jobs(run_all)
-    gpu = dict(re.findall(r"^gpu_job (p1_\w+)\s+\$PY (.+)$", run_all, re.M))
-    mine = dict(re.findall(r"^\s+(p1_\w+)\)\s+echo \"(.+)\" ;;$", lane, re.M))
-    assert set(gpu) == set(mine) == {"p1_pythia", "p1_polypythia", "p1_olmo", "p1_olmo7b"}
+    gpu = dict(re.findall(r"^gpu_job (p1_\w+|p3_fractional)\s+\$PY (.+)$", run_all, re.M))
+    mine = dict(re.findall(r"^\s+(p1_\w+|p3_fractional)\)\s+echo \"(.+)\" ;;$", lane, re.M))
+    assert set(gpu) == set(mine) == {"p1_pythia", "p1_polypythia", "p1_olmo", "p1_olmo7b", "p3_fractional"}
     assert all(gpu[j].strip() == mine[j] for j in gpu)
 
 
@@ -127,3 +127,75 @@ def test_pins_saved_by_two_jobs_keep_both_jobs_entries(tmp_path):
     assert set(disk) == {"a@main", "b@step1", "c@step2"}
     assert disk["a@main"]["deduped_check"] == {"verdict": "differs"}       # not undone by the older copy
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_p3_runs_in_its_own_lane_next_to_a_p1_lane(pilot):
+    """After the first P3 is stopped (run_all.sh wrote its END and went on to p1_olmo7b), a P3 lane starts next to
+    the running P1 lane; while run_all.sh still runs P3, or with P1 jobs in the same lane, it is refused."""
+    d, env = pilot
+    prog = d / "logs" / "progress.txt"
+    prog.write_text("2026-11-16T00:56:00Z  START  p3_fractional  total 51.00 h\n"
+                    "2026-11-17T09:00:00Z  START  p1_pythia  total 51.00 h  (lane)\n")
+    import time
+    p1_lane = subprocess.Popen(["flock", str(d / "logs" / ".run_lane.lock"), "sleep", "30"])
+    run_all = subprocess.Popen(["flock", str(d / "logs" / ".run_all.lock"), "sleep", "30"])
+    try:
+        time.sleep(0.3)
+        r = _run(d, env, "p3_fractional")
+        assert r.returncode == 1 and "progress.txt shows it running" in r.stderr
+        r = _run(d, env, "p3_fractional", "p1_olmo")
+        assert r.returncode == 2 and "lane of its own" in r.stderr
+        with prog.open("a") as f:
+            f.write("2026-11-17T10:00:00Z  END    p3_fractional  exit 143  elapsed 33.07 h  total 84.07 h\n"
+                    "2026-11-17T10:00:01Z  START  p1_olmo7b  total 84.07 h\n")
+        r = _run(d, env, "p3_fractional")
+    finally:
+        p1_lane.kill()
+        run_all.kill()
+    assert r.returncode == 0, r.stderr
+    last = prog.read_text().splitlines()[-2:]
+    assert [x.split()[1:3] for x in last] == [["START", "p3_fractional"], ["END", "p3_fractional"]]
+    assert all(x.endswith("(lane)") for x in last) and (d / "logs" / "p3_fractional.done").exists()
+    assert "p3_fractional_memory.py  --out results/p3_fractional" in (d / "logs" / "p3_fractional.log").read_text()
+
+
+def _hold(path, seconds):
+    import sys
+    h = subprocess.Popen([sys.executable, "-c", "import fcntl, sys, time; f = open(sys.argv[1], 'a'); "
+                          "fcntl.flock(f, fcntl.LOCK_EX); print('held', flush=True); time.sleep(float(sys.argv[2]))",
+                          str(path), str(seconds)], stdout=subprocess.PIPE, text=True)
+    assert h.stdout.readline().strip() == "held"
+    return h
+
+
+def test_olmo7b_waits_for_the_lanes_and_for_p3(tmp_path, monkeypatch):
+    import argparse
+    import time
+    import p1_checkpoints as p1
+    from common import gpu_locks, runtime
+    monkeypatch.setattr(runtime, "PILOT_ROOT", tmp_path)
+    monkeypatch.delenv("PILOT_LANE_LOCK", raising=False)
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    sleeps, real_sleep = [], time.sleep
+    monkeypatch.setattr(gpu_locks.time, "sleep", lambda s: (sleeps.append(s), real_sleep(0.2)))
+    lane = _hold(logs / ".run_lane.lock", 1.0)                      # a P1 lane runs
+    p3 = _hold(logs / ".p3_gpu.lock", 2.0)                           # and P3
+    t0 = time.perf_counter()
+    held, waited = p1.gpu_lock(argparse.Namespace(smoke=False, pin_only=False, device=None, suite="olmo7b"))
+    assert time.perf_counter() - t0 > 1.7 and waited > 1.7 and sleeps and len(held) == 2
+    assert lane.wait(timeout=5) == 0 and p3.wait(timeout=5) == 0     # both had ended
+    assert gpu_locks.is_held(logs / ".p3_gpu.lock")                 # olmo7b now holds P3's lock (P3 would wait)
+    for f in held:
+        f.close()
+    # another suite does not wait for lanes, and olmo7b inside a lane does not wait for its own lane
+    lane = _hold(logs / ".run_lane.lock", 3.0)
+    t0 = time.perf_counter()
+    held, _ = p1.gpu_lock(argparse.Namespace(smoke=False, pin_only=False, device=None, suite="polypythia"))
+    assert len(held) == 1 and time.perf_counter() - t0 < 1.0
+    held[0].close()
+    monkeypatch.setenv("PILOT_LANE_LOCK", str(logs / ".run_lane.lock"))
+    t0 = time.perf_counter()
+    held, _ = p1.gpu_lock(argparse.Namespace(smoke=False, pin_only=False, device=None, suite="olmo7b"))
+    assert len(held) == 2 and time.perf_counter() - t0 < 1.0
+    lane.kill()

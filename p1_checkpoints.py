@@ -79,7 +79,7 @@ import pandas as pd
 import torch
 
 import config
-from common import coupling, gradients, hf, lm, p1_tasks, runtime, spectra, stable
+from common import coupling, gradients, gpu_locks, hf, lm, p1_tasks, runtime, spectra, stable
 
 
 def suite_models(cfg, suite):
@@ -291,29 +291,36 @@ def directions(model, ids_hess, device, n_random, n_hessian, seed):
 noise_quantities = p1_tasks.noise_quantities   # moved to common/p1_tasks.py (runs in the pool)
 
 
+# suites that run only when no lane runs and never next to P3: olmo7b needs 31.5 GiB (memory_check.py), and with
+# P3's 10-13 GiB that exceeds the L40S's 44 GiB
+RUNS_ALONE = {"olmo7b"}
+
+
 def gpu_lock(args):
     """One P1 job on the GPU at a time (an exclusive lock on logs/.p1_gpu.lock, held until the process ends).
     run_lane.sh runs P1 suites next to run_all.sh; the lock keeps them from overlapping each other or run_all.sh's
     p1_olmo7b (31.5 GiB by memory_check.py, which with a 17.3 GiB suite would exceed the L40S's 44 GiB): the later
-    job waits. Not taken under --smoke, --pin-only or --device cpu. Returns (open lock file, seconds waited)."""
+    job waits. A suite in RUNS_ALONE (olmo7b) first waits until no run_lane.sh runs (so that it stays last instead of
+    taking the P1 lock between two suites of a lane) and takes logs/.p3_gpu.lock, which P3 holds while it runs
+    (common/gpu_locks.py). Not taken under --smoke, --pin-only or --device cpu. Returns (open lock files, seconds
+    waited)."""
     if args.smoke or args.pin_only or (args.device or "").startswith("cpu"):
         return None, 0.0
-    try:
-        import fcntl
-    except ImportError:
+    logs = runtime.PILOT_ROOT / "logs"
+    note = lambda m: print(f"[p1_checkpoints] {m}", flush=True)     # noqa: E731
+    held, waited = [], 0.0
+    if set(filter(None, (getattr(args, "suite", None) or "").split(","))) & RUNS_ALONE:
+        waited += gpu_locks.wait_for_lanes(logs, log=note)
+        f, w = gpu_locks.take(logs / ".p3_gpu.lock", f"P3 holds {logs / '.p3_gpu.lock'}; waiting for it to finish",
+                              log=note)
+        held.append(f)
+        waited += w
+    f, w = gpu_locks.take(logs / ".p1_gpu.lock", f"another P1 job holds {logs / '.p1_gpu.lock'}; waiting for it to "
+                          "finish", log=note)
+    if f is None:
         return None, 0.0
-    path = runtime.PILOT_ROOT / "logs" / ".p1_gpu.lock"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    f = open(path, "a")
-    t0 = time.perf_counter()
-    try:
-        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        print(f"[p1_checkpoints] another P1 job holds {path}; waiting for it to finish", flush=True)
-        fcntl.flock(f, fcntl.LOCK_EX)
-    return f, time.perf_counter() - t0
-
-
+    held.append(f)
+    return held, waited + w
 
 
 # ----------------------------------------------------------------------------- H7.1 stages
@@ -727,8 +734,8 @@ def main():
                                                  # lasts as long as this process (and _held)
     run = runtime.start_run("p1_checkpoints", cfg, args)
     if waited > 1:
-        run.note(f"waited {waited / 3600:.2f} h for the P1 GPU lock (logs/.p1_gpu.lock); progress.txt's elapsed "
-                 f"hours for this job include the wait")
+        run.note(f"waited {waited / 3600:.2f} h for the GPU locks (logs/.p1_gpu.lock; for olmo7b also the lanes "
+                 f"and logs/.p3_gpu.lock); progress.txt's elapsed hours for this job include the wait")
     dev = run.device
     dtype = getattr(torch, cfg.get("dtype", "float32"))
     skip = set(filter(None, args.skip.split(",")))

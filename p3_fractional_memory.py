@@ -8,25 +8,44 @@ and every arm gets the same learning-rate grid (equal tuning budget), steps and 
 Tasks:
   powerlaw     y_t = sum_k kappa_k g_{t-k}, kappa_k ~ (k+1)^-(1+nu*), lags 1..L (power-law memory)
   exponential  kappa_k ~ exp(-k / (tau_frac L))                        (exponential memory)
-  lra_image    Long Range Arena image task: CIFAR-10 in grayscale as 1,024-step sequences
+  lra_image    Long Range Arena image task: CIFAR-10 in grayscale as 1,024-step sequences, in one of the
+               designs of config.py's lra_designs: "reduced" (the default since 2026-11-17: 3 epochs, n_s 2, 8
+               and 32, seeds 1-3, tuned at n_s = 8 on seed 0) or "full" (--lra-design full, the first plan:
+               20 epochs, all six n_s, seeds 0-4, tuned at n_s = 16)
 Accuracy is R^2 on held-out sequences for the two regression tasks and classification
 accuracy for lra_image. H4.1 is refuted if the baseline accuracy-state curves lie on or above
 the fractional block's on the power-law task, or if any advantage does not depend on task type.
 
-Outputs (results/p3_fractional_memory/[smoke/]): runs.csv (one row per run incl. tuning trials,
-with params, FLOPs proxy, peak memory and wall-clock), curves.csv (best accuracy per arm, task,
-n_s, seed), states_to_target.csv, run.json
+Every run is saved as it finishes, and a restart with the same --out goes on from the saved runs
+(results/p3_fractional_memory/[smoke/] by default):
+  runs/<task>/<phase>_<arch>_ns<n_s>_seed<seed>_lr<lr>_steps<steps>.json   one finished run, written atomically
+  runs/<task>/settings.json   the settings that decide a run's result; a restart with others stops (new --out)
+  runs.csv          one row per run incl. tuning trials, with params, FLOPs proxy, peak memory and wall-clock
+  curves.csv        mean accuracy per task, arm and n_s over the finished main runs (n = seeds so far)
+  states_to_target.csv, and run.json at the end
+runs.csv, curves.csv and states_to_target.csv are rewritten after every run. A run's result depends only on
+its settings: each run seeds itself from its seed, and the synthetic data are drawn in config order from the run
+seed (as before 2026-11-17), whatever --tasks says; so restarts and the order of runs change nothing. Main runs
+go seed by seed (every arm and state size of one seed, then the next seed), so a P3 stopped early leaves whole
+seeds. A run stopped in the middle is lost and runs again from its start.
 
 Commands:
   python p3_fractional_memory.py
+  python p3_fractional_memory.py --plan              # saved and remaining runs, hours by measured step times
+  python p3_fractional_memory.py --adopt rescued_runs.json --plan   # runs recovered by p3_rescue.py
   python p3_fractional_memory.py --tasks powerlaw,exponential      # drop LRA first if time runs short
   python p3_fractional_memory.py --smoke
 """
 
 from __future__ import annotations
 
+import datetime as dt
+import json
 import math
+import os
+import signal
 import time
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -34,7 +53,12 @@ import torch
 import torch.nn.functional as F
 
 import config
-from common import hf, runtime, ssm
+from common import gpu_locks, hf, runtime, ssm
+
+SYNTHETIC = ("powerlaw", "exponential")
+CIFAR10_TRAIN = 50_000          # images in CIFAR-10's train split (checked when the data are loaded)
+# the settings that decide one run's result besides its key (phase, arch, n_s, seed, lr, steps)
+RESULT_KEYS = ("batch", "n_layers", "H_ref", "ref_arch", "weight_decay")
 
 
 def memory_task(kind, L, n, cfg_t, rng):
@@ -47,6 +71,22 @@ def memory_task(kind, L, n, cfg_t, rng):
     kappa /= np.sqrt((kappa ** 2).sum())
     y = np.real(np.fft.irfft(np.fft.rfft(g, 2 * L) * np.fft.rfft(kappa, 2 * L), 2 * L))[:, :L]
     return torch.tensor(g[..., None]), torch.tensor(y[..., None].astype(np.float32))
+
+
+def synthetic_data(cfg, seed, wanted):
+    """{task: (Xtr, Ytr, Xte, Yte)} for the synthetic tasks in `wanted`. All of them are drawn, in config order,
+    from one generator seeded with the run seed, as the code before 2026-11-17 did for a full run: a task's data
+    do not depend on which tasks this run trains."""
+    rng = runtime.rng(seed)
+    out = {}
+    for task, ct in cfg["tasks"].items():
+        if task not in SYNTHETIC:
+            continue
+        Xtr, Ytr = memory_task(task, ct["L"], ct["n_train"], ct, rng)
+        Xte, Yte = memory_task(task, ct["L"], ct["n_test"], ct, rng)
+        if task in wanted:
+            out[task] = (Xtr, Ytr, Xte, Yte)
+    return out
 
 
 def lra_image(cfg_t, run, rng):
@@ -90,14 +130,13 @@ def evaluate(model, X, Y, task, device, batch=64):
     return float(1 - resid / tot)
 
 
-def train_one(arch, task, n_s, H, data, cfg, lr, seed, device):
+def train_one(arch, task, n_s, H, data, cfg, lr, seed, device, steps):
     runtime.set_all_seeds(seed)
     Xtr, Ytr, Xte, Yte = data
     L = Xtr.shape[1]
     cls = task == "lra_image"
     model = ssm.SSMModel(arch, 1, 10 if cls else 1, H, n_s, cfg["n_layers"], L, pool=cls).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=cfg["weight_decay"])
-    steps = cfg["steps"] if not cls else cfg["lra_epochs"] * max(1, len(Xtr) // cfg["batch"])
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=lr, total_steps=steps, pct_start=0.1)
     g = torch.Generator().manual_seed(seed)
     if device.startswith("cuda"):
@@ -125,69 +164,385 @@ def train_one(arch, task, n_s, H, data, cfg, lr, seed, device):
             "flops_proxy": 6 * ssm.n_params(model) * steps * cfg["batch"] * L}
 
 
-def main():
-    ap = runtime.base_parser(__doc__)
-    ap.add_argument("--tasks", default=None)
-    ap.add_argument("--archs", default=None)
-    args = ap.parse_args()
-    cfg = config.get("p3_fractional_memory", args.smoke)
-    run = runtime.start_run("p3_fractional_memory", cfg, args)
-    rng = runtime.rng(run.seed)
-    dev = run.device
-    tasks = args.tasks.split(",") if args.tasks else list(cfg["tasks"])
-    archs = args.archs.split(",") if args.archs else cfg["archs"]
-    rows = []
-    for task in tasks:
-        ct = cfg["tasks"][task]
-        if task == "lra_image":
-            data, src = lra_image(ct, run, rng)
-        else:
-            Xtr, Ytr = memory_task(task, ct["L"], ct["n_train"], ct, rng)
-            Xte, Yte = memory_task(task, ct["L"], ct["n_test"], ct, rng)
-            data, src = (Xtr, Ytr, Xte, Yte), "synthetic"
-        L = data[0].shape[1]
-        cls = task == "lra_image"
-        def widths_for(n_s):
-            ref = ssm.SSMModel(cfg["ref_arch"], 1, 10 if cls else 1, cfg["H_ref"], n_s, cfg["n_layers"], L, pool=cls)
-            target = ssm.n_params(ref)
-            return target, {a: ssm.width_for_budget(a, 1, 10 if cls else 1, n_s, cfg["n_layers"], L, cls, target)
-                            for a in archs}
+# ----------------------------------------------------------------------------- the plan
+def task_settings(cfg: dict, task: str, design: str) -> dict:
+    """State sizes, seeds, tuning and steps per run of one task: the shared settings, and for lra_image those of
+    its design (epochs x train images // batch steps per run, as before)."""
+    s = {k: cfg[k] for k in ("n_states", "seeds", "tune_n_states", "tune_seed", "lr_grid")}
+    if task == "lra_image":
+        d = cfg["lra_designs"][design]
+        s.update({k: d[k] for k in ("n_states", "seeds", "tune_n_states", "tune_seed") if k in d})
+        n_train = cfg["tasks"][task].get("limit_train") or CIFAR10_TRAIN
+        s.update(design=design, epochs=d["epochs"], n_train=n_train,
+                 steps=d["epochs"] * max(1, n_train // cfg["batch"]))
+    else:
+        s.update(design="", steps=cfg["steps"])
+    return s
 
-        # equal tuning budget: the same LR grid for every arm, on the tuning seed at the tuning state size
-        best_lr = {}
-        n_tune = cfg["tune_n_states"]
-        target_t, widths_t = widths_for(n_tune)
-        for arch in archs:
-            trials = []
-            for lr in cfg["lr_grid"]:
-                r = train_one(arch, task, n_tune, widths_t[arch][0], data, cfg, lr, cfg["tune_seed"], dev)
-                rows.append({"task": task, "arch": arch, "n_s": n_tune, "H": widths_t[arch][0], "lr": lr,
-                             "seed": cfg["tune_seed"], "phase": "tune", "target_params": target_t,
-                             "data_source": src, **r})
-                trials.append((r["acc"] if np.isfinite(r["acc"]) else -np.inf, lr))
-            best_lr[arch] = max(trials)[1]
-        for n_s in cfg["n_states"]:
-            target, widths = widths_for(n_s)
-            for arch in archs:
-                H = widths[arch][0]
-                for seed in cfg["seeds"]:
-                    r = train_one(arch, task, n_s, H, data, cfg, best_lr[arch], seed, dev)
-                    rows.append({"task": task, "arch": arch, "n_s": n_s, "H": H, "lr": best_lr[arch], "seed": seed,
-                                 "phase": "main", "target_params": target, "data_source": src, **r})
-                run.note(f"{task} n_s={n_s} {arch}: H={H}, params={widths[arch][1]} (target {target}), lr={best_lr[arch]}")
-    df = pd.DataFrame(rows)
-    runtime.write_csv(run.out_dir / "runs.csv", rows)
-    main_runs = df[df.phase == "main"]
+
+def result_settings(cfg: dict, task: str, seed: int, smoke: bool) -> dict:
+    """What decides a run's result apart from its key: the task's data and the shared training settings."""
+    return json.loads(json.dumps({"task": cfg["tasks"][task], **{k: cfg[k] for k in RESULT_KEYS},
+                                  "seed": int(seed), "smoke": bool(smoke)}))
+
+
+def run_key(spec: dict) -> str:
+    return (f"{spec['phase']}_{spec['arch']}_ns{spec['n_s']}_seed{spec['seed']}_lr{spec['lr']:g}"
+            f"_steps{spec['steps']}")
+
+
+def plan_task(task: str, s: dict, archs: list[str]) -> tuple[list[dict], list[dict]]:
+    """Tuning runs (every arm at every LR, tuning seed and state size), then main runs seed by seed; a main run's
+    lr is the best of its arm's tuning runs (filled in once they are saved)."""
+    tune = [{"task": task, "phase": "tune", "arch": a, "n_s": s["tune_n_states"], "seed": s["tune_seed"], "lr": lr,
+             "steps": s["steps"]} for a in archs for lr in s["lr_grid"]]
+    main = [{"task": task, "phase": "main", "arch": a, "n_s": n, "seed": sd, "lr": None, "steps": s["steps"]}
+            for sd in s["seeds"] for n in s["n_states"] for a in archs]
+    return tune, main
+
+
+def _num(x) -> float:
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def best_lr(tune_rows: list[dict]) -> float:
+    """The tuning rule of the first P3: the LR with the highest accuracy (a diverged run counts as -inf; ties go
+    to the larger LR)."""
+    return max((_num(r["acc"]) if np.isfinite(_num(r["acc"])) else -np.inf, r["lr"]) for r in tune_rows)[1]
+
+
+class Widths:
+    """Matched widths per (task kind, n_s): (target params, {arch: (H, params)}), computed once."""
+
+    def __init__(self, cfg, archs):
+        self.cfg, self.archs, self.cache = cfg, archs, {}
+
+    def __call__(self, task: str, n_s: int):
+        cls, L = task == "lra_image", self.cfg["tasks"][task]["L"]
+        if (cls, L, n_s) not in self.cache:
+            c = self.cfg
+            ref = ssm.SSMModel(c["ref_arch"], 1, 10 if cls else 1, c["H_ref"], n_s, c["n_layers"], L, pool=cls)
+            target = ssm.n_params(ref)
+            self.cache[(cls, L, n_s)] = (target, {a: ssm.width_for_budget(a, 1, 10 if cls else 1, n_s, c["n_layers"],
+                                                                          L, cls, target) for a in self.archs})
+        return self.cache[(cls, L, n_s)]
+
+
+# ----------------------------------------------------------------------------- saved runs
+def atomic_json(path: Path, obj) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(runtime.to_jsonable(obj), default=str))
+    os.replace(tmp, path)
+
+
+class RunStore:
+    """runs/<task>/<key>.json, one per finished run, and runs/<task>/settings.json."""
+
+    def __init__(self, out_dir: Path):
+        self.dir = Path(out_dir) / "runs"
+        self.rows: dict[tuple[str, str], dict] = {}
+        for p in sorted(self.dir.glob("*/*.json")):
+            if p.name != "settings.json":
+                self.rows[(p.parent.name, p.stem)] = json.loads(p.read_text())
+
+    def check_settings(self, task: str, fp: dict) -> None:
+        path = self.dir / task / "settings.json"
+        if path.exists():
+            old = json.loads(path.read_text())
+            diff = sorted(k for k in set(old) | set(fp) if old.get(k) != fp.get(k))
+            if diff:
+                raise SystemExit(f"{path} was written with other settings ({', '.join(diff)}: saved {[old.get(k) for k in diff]}, "
+                                 f"now {[fp.get(k) for k in diff]}); its runs would not match. Use another --out.")
+        else:
+            atomic_json(path, fp)
+
+    def get(self, task: str, key: str) -> dict | None:
+        return self.rows.get((task, key))
+
+    def put(self, task: str, key: str, row: dict) -> None:
+        atomic_json(self.dir / task / f"{key}.json", row)
+        self.rows[(task, key)] = json.loads(json.dumps(runtime.to_jsonable(row), default=str))
+
+
+def step_seconds(rows) -> dict:
+    """Median seconds per training step by (arch, n_s) over the saved runs that did not diverge (the step costs
+    the same in every task: L = 1,024 and the same batch everywhere at full size)."""
+    by: dict = {}
+    for r in rows:
+        if not r.get("diverged") and r.get("steps") and np.isfinite(_num(r.get("wall_s"))):
+            by.setdefault((r["arch"], int(r["n_s"])), []).append(r["wall_s"] / r["steps"])
+    return {k: float(np.median(v)) for k, v in by.items()}
+
+
+def hours_for(specs: list[dict], per: dict) -> tuple[float | None, bool]:
+    """Hours of `specs` by the measured step times: (hours, True if some (arch, n_s) had no measurement and took
+    the arm's nearest state size, or the median of all); (None, True) without any measurement."""
+    if not per:
+        return (None, True) if specs else (0.0, False)
+    rough, total = False, 0.0
+    every = float(np.median(list(per.values())))
+    for sp in specs:
+        v = per.get((sp["arch"], sp["n_s"]))
+        if v is None:
+            rough = True
+            same = [(abs(math.log2(n) - math.log2(sp["n_s"])), t) for (a, n), t in per.items() if a == sp["arch"]]
+            v = min(same)[1] if same else every
+        total += v * sp["steps"]
+    return total / 3600, rough
+
+
+# ----------------------------------------------------------------------------- runs recovered from the old code
+def adopt(path: str, store: RunStore, cfg: dict, seed: int, smoke: bool, settings: dict, widths: Widths,
+          archs: list[str]) -> dict:
+    """Save the runs that p3_rescue.py recovered from a P3 process of the code before 2026-11-17 as finished runs,
+    after checking that the process used the same settings and that every run belongs to this plan. Returns
+    counts by outcome."""
+    d = json.loads(Path(path).read_text())
+    old_cfg, old_seed = d.get("cfg") or {}, d.get("seed")
+    origin = f"rescued from P3 pid {d.get('pid')} ({d.get('utc', '?')})"
+    ok_tasks = {}
+    for task in settings:
+        if task not in old_cfg.get("tasks", {}):
+            continue
+        try:
+            same = result_settings(old_cfg, task, old_seed, bool(d.get("smoke"))) == result_settings(cfg, task, seed, smoke)
+        except KeyError:
+            same = False
+        ok_tasks[task] = same
+        if not same:
+            print(f"[p3_fractional_memory] adopt: {task}: the rescued process used other settings; its runs are not used",
+                  flush=True)
+    counts = {"adopted": 0, "already saved": 0, "not in this plan": 0, "other settings": 0}
+    for r in d["rows"]:
+        task = r.get("task")
+        if task not in settings:
+            counts["not in this plan"] += 1
+            continue
+        if not ok_tasks.get(task):
+            counts["other settings"] += 1
+            continue
+        s = settings[task]
+        n_s, seed_r, phase = int(r["n_s"]), int(r["seed"]), r["phase"]
+        in_plan = (r["arch"] in archs and int(r["steps"]) == s["steps"] and r["lr"] in s["lr_grid"] and (
+            (phase == "tune" and n_s == s["tune_n_states"] and seed_r == s["tune_seed"]) or
+            (phase == "main" and n_s in s["n_states"] and seed_r in s["seeds"])))
+        target, w = widths(task, n_s) if in_plan else (None, {})
+        if not in_plan or int(r["H"]) != w[r["arch"]][0] or int(r["target_params"]) != target:
+            counts["not in this plan"] += 1
+            continue
+        spec = {"phase": phase, "arch": r["arch"], "n_s": n_s, "seed": seed_r, "lr": float(r["lr"]),
+                "steps": int(r["steps"])}
+        key = run_key(spec)
+        if store.get(task, key) is not None:
+            counts["already saved"] += 1
+            continue
+        store.check_settings(task, result_settings(cfg, task, seed, smoke))
+        store.put(task, key, {**r, "design": s["design"], "origin": origin})
+        counts["adopted"] += 1
+    print(f"[p3_fractional_memory] adopt {path}: " + ", ".join(f"{k} {v}" for k, v in counts.items()), flush=True)
+    return counts
+
+
+# ----------------------------------------------------------------------------- outputs
+def planned_rows(store: RunStore, plans: dict, archs: list[str]) -> list[dict]:
+    """The saved rows of the plan, in plan order; main runs of an arm count once its tuning runs are all saved."""
+    rows = []
+    for task, (s, tune, main) in plans.items():
+        t_rows = [store.get(task, run_key(sp)) for sp in tune]
+        rows += [r for r in t_rows if r is not None]
+        lrs = {a: best_lr([r for sp, r in zip(tune, t_rows) if sp["arch"] == a])
+               for a in archs if all(r is not None for sp, r in zip(tune, t_rows) if sp["arch"] == a)}
+        for sp in main:
+            if sp["arch"] in lrs:
+                r = store.get(task, run_key({**sp, "lr": lrs[sp["arch"]]}))
+                if r is not None:
+                    rows.append(r)
+    return rows
+
+
+def write_outputs(out_dir: Path, rows: list[dict], cfg: dict) -> None:
+    runtime.write_csv(out_dir / "runs.csv", rows)
+    main_runs = pd.DataFrame([r for r in rows if r["phase"] == "main"])
+    if main_runs.empty:
+        runtime.write_csv(out_dir / "curves.csv", [])
+        runtime.write_csv(out_dir / "states_to_target.csv", [])
+        return
     curves = main_runs.groupby(["task", "arch", "n_s"]).agg(acc_mean=("acc", "mean"), acc_sd=("acc", "std"),
                                                              params=("params", "mean"), n=("acc", "size")).reset_index()
-    runtime.write_csv(run.out_dir / "curves.csv", curves.to_dict("records"))
+    runtime.write_csv(out_dir / "curves.csv", curves.to_dict("records"))
     tgt = []
     for (task, arch), g in curves.groupby(["task", "arch"]):
         thr = cfg["target_accuracy"][task]
         hit = g[g.acc_mean >= thr].n_s
         tgt.append({"task": task, "arch": arch, "target_acc": thr, "min_n_s": int(hit.min()) if len(hit) else None})
-    runtime.write_csv(run.out_dir / "states_to_target.csv", tgt)
-    runtime.finish_run(run, extra={"n_runs": len(rows)})
+    runtime.write_csv(out_dir / "states_to_target.csv", tgt)
+
+
+def plan_table(store: RunStore, plans: dict, archs: list[str]) -> tuple[list[dict], list[dict]]:
+    """(one line per task and phase with runs, saved, left, steps and hours left, the specs still to run)."""
+    per = step_seconds(store.rows.values())
+    lines, todo_all = [], []
+    for task, (s, tune, main) in plans.items():
+        t_rows = [store.get(task, run_key(sp)) for sp in tune]
+        lrs = {a: best_lr([r for sp, r in zip(tune, t_rows) if sp["arch"] == a])
+               for a in archs if all(r is not None for sp, r in zip(tune, t_rows) if sp["arch"] == a)}
+        for phase, specs in (("tune", tune), ("main", main)):
+            todo = []
+            for sp in specs:
+                if phase == "main" and sp["arch"] in lrs:
+                    sp = {**sp, "lr": lrs[sp["arch"]]}
+                if sp["lr"] is None or store.get(task, run_key(sp)) is None:
+                    todo.append(sp)
+            h, rough = hours_for(todo, per)
+            lines.append({"task": task, "design": s["design"], "phase": phase, "runs": len(specs),
+                          "saved": len(specs) - len(todo), "left": len(todo), "steps_per_run": s["steps"],
+                          "hours_left": h, "rough": rough})
+            todo_all += todo
+    return lines, todo_all
+
+
+def print_plan(store: RunStore, plans: dict, archs: list[str], out_dir: Path) -> None:
+    lines, todo = plan_table(store, plans, archs)
+    per = step_seconds(store.rows.values())
+    print(f"P3 plan in {out_dir}:")
+    print(f"  {'task':12} {'design':8} {'phase':5} {'runs':>5} {'saved':>6} {'left':>5} {'steps/run':>10} {'hours left':>11}")
+    for ln in lines:
+        h = "?" if ln["hours_left"] is None else f"{ln['hours_left']:.1f}{' ~' if ln['rough'] and ln['left'] else ''}"
+        print(f"  {ln['task']:12} {ln['design'] or '-':8} {ln['phase']:5} {ln['runs']:5d} {ln['saved']:6d} {ln['left']:5d} "
+              f"{ln['steps_per_run']:10,d} {h:>11}")
+    h, rough = hours_for(todo, per)
+    n_meas = sum(1 for r in store.rows.values() if not r.get("diverged"))
+    print(f"  left: {len(todo)} runs, " + ("no measured step times yet" if h is None else
+          f"about {h:.1f} h by the median step time per arm and n_s of {n_meas} saved runs"
+          + (" (~: some arm and n_s not measured yet; nearest n_s of the arm used)" if rough else "")))
+    if per:
+        ns = sorted({n for _, n in per})
+        print("  seconds per step, measured:  " + "  ".join(f"n_s={n}" for n in ns))
+        for a in archs:
+            print(f"    {a:8} " + "  ".join(f"{per[(a, n)]:.3f}" if (a, n) in per else "  -  " for n in ns))
+
+
+# ----------------------------------------------------------------------------- main
+def gpu_lock(args, device: str):
+    """P3 holds logs/.p3_gpu.lock while it runs on the GPU; P1's olmo7b takes the same lock (common/gpu_locks.py),
+    so the two never share the L40S. Not under --smoke, --plan or on the CPU."""
+    if args.smoke or args.plan or not device.startswith("cuda"):
+        return None, 0.0
+    path = runtime.PILOT_ROOT / "logs" / ".p3_gpu.lock"
+    return gpu_locks.take(path, f"[p3_fractional_memory] {path} is held (P1's olmo7b, or another P3); waiting")
+
+
+def main():
+    ap = runtime.base_parser(__doc__)
+    ap.add_argument("--tasks", default=None)
+    ap.add_argument("--archs", default=None)
+    ap.add_argument("--lra-design", default=None, choices=["reduced", "full"],
+                    help="lra_image design from config.py lra_designs (default: config's lra_design, reduced)")
+    ap.add_argument("--plan", action="store_true",
+                    help="print the saved and the remaining runs with hours by measured step times; train nothing")
+    ap.add_argument("--adopt", default=None,
+                    help="JSON from p3_rescue.py: save the runs it recovered as finished runs (checked against "
+                         "this plan's settings), then go on (or stop, with --plan)")
+    args = ap.parse_args()
+    cfg = config.get("p3_fractional_memory", args.smoke)
+    design = args.lra_design or cfg["lra_design"]
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    _held, waited = gpu_lock(args, device)       # before CUDA starts; held as long as this process runs
+    run = runtime.start_run("p3_fractional_memory", cfg, args)
+    if waited > 1:
+        run.note(f"waited {waited / 3600:.2f} h for logs/.p3_gpu.lock")
+    dev = run.device
+    tasks = args.tasks.split(",") if args.tasks else list(cfg["tasks"])
+    archs = args.archs.split(",") if args.archs else cfg["archs"]
+    store = RunStore(run.out_dir)
+    widths = Widths(cfg, archs)
+    settings = {t: task_settings(cfg, t, design) for t in cfg["tasks"]}
+    plans = {t: (settings[t], *plan_task(t, settings[t], archs)) for t in cfg["tasks"]}
+    for t in tasks:
+        store.check_settings(t, result_settings(cfg, t, run.seed, run.smoke))
+    if args.adopt:
+        adopt(args.adopt, store, cfg, run.seed, run.smoke, settings, widths, archs)
+        write_outputs(run.out_dir, planned_rows(store, plans, archs), cfg)
+    if args.plan:
+        print_plan(store, {t: plans[t] for t in tasks}, archs, run.out_dir)
+        return
+
+    def _stop(signum, frame):                    # SIGTERM (kill, run_all.sh, run_lane.sh): saved runs stay
+        raise SystemExit(128 + signum)
+    signal.signal(signal.SIGTERM, _stop)
+
+    todo_total = len(plan_table(store, {t: plans[t] for t in tasks}, archs)[1])
+    done_here = 0
+    synth = synthetic_data(cfg, run.seed, [t for t in tasks if t in SYNTHETIC])
+    rng = runtime.rng(run.seed)
+    lines, _ = plan_table(store, {t: plans[t] for t in tasks}, archs)
+    for ln in lines:
+        run.note(f"plan: {ln['task']} {ln['phase']}: {ln['saved']}/{ln['runs']} runs saved, {ln['left']} to run "
+                 f"({ln['steps_per_run']:,} steps each)")
+    try:
+        for task in tasks:
+            s, tune, main_specs = plans[task]
+            if not plan_table(store, {task: plans[task]}, archs)[1]:
+                run.note(f"{task}: every run saved")
+                continue
+            if task == "lra_image":
+                data, src = lra_image(cfg["tasks"][task], run, rng)
+                if src != "fallback" and len(data[0]) != s["n_train"]:
+                    raise SystemExit(f"lra_image: {len(data[0])} train images, the plan assumed {s['n_train']}")
+            else:
+                data, src = synth[task], "synthetic"
+
+            def ensure(sp):
+                nonlocal done_here
+                key = run_key(sp)
+                target, w = widths(task, sp["n_s"])
+                H = w[sp["arch"]][0]
+                saved = store.get(task, key)
+                if saved is not None:
+                    if int(saved["H"]) != H or int(saved["target_params"]) != target:
+                        raise SystemExit(f"saved run {task}/{key} has H={saved['H']} (target {saved['target_params']}),"
+                                         f" the widths now give H={H} (target {target}): the code changed; use "
+                                         f"another --out")
+                    return saved
+                r = train_one(sp["arch"], task, sp["n_s"], H, data, cfg, sp["lr"], sp["seed"], dev, sp["steps"])
+                row = {"task": task, "arch": sp["arch"], "n_s": sp["n_s"], "H": H, "lr": sp["lr"], "seed": sp["seed"],
+                       "phase": sp["phase"], "target_params": target, "data_source": src, **r,
+                       "design": s["design"], "origin": "this run",
+                       "finished_utc": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")}
+                store.put(task, key, row)
+                write_outputs(run.out_dir, planned_rows(store, plans, archs), cfg)
+                done_here += 1
+                _, left = plan_table(store, {t: plans[t] for t in tasks}, archs)
+                h, rough = hours_for(left, step_seconds(store.rows.values()))
+                print(f"[p3_fractional_memory] {dt.datetime.now(dt.timezone.utc):%Y-%m-%dT%H:%M:%SZ}  "
+                      f"{done_here}/{todo_total}  {task} {sp['phase']} {sp['arch']} n_s={sp['n_s']} seed={sp['seed']} "
+                      f"lr={sp['lr']:g}: acc {r['acc']:.4f}, {r['steps']:,} steps in {r['wall_s']:.0f} s "
+                      f"({r['wall_s'] / max(1, r['steps']):.3f} s/step); {len(left)} runs left"
+                      + ("" if h is None else f", about {h:.1f} h{' (rough)' if rough else ''}"), flush=True)
+                return store.get(task, key)
+
+            t_rows = [ensure(sp) for sp in tune]
+            lrs = {a: best_lr([r for sp, r in zip(tune, t_rows) if sp["arch"] == a]) for a in archs}
+            run.note(f"{task}: tuned learning rates {lrs}")
+            for sp in main_specs:
+                ensure({**sp, "lr": lrs[sp["arch"]]})
+            for n_s in s["n_states"]:
+                target, w = widths(task, n_s)
+                run.note(f"{task} n_s={n_s}: " + ", ".join(f"{a} H={w[a][0]} params={w[a][1]}" for a in archs)
+                         + f" (target {target})")
+    except SystemExit:
+        print(f"[p3_fractional_memory] stopped; {len(store.rows)} runs saved in {store.dir} (a restart goes on from "
+              f"them)", flush=True)
+        raise
+    rows = planned_rows(store, plans, archs)
+    write_outputs(run.out_dir, rows, cfg)
+    runtime.finish_run(run, extra={"n_runs": len(rows), "trained_now": done_here, "lra_design": design,
+                                   "adopted": sum(1 for r in rows if str(r.get("origin", "")).startswith("rescued"))})
 
 
 if __name__ == "__main__":

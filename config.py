@@ -245,16 +245,30 @@ CONFIG = {
                 "lra_image": {"L": 1024},
             },
             "H_ref": 64, "ref_arch": "s4d", "n_layers": 2,
-            "steps": 3000, "lra_epochs": 20, "batch": 32,
+            "steps": 3000, "batch": 32,
             "lr_grid": [1e-3, 3e-3, 1e-2], "tune_seed": 0, "tune_n_states": 16,   # equal tuning budget
             "weight_decay": 0.01, "target_accuracy": {"powerlaw": 0.9, "exponential": 0.9, "lra_image": 0.6},
+            # lra_image: epochs, state sizes, seeds and tuning per design (the other tasks use the settings above).
+            # "full" is the first plan: 132 runs of 31,240 steps (20 x 1,562), about 10.4 times the steps of a
+            # synthetic task, about 180-210 L40S hours by the first P3 run's pace. "reduced" (2026-11-17, the
+            # default; --lra-design full for the other): 48 runs of 4,686 steps, about 6-10 L40S hours by the same
+            # pace; tuned on seed 0 and measured on seeds 1-3, so no main run repeats a tuning run.
+            "lra_design": "reduced",
+            "lra_designs": {
+                "full": {"epochs": 20, "n_states": [2, 4, 8, 16, 32, 64], "seeds": [0, 1, 2, 3, 4],
+                         "tune_n_states": 16, "tune_seed": 0},
+                "reduced": {"epochs": 3, "n_states": [2, 8, 32], "seeds": [1, 2, 3],
+                            "tune_n_states": 8, "tune_seed": 0},
+            },
         },
         "smoke": {
             "archs": ["frac", "s4_legs", "s4d", "mamba"], "n_states": [2, 8], "seeds": [0],
             "tasks": {"powerlaw": {"L": 128, "nu_star": 0.3, "n_train": 256, "n_test": 64},
                       "exponential": {"L": 128, "tau_frac": 0.125, "n_train": 256, "n_test": 64},
                       "lra_image": {"L": 1024, "limit_train": 256, "limit_test": 64}},
-            "H_ref": 16, "steps": 20, "lra_epochs": 1, "batch": 16, "lr_grid": [3e-3], "tune_n_states": 2,
+            "H_ref": 16, "steps": 20, "batch": 16, "lr_grid": [3e-3], "tune_n_states": 2,
+            "lra_designs": {"full": {"epochs": 1, "n_states": [2, 8], "seeds": [0], "tune_n_states": 2},
+                            "reduced": {"epochs": 1, "n_states": [2, 8], "seeds": [1], "tune_n_states": 2}},
         },
     },
     # ------------------------------------------------------------------ P4: clipping sweep (H6.1, H7.1 control, H_grad)

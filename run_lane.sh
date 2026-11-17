@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# A second lane for P1 jobs, next to a running run_all.sh, with run_all.sh's bookkeeping, so that run_all.sh's
-# resume skips them later. Jobs run one after another, each with the same command and --out folder as in
+# A second lane for P1 jobs (and, in a lane of its own, P3), next to a running run_all.sh, with run_all.sh's
+# bookkeeping, so that run_all.sh's resume skips them later. Jobs run one after another, each with the same command and --out folder as in
 # run_all.sh, and for each one this script writes what run_job writes:
 #   logs/progress.txt      START and END lines in run_all.sh's format, tagged "(lane)" at the end
 #   logs/<job>.log         the job's output, appended, with the same header
@@ -9,11 +9,15 @@
 #
 # Usage, in the pilot folder inside the venv (CPUs 7-10, four threads per pool):
 #   nohup taskset -c 7-10 bash run_lane.sh p1_pythia p1_polypythia p1_olmo > logs/run_lane.out 2>&1 &
+#   nohup taskset -c 0-6 bash run_lane.sh p3_fractional > logs/run_lane_p3.out 2>&1 &    # P3, in its own lane
 #   bash run_lane.sh --dry-run p1_pythia p1_polypythia p1_olmo       # checks only, runs nothing
 #
 # Safety checks before each job:
-#   - only P1 jobs: p1_checkpoints.py holds an exclusive GPU lock (logs/.p1_gpu.lock) for its whole run, so
-#     at most one P1 job uses the GPU at a time, whether it runs here or in run_all.sh (p1_olmo7b waits);
+#   - only P1 jobs, or p3_fractional alone: p1_checkpoints.py holds an exclusive GPU lock (logs/.p1_gpu.lock) for
+#     its whole run, so at most one P1 job uses the GPU at a time, whether it runs here or in run_all.sh; P3 holds
+#     logs/.p3_gpu.lock, which run_all.sh's p1_olmo7b (31.5 GiB) also takes, and p1_olmo7b first waits until no
+#     lane runs (common/gpu_locks.py), so it stays last and never shares the GPU with P3;
+#   - one lane of each kind at a time: logs/.run_lane.lock for P1 jobs, logs/.run_lane.p3.lock for P3;
 #   - a job with logs/<job>.done is skipped; a job that progress.txt shows as running is refused;
 #   - while run_all.sh runs (it holds logs/.run_all.lock), only jobs that come before its current job in its
 #     order are accepted, since run_all.sh will not run those again;
@@ -44,9 +48,9 @@ for a in "$@"; do
     *) JOBS_HERE+=("$a") ;;
   esac
 done
-[ "${#JOBS_HERE[@]}" -gt 0 ] || { echo "usage: bash run_lane.sh [--dry-run] p1_pythia p1_polypythia p1_olmo" >&2; exit 2; }
+[ "${#JOBS_HERE[@]}" -gt 0 ] || { echo "usage: bash run_lane.sh [--dry-run] p1_pythia p1_polypythia p1_olmo  (or: bash run_lane.sh p3_fractional)" >&2; exit 2; }
 
-# run_all.sh's job order and the P1 commands, exactly as there (tests/test_run_lane.py compares them)
+# run_all.sh's job order and its P1 and P3 commands, exactly as there (tests/test_run_lane.py compares them)
 ALL_JOBS="p0_calibration p5_escape p5_escape_h31 p2_w4a4 p4_transformer p4_resnet18 p1_pythia p1_polypythia p1_olmo p3_fractional p1_olmo7b"
 job_args () {
   case "$1" in
@@ -54,21 +58,32 @@ job_args () {
     p1_polypythia) echo "p1_checkpoints.py --suite polypythia,polypythia_data,polypythia_weight" ;;
     p1_olmo)       echo "p1_checkpoints.py --suite olmo" ;;
     p1_olmo7b)     echo "p1_checkpoints.py --suite olmo7b" ;;
+    p3_fractional) echo "p3_fractional_memory.py" ;;
     *) return 1 ;;
   esac
 }
-# peak GPU memory in GiB by python memory_check.py p1 (2026-11-16; tensors only, so the headroom adds the CUDA
+# peak GPU memory in GiB by python memory_check.py p1 p3 (2026-11-16; tensors only, so the headroom adds the CUDA
 # context and allocator rounding)
 job_gib () {
   case "$1" in
     p1_pythia) echo 16.3 ;; p1_polypythia) echo 7.7 ;; p1_olmo) echo 17.3 ;; p1_olmo7b) echo 31.5 ;;
+    p3_fractional) echo 12.9 ;;
   esac
 }
 index_of () { local i=0; for j in $ALL_JOBS; do [ "$j" = "$1" ] && { echo $i; return; }; i=$((i + 1)); done; echo -1; }
 
+# P3 runs in a lane of its own (its own lock), so that it can run next to a P1 lane
+KIND=p1
+for j in "${JOBS_HERE[@]}"; do [ "$j" = p3_fractional ] && KIND=p3; done
+if [ "$KIND" = p3 ] && [ "${#JOBS_HERE[@]}" -gt 1 ]; then
+  echo "run_lane.sh: run p3_fractional in a lane of its own (bash run_lane.sh p3_fractional)" >&2; exit 2
+fi
+LANE_LOCK=logs/.run_lane.lock
+[ "$KIND" = p3 ] && LANE_LOCK=logs/.run_lane.p3.lock
+export PILOT_LANE_LOCK="$(pwd)/$LANE_LOCK"      # p1_checkpoints.py: olmo7b in this lane does not wait for it
 if [ "$DRY" = 0 ] && command -v flock > /dev/null; then
-  exec 8> logs/.run_lane.lock
-  flock -n 8 || { echo "run_lane.sh is already running (logs/.run_lane.lock)" >&2; exit 1; }
+  exec 8> "$LANE_LOCK"
+  flock -n 8 || { echo "run_lane.sh is already running ($LANE_LOCK)" >&2; exit 1; }
 fi
 
 stamp () { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -97,7 +112,7 @@ gpu_free_gib () {
 
 check_job () {   # prints why a job cannot run here (nothing if it can)
   local job="$1"
-  job_args "$job" > /dev/null || { echo "not a P1 job (only P1 jobs hold the GPU lock that keeps lanes apart)"; return; }
+  job_args "$job" > /dev/null || { echo "not a P1 job or p3_fractional (only these hold the GPU locks that keep lanes apart)"; return; }
   if running_jobs | grep -qx "$job"; then echo "progress.txt shows it running"; return; fi
   if run_all_active; then
     local cur; cur=$(running_jobs | grep -vx p0_calibration | while read -r j; do echo "$(index_of "$j") $j"; done \

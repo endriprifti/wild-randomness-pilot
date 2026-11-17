@@ -36,7 +36,7 @@ WSL2, **T4** = Kaggle's 16 GB T4 (not the P100, see below), **5090** = RTX 5090 
 | 3 | W4A4 and weight-only, H6.2 (simulated quantization) | 30 | 5090 (Pythia-6.9B and OLMo-7B in bfloat16, about 14 GB each); L40S also fine | `python p2_w4a4.py` (one model: `--models EleutherAI/pythia-6.9b`) |
 | 4 | Clipping sweep, H6.1 / H7.1 control | 30 | 5090 (transformer peak ~21 GiB, see GPU memory below); ResNet-18 also T4 | `python p4_clipping.py --model transformer` and `python p4_clipping.py --model resnet18` |
 | 5 | Checkpoint measurements, with the 410M loss-spike check (pass (a) downloads about 391 GB, see below) | 45 | Pythia: 5090 (H7.1's HVP at 14M to 160M peaks ~16 GiB); PolyPythias: T4; OLMo 2 1B: 5090 | `python p1_checkpoints.py --pin-only`, then `--suite pythia`, `--suite polypythia,polypythia_data,polypythia_weight`, `--suite olmo` |
-| 6 | Fractional memory, H4.1 | 65 | 5090; T4 is tight (Mamba at n_s = 64 peaks ~13 GiB) | `python p3_fractional_memory.py` (drop LRA first if time runs short: `--tasks powerlaw,exponential`) |
+| 6 | Fractional memory, H4.1 | 65 | 5090; T4 is tight (Mamba at n_s = 64 peaks ~13 GiB) | `python p3_fractional_memory.py` (LRA image in its reduced design by default, see "P3" below; drop LRA first if time runs short: `--tasks powerlaw,exponential`) |
 | 7 | **Optional, last:** OLMo 2 7B checkpoints | not in the 45 (ours: ~10) | **L40S** (fp32 weights plus per-example JVP exceed 32 GB) | `python p1_checkpoints.py --suite olmo7b`, only if credits remain |
 
 Jobs 0 to 6 all fit the RTX 5090. Job 7 is the only one that needs the L40S, and nothing else depends on it.
@@ -251,10 +251,87 @@ nohup taskset -c 7-10 bash run_lane.sh p1_pythia p1_polypythia p1_olmo > logs/ru
   renamed into place; entries only grow, and the file on disk wins where two jobs carry the same field, so no job
   undoes another's additions. progress.txt lines are appended one write each, so lines from the two scripts never
   mix. Each job has its own log, `.done` file and archive.
-- **Checks.** Only P1 jobs are accepted; a job with a `.done` file is skipped; a job that progress.txt shows as
-  running is refused; while `run_all.sh` runs, only jobs before its current job in its order are accepted (it
-  will not run those again); a second lane does not start (`logs/.run_lane.lock`). `--dry-run` shows what would
-  run. Until the lane has finished, start any new `run_all.sh` with `--skip` for the lane's jobs.
+- **Checks.** Only P1 jobs are accepted, or `p3_fractional` in a lane of its own (see "P3" below); a job with a
+  `.done` file is skipped; a job that progress.txt shows as running is refused; while `run_all.sh` runs, only jobs
+  before its current job in its order are accepted (it will not run those again); a second lane of the same kind
+  does not start (`logs/.run_lane.lock`, and `logs/.run_lane.p3.lock` for P3). `--dry-run` shows what would run.
+  Until the lane has finished, start any new `run_all.sh` with `--skip` for the lane's jobs.
+- **p1_olmo7b stays last.** `p1_checkpoints.py --suite olmo7b` first waits until no lane runs, then takes
+  `logs/.p3_gpu.lock` (which P3 holds while it runs) and the P1 lock (`common/gpu_locks.py`). So when run_all.sh
+  reaches it while lanes still run, it waits without GPU memory instead of taking the P1 lock in the gap between
+  two suites of a lane, and it never shares the GPU with P3 (31.5 + 12.9 GiB would not fit).
+
+### P3: a save after every run, the reduced LRA design, and replacing the first P3 (2026-11-17)
+
+Until 2026-11-17, P3 kept every finished run in memory and wrote `runs.csv` only after the last task, so stopping
+it lost everything. Now:
+
+- **A save per run, and resume.** Each finished run is written to `runs/<task>/<phase>_<arch>_ns<n_s>_seed<seed>_lr<lr>_steps<steps>.json`
+  (atomically), and `runs.csv`, `curves.csv` and `states_to_target.csv` are rewritten after every run. Run the same
+  command again and it goes on from the saved runs; a run stopped in the middle starts again. A run's result
+  depends only on its settings (each run seeds itself from its seed; the synthetic data are drawn from the run seed
+  in config order, as before, whatever `--tasks` says), so the order of runs and restarts change nothing: a smoke
+  run stopped with SIGTERM and resumed, and one started from runs recovered from an old-code process, give the same
+  `runs.csv` and `curves.csv` as an uninterrupted old-code run. `runs/<task>/settings.json` holds the settings
+  that decide a run's result (the task's data, batch, layers, H_ref, weight decay, seed); a restart with others
+  stops. Main runs go seed by seed (every arm and n_s of seed 1, then seed 2, ...), so a P3 stopped early leaves
+  whole seeds. Each run logs a line with its accuracy, seconds per step and the hours left by the measured step
+  times; `python p3_fractional_memory.py --plan` prints the saved and remaining runs per task and phase with those
+  hours, and the measured seconds per step by arm and n_s, without training.
+- **LRA image designs** (`config.py`, `lra_designs`). The first plan (`--lra-design full`): 12 tuning runs (four arms
+  × three learning rates at n_s = 16, seed 0) and 120 main runs (six n_s × four arms × five seeds), each of
+  20 × 1,562 = 31,240 steps, 10.4 times a synthetic run's 3,000 steps at the same cost per step (L = 1,024 and
+  batch 32 in every task). At the first P3's pace on the L40S next to the P1 lane (about 32 h for powerlaw and
+  most of exponential) that is about 180-215 h. The reduced design (the default): three epochs (4,686 steps),
+  n_s = 2, 8 and 32, the four arms, the same learning-rate grid tuned at n_s = 8 on seed 0, and main runs on seeds
+  1, 2 and 3: 12 + 36 runs, an estimated 7-10 L40S hours by the same pace (the range is the cost of Mamba's scan,
+  which grows with n_s, against an equal cost per run); `--plan` gives the measured figure once runs are saved.
+  It can show whether, on real images at an equal short training budget and equal tuning, the fractional block's
+  accuracy at small state sizes is above, at or below S4-LegS, S4D and Mamba, and whether that ordering follows the
+  power-law task or the exponential one: H4.1's clause that an advantage must depend on the task type, now on real
+  data, with three seeds (differences of about two seed SDs or more). It cannot show accuracies near published LRA
+  numbers (two-layer models of 10-25 thousand parameters trained for three epochs; the 0.6 target of
+  `states_to_target.csv` will likely not be reached, so the comparison rests on the curves), what the arms reach
+  with 20 epochs (an arm that learns faster can lead at three epochs and not at twenty), n_s = 4, 16 or 64, or small
+  differences; and whether images have power-law memory at all is not tested by it.
+- **Locks.** P3 holds `logs/.p3_gpu.lock` while it runs on the GPU; `p1_olmo7b` takes the same lock (see the lane's
+  "p1_olmo7b stays last" above). `run_lane.sh p3_fractional` runs P3 with run_all.sh's command and records, in a
+  lane of its own next to the P1 lane.
+- **Runs held by an old-code P3.** `p3_rescue.py` attaches gdb to the running process for a moment and, at a safe
+  moment (its main thread has released the GIL and is not in the C allocator), runs a few lines of Python inside it
+  that write the list of finished runs, the config and the seed to `rescued_runs.json`; the process keeps running
+  (tested 46 times against one smoke run, whose results then equalled an undisturbed run's).
+  `--adopt rescued_runs.json` saves those runs after checking that the process used the same settings and that
+  each run belongs to this plan (old LRA runs of 31,240 steps do not belong to the reduced design).
+
+Replacing the first P3 (run by `run_all.sh` since 2026-11-16) by the new one, next to the P1 lane:
+
+```bash
+cd ~/pilot                                  # venv active
+# 1. pull as in "Pulling on the L40S" below (the running jobs keep the code they loaded; run_all.sh is unchanged)
+# 2. GPU memory now
+nvidia-smi --query-gpu=memory.used,memory.total --format=csv
+nvidia-smi --query-compute-apps=pid,used_memory --format=csv
+# 3. recover the first P3's finished runs (it keeps running); gdb: sudo apt-get install -y gdb
+P3PID=$(pgrep -f 'p3_fractional_memory.py --out results/p3_fractional'); echo "$P3PID"
+python p3_rescue.py --pid "$P3PID"          # if gdb says "ptrace: Operation not permitted": sudo "$(which python)" p3_rescue.py --pid "$P3PID"
+python p3_fractional_memory.py --out results/p3_fractional --adopt results/p3_fractional/rescued_runs.json --plan
+# 4. keep P1's statistics on CPUs 7-10 while P3 is replaced (run_all.sh's END line for P3 would widen them)
+echo 7-10 > logs/p1_cpus
+# 5. stop the first P3 (its Python process only: run_all.sh writes "END p3_fractional exit 143", packs the
+#    archive and starts p1_olmo7b, which waits for the lanes and P3 without touching the GPU)
+kill -TERM "$P3PID"
+sleep 20; tail -3 logs/progress.txt; tail -2 logs/p1_olmo7b.log      # START p1_olmo7b, then "waiting for run_lane.sh"
+# 6. start the new P3 in its own lane (it waits until the GPU has 12.9 + 4 GiB free)
+nohup taskset -c 0-6 bash run_lane.sh p3_fractional > logs/run_lane_p3.out 2>&1 &
+sleep 60; tail -2 logs/progress.txt; tail -3 logs/p3_fractional.log
+rm logs/p1_cpus                             # progress.txt shows P3 running again: the P1 pool stays on 7-10
+nvidia-smi --query-compute-apps=pid,used_memory --format=csv
+```
+
+Step 6 is refused until progress.txt shows run_all.sh at `p1_olmo7b` (step 5's check). When the new P3 ends,
+its END line widens the P1 pool to every CPU as before, and `logs/p3_fractional.done` makes a later `run_all.sh`
+skip P3. `p1_olmo7b` starts when the P1 lane and the new P3 have both ended.
 
 ### GPU memory on the L40S
 
@@ -672,7 +749,7 @@ before the run.
 
 ## Unit tests
 
-`python -m pytest -q` (165 tests, about 3 min on a CPU; `-m "not slow"` skips the two slowest). Synthetic data with
+`python -m pytest -q` (173 tests, about 3.5 min on a CPU; `-m "not slow"` skips the two slowest). Synthetic data with
 known parameters:
 
 - stable density against the Gaussian and Cauchy closed forms and against SciPy; ML fit recovers α ∈ {1.2, 1.5, 1.8},
@@ -707,9 +784,16 @@ known parameters:
   run; a pool runs a checkpoint's tasks and a restart reads `result.json` back; other settings refuse to resume;
 - the grid stable density against the FFT density (log f within 1e-4 for |x| <= 50) and its fits against the FFT
   fits (α̂ within 0.01 and γ̂ within 1%, unless the grid fit's likelihood is higher);
-- `run_lane.sh`: run_all.sh's job order and P1 commands; its records next to a running run_all.sh (a stand-in
-  Python), refusal of jobs run_all.sh will still run and of non-P1 jobs, one lane at a time; P1's GPU lock makes
-  a second P1 job wait; two jobs saving `pins.json` keep each other's entries;
+- `run_lane.sh`: run_all.sh's job order and its P1 and P3 commands; its records next to a running run_all.sh (a
+  stand-in Python), refusal of jobs run_all.sh will still run and of other jobs, one lane of each kind at a time;
+  P3 in its own lane next to a P1 lane, refused while run_all.sh still runs P3 or with P1 jobs in the same lane;
+  P1's GPU lock makes a second P1 job wait; olmo7b waits for the lanes and for P3's lock (and not for its own
+  lane), other suites do not; two jobs saving `pins.json` keep each other's entries;
+- P3: the LRA designs' run counts and steps (31,240 per run in the first plan, 4,686 in the reduced one; no main
+  run repeats a tuning run; main runs seed by seed); the synthetic data are the old code's draws whatever tasks
+  run; saved runs are reused and deleted ones run again with the same results; other settings in the folder stop
+  the run; `--adopt` takes old-code rows only with the same settings and only rows of the plan; P3's GPU lock;
+  `p3_rescue.py` reads the list of runs out of a running process (with gdb) and leaves it running;
 - P2's outlier scheme: a kept channel 1000 times larger leaves every other channel's activation error, the other
   weight columns and the layer's output error unchanged (before the fix it rounded most of them to zero); the
   rotation arm in bfloat16 adds no rounding beyond bfloat16 storage;
