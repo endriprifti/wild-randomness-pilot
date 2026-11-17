@@ -7,6 +7,14 @@ alpha-hat(B) and gamma-hat_B; b is the OLS slope of alpha-hat on log2 B (change 
 Its 90% interval comes from a bootstrap that resamples the pool, so the positive correlation
 of the alpha-hat(B) across B (one pool) is kept.
 
+Batch order (2026-11-17): the blocks are consecutive values of the pool, so they are random batches only if the
+pool is in a random order. P1's pools are consecutive chunks of the same documents, whose neighbours are
+correlated; the i.i.d. bootstrap then describes random batches while the main fit described batches of
+neighbouring chunks, and b fell outside its own interval. With order_seed the main fit first puts the pool in a
+fixed random order (pool_order), as SGD draws random batches. The bootstrap is unchanged: it draws the pool
+i.i.d. with replacement, so the order of the pool does not change its distribution, and its replicates are the
+same with or without order_seed (P1 recomputes the main fit of saved checkpoints and keeps their bootstrap).
+
 Preregistered reading (thresholds ours, sec. 7.5): invariance if the 90% interval lies inside
 +-0.03; drift towards 2 if it lies above 0.05; otherwise undecided. The scale exponent is the
 slope of log gamma-hat_B on log B, compared with 1/alpha-hat - 1.
@@ -23,6 +31,17 @@ import math
 import numpy as np
 
 from .stable import block_noise, fit_stable
+
+
+def pool_order(n: int, seed) -> np.ndarray:
+    """A fixed random order of n pool values; seed is an int or a list of ints (np.random.SeedSequence entropy)."""
+    return np.random.default_rng(np.random.SeedSequence(seed)).permutation(int(n))
+
+
+def shuffled(pool, seed) -> np.ndarray:
+    """The pool in the fixed random order of `seed` (rows, for a 2-D pool), so that its blocks are random batches."""
+    pool = np.asarray(pool)
+    return pool[pool_order(len(pool), seed)]
 
 
 def fit_over_batches(pool: np.ndarray, batch_sizes, n_blocks: int, symmetric: bool = False) -> list[dict]:
@@ -101,10 +120,13 @@ def h71_summary(rows: list[dict], boots_b, boots_gap, n_pool: int, batch_sizes, 
 
 def h71_test(pool: np.ndarray, batch_sizes=(8, 16, 32, 64, 128, 256, 512, 1024), n_blocks: int = 1600,
              n_boot: int = 200, level: float = 0.90, inv_tol: float = 0.03, drift_tol: float = 0.05,
-             rng: np.random.Generator | None = None, symmetric: bool = False) -> dict:
+             rng: np.random.Generator | None = None, symmetric: bool = False, order_seed=None) -> dict:
+    """The H7.1 test of one pool. order_seed: the main fit's blocks come from the pool in that fixed random order
+    (for a pool whose neighbours may be correlated); None keeps the pool's order (pools drawn i.i.d., as in P0,
+    P0b and P4's control, whose results stay as they were)."""
     rng = rng if rng is not None else np.random.default_rng(0)
     pool = np.asarray(pool, dtype=float)
-    rows = fit_over_batches(pool, batch_sizes, n_blocks, symmetric)
+    rows = fit_over_batches(pool if order_seed is None else shuffled(pool, order_seed), batch_sizes, n_blocks, symmetric)
     boots_b, boots_gap = h71_bootstrap(pool, batch_sizes, n_blocks, n_boot, rng, symmetric)
     summary = h71_summary(rows, boots_b, boots_gap, len(pool), batch_sizes, n_blocks, level, inv_tol, drift_tol)
     return {"per_B": rows, "summary": summary}

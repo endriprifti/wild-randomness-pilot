@@ -149,12 +149,14 @@ explained under "Known limit" below. α̂ cannot exceed 2, so α = 2 is tested o
 sizes, fitted exactly as a real pool (the bootstrap is not used for the level, since it fails at the boundary).
 Every input is already a column of the summary CSVs (`b_lo`, `b_hi`, `alpha_mean`, `scale_exponent`,
 `scale_gap_lo`, `scale_gap_hi`, `n_pool`, `n_blocks`), so the verdict is recomputed from saved files, without
-refitting and without changing the cloud run's code. On the laptop, after unpacking the archives from the L40S:
+refitting. Since 2026-11-17 P1 and P4 write it into their own `h71_summary.csv` (see "Batches in random order"
+below), against `reference/h71_gauss_null.csv` in the repository: 400 Gaussian pools each at 1,600 and 200 blocks
+and B = 8 … 1,024, the full-run settings (P0b's h71null part with the same seeds, FFT density). For files written
+before, on the L40S or the laptop:
 
 ```bash
 python -m common.h71_verdict results/p0_calibration/block_check_bootstrap.csv \
-    results/p1_pythia/h71_summary.csv results/p4_resnet18/h71_summary.csv \
-    --null results/p0b_calibration/h71_gauss_null.csv --jobs 6
+    results/p1_pythia/h71_summary.csv results/p4_resnet18/h71_summary.csv --jobs 6
 ```
 
 It writes `<name>_verdict.csv` beside each file (the original columns, including the slope-only `reading`, plus
@@ -162,7 +164,8 @@ It writes `<name>_verdict.csv` beside each file (the original columns, including
 `verdict` and `verdict_reason`) and prints the counts. The batch sizes come from the `alpha_B<B>` columns (P0b),
 from `h71_per_B.csv` beside the file (P1, P4) or from `config.BATCH_SIZES` (P0; `--batch-sizes` overrides). A
 setting missing from the Gaussian reference (for example a pool that came out short) is simulated on the spot
-and added to the `--null` file (400 pools; about 1 h on 6 cores at 1,600 blocks).
+and added to the `--null` file (default `results/p0b_calibration/h71_gauss_null.csv`, read together with the
+reference in the repository; 400 pools, about 1 h on 6 cores at 1,600 blocks).
 
 **Check at full size** (this environment's CPU, 2026-11-14; 1,600 blocks, B = 8 … 1024, 100 Gaussian reference
 pools, full tests with a reduced bootstrap of 30 resamples). The reference puts the 5% quantile of ᾱ at 1.993
@@ -666,6 +669,63 @@ kill -TERM "$(pgrep -f 'bash run_lane.sh')"     # stops the job; its finished ch
 nohup taskset -c 7-10 bash run_lane.sh p1_pythia p1_polypythia p1_olmo > logs/run_lane.out 2>&1 &
 ```
 
+### Batches in random order, Δh_rep and the H7.1 verdict in P1 and P4 (2026-11-17)
+
+Endri's check of P1's first 42 checkpoints: in most H7.1 rows b lay outside its own 90% bootstrap interval
+(pythia-14m step 1,000, random0: b = −0.0115, interval [−0.0014, 0.0024]). The example pool is consecutive
+128-token chunks of the same documents, and the main fit cut it into consecutive blocks, so a batch held
+neighbouring chunks of a few documents; the bootstrap resamples the pool i.i.d., so its interval describes random
+batches, another statistic. The coupling α had the same problem (P1's `grad`: blocks of 8 consecutive chunks; P4:
+the first 1,600·B training sequences in order).
+
+- **Fix.** P1's `grad` and H7.1 main fit put the pool in a fixed random order before cutting blocks
+  (`common/batch.py`: `shuffled`, seeded by the run seed only, so every checkpoint and direction uses the same
+  order), as SGD draws random batches. The bootstrap is unchanged: it resamples i.i.d. with replacement, so the
+  pool's order does not change its distribution, and its replicates are exactly those computed before. On
+  document-like pools (documents of 16 chunks sharing a level, Student t values), the shuffled main fit lay inside
+  its 90% interval in 17 of 20 pools and the consecutive one in 5 of 20 (`tests/test_batch_order.py`). P4 draws
+  its α pool without replacement, in random order, from the whole training set (`pool_ids`; the same examples for
+  every arm and seed). `alpha_batch_order` in `checkpoints.csv` and P4's `runs.csv`, and `batch_order` in
+  `h71_summary.csv`, say which order a row used. The bootstrap still treats chunks as independent; chunks of one document are not, so the interval can
+  be somewhat narrow (a bootstrap by document would need the document of each example, which the samples do not
+  keep).
+- **Not affected.** P4's H7.1 control draws random images (`torch.randint`), so its batches were random already,
+  which is why ResNet's b mostly lay inside its interval. `p4_resnet18`'s α pool was CIFAR-10's training images in
+  file order, which the dataset documents as random. P5 draws its 10⁴ Fashion-MNIST images by a random permutation;
+  the P0 and P0b pools are i.i.d.
+- **Δh_rep.** `dh_rep` is NaN when the dimension clause fails (D_max ≥ log10 n, or fewer than two decades of r) or
+  the width is negative (h(q) cannot increase in q); `dh_rep_raw` keeps `delta_h_rep`'s number and `dh_rep_note`
+  says why (P1 and P4). In `p4_resnet18`'s `runs.csv`, written before, read `dh_rep` as NaN where `dh_scope` is
+  "local" (the clause failed) or `dh_rep` < 0.
+- **Verdict.** P1's and P4's `h71_summary.csv` carry the verdict columns of "H7.1 verdict" above. The slope-only
+  `reading` is dropped there; `slope_reading` says the same thing.
+- **What P1 keeps.** `grad.npy` (the coupling α pool), `h71.npy` (the H7.1 pools), `htok.npy` and `esd.npz` stay on
+  disk, so α and the H7.1 fits can be recomputed on the CPU without the GPU pass. The bootstrap, α_ESD, act_zeta,
+  H_tok and Δh_rep are kept as computed: the Δh_rep rule needs only the saved numbers (`dh.npy` and `act.npz` are
+  deleted after use).
+
+**A P1 job that runs on with the earlier code** (p1_pythia, started before this commit) writes the old order to the
+end. Pulling does not disturb it: it keeps the code it loaded, and pool processes it starts after the pull (when its
+CPUs change) run the new code but compute its tasks as before, since those carry no order (a test checks this).
+`p1_recompute.py` then computes its statistics again into another folder, CPU only, at nice 19, reading the job's
+folder without changing it:
+
+```bash
+python p1_recompute.py results/p1_pythia --dry-run    # finished checkpoints, tasks, and the CPU hours they took there
+nohup taskset -c 0-10 python p1_recompute.py results/p1_pythia > logs/p1_recompute_pythia.log 2>&1 &
+# once p1_pythia has ended, the same command again adds the checkpoints finished since (done ones are kept)
+```
+
+It writes `results/p1_pythia_recomputed/`: per checkpoint `row.json` with the order added, `stats/` (grad and the
+H7.1 main fits computed again from the job's samples with the job's task seeds, everything else copied) and
+`result.json`, and the job's CSVs (`checkpoints.csv`, `h71_summary.csv` with the verdict, `h71_per_B.csv`, the
+per-layer CSVs, `scaling.csv`, `seed_variance.csv`, coupling and spike files when the job has them, `run.json`).
+They equal what the current `p1_checkpoints.py` gives on those checkpoints (`tests/test_batch_order.py`; and a smoke
+run measured with the previous commit and recomputed gave the same CSVs as one measured with this commit). Jobs started after the pull (p1_polypythia, p1_olmo, p1_olmo7b, and the queue's p4_transformer) use the
+random order from the start. A job started with this code on a folder measured before upgrades it on resume: the
+grad and H7.1 main-fit statistics of each checkpoint are computed again from its samples, the old ones moved to
+`stats/consecutive/`, and `fingerprint.json` records `upgraded_from`.
+
 ### Datasets
 
 Every Hub dataset is read through `common/hf.py` at a commit pinned in `pins.json`, like the models (key
@@ -788,7 +848,7 @@ before the run.
 
 ## Unit tests
 
-`python -m pytest -q` (186 tests, about 5.5 min on a 4-core CPU; `-m "not slow"` skips the slowest). Synthetic data with
+`python -m pytest -q` (194 tests, about 5.5 min on a 4-core CPU; `-m "not slow"` skips the slowest). Synthetic data with
 known parameters:
 
 - stable density against the Gaussian and Cauchy closed forms and against SciPy; ML fit recovers α ∈ {1.2, 1.5, 1.8},

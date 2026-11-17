@@ -7,7 +7,9 @@ h(q_lo) - h(q_hi) over a preregistered q range; negative q is unstable (Falconer
 
 Dimension clause (sec. 7.2): global D_q claims only where two decades of r are available,
 roughly D_q below log10 n with n points; above that the code reports a local dimension at a
-stated scale and marks Delta h_rep as local.
+stated scale and marks Delta h_rep as local. The width that P1 and P4 report (reported_width,
+2026-11-17) is NaN when the clause fails or the width is negative (h(q) must not increase in q);
+delta_h_rep's own number stays in their dh_rep_raw column.
 """
 
 from __future__ import annotations
@@ -146,6 +148,22 @@ def delta_h_rep(X: np.ndarray, q_lo: float = 0.5, q_hi: float = 4.0, n_q: int = 
         out["local_D2"] = float(gl["D"][0])
         out["local_scale"] = float(np.exp(np.mean(np.log(r[:k]))))
     return out
+
+
+def reported_width(d: dict) -> tuple[float, str]:
+    """The Delta h_rep to report from delta_h_rep's result, and why it is NaN ("" when it is not): NaN when the
+    dimension clause fails (D_max >= log10 n or fewer than two decades of r: no global D_q claim) or the width
+    is negative (h(q) decreases in q for a measure, so a negative width is an estimation failure)."""
+    w = float(d.get("delta_h_rep", np.nan))
+    if not d.get("clause_ok", False):
+        return float("nan"), (f"dimension clause fails (D_max {float(d.get('D_max', np.nan)):.2f} vs log10 n "
+                              f"{float(d.get('log10_n', np.nan)):.2f}, {float(d.get('decades_r', np.nan)):.2f} decades "
+                              f"of r): local only")
+    if not np.isfinite(w):
+        return float("nan"), "no width"
+    if w < 0:
+        return float("nan"), f"negative width {w:.3g}"
+    return w, ""
 
 
 # ----------------------------------------------------------------------------- cascades

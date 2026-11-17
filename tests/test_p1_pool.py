@@ -8,7 +8,7 @@ import pytest
 
 import config
 import p1_checkpoints as p1
-from common import batch, p1_tasks, stable
+from common import batch, h71_verdict, p1_tasks, stable
 
 PYTHIA = {s: f"step{s}" for s in [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512] + list(range(1000, 143001, 1000))}
 
@@ -103,7 +103,9 @@ def test_tasks_merge_into_the_rows_written_before(tmp_path, rng):
     b = stats["h71_boot.random0.0"]["result"]["b"] + stats["h71_boot.random0.1"]["result"]["b"]
     g = stats["h71_boot.random0.0"]["result"]["gap"] + stats["h71_boot.random0.1"]["result"]["gap"]
     ref = batch.h71_summary(stats["h71_fit.random0"]["result"]["per_B"], b, g, record["h71"]["n_pool"], [8, 16, 32], 30)
+    ref.pop("reading")                          # slope only: the verdict's slope_reading replaces it (2026-11-17)
     assert {k: v for k, v in s.items() if k in ref} == pytest.approx(ref, nan_ok=True)
+    assert "reading" not in s and s["verdict"] in h71_verdict.VERDICTS and s["batch_order"] == "consecutive"
 
 
 def test_a_failed_statistic_is_recorded_and_a_bug_stops(tmp_path, rng):

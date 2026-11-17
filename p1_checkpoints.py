@@ -41,6 +41,16 @@ whose statistics are saved gets result.json; checkpoints.csv and h71_summary.csv
 same command resumes: finished checkpoints are read back, the rest measured. Progress lines per measurement in the
 log, seconds in timings.csv. H7.1 runs at one checkpoint per stage (the nearest to 1, 10, 50, 100% of training).
 
+Batch order and reported values (2026-11-17): the example pool is consecutive chunks of the same documents, so the
+coupling alpha (grad) and the H7.1 main fit form their batches from the pool in a fixed random order (the run seed's
+order_seed), as SGD draws random batches; the H7.1 bootstrap resamples i.i.d. and stays as it was (common/batch.py).
+batch_order in checkpoints.csv and h71_summary.csv says which order a row used. dh_rep is NaN when the dimension
+clause fails or the width is negative (dh_rep_raw, dh_rep_note), and h71_summary.csv carries the verdict of
+common/h71_verdict.py (verdict, verdict_reason; it replaces the slope-only reading). A folder measured before
+(fingerprint without batch_order) is resumed and upgraded: each checkpoint's grad and h71_fit statistics are computed
+again from its saved samples (the old ones move to stats/consecutive/), the rest is kept. p1_recompute.py does the
+same into another folder, without the GPU, for a job that is still running with the earlier code.
+
 Outputs (results/p1_checkpoints/[smoke/]): checkpoints.csv, esd_layers.csv, activations_layers.csv,
 h71_per_B.csv, h71_summary.csv, scaling.csv, seed_variance.csv, spike_check.csv, coupling_pairs.csv,
 coupling.json, timings.csv, checkpoints/ (per checkpoint: samples/, stats/, row.json, result.json), run.json;
@@ -681,20 +691,51 @@ def fingerprint(cfg, seed, skip, density, boot_chunk) -> dict:
     """What a resumed checkpoint must share with this run: the P1 config, seed, skipped parts and stable density."""
     blob = json.dumps(runtime.to_jsonable(cfg), sort_keys=True, default=str)
     return {"format": 1, "config_sha256": hashlib.sha256(blob.encode()).hexdigest(), "seed": int(seed),
-            "skip": sorted(skip), "stable_density": density, "h71_boot_chunk": int(boot_chunk)}
+            "skip": sorted(skip), "stable_density": density, "h71_boot_chunk": int(boot_chunk),
+            "batch_order": "shuffled"}
 
 
-def check_fingerprint(root: Path, fp: dict) -> None:
+def check_fingerprint(root: Path, fp: dict) -> bool:
+    """Refuse a folder measured with other settings. Returns True when the folder was measured before the batch
+    order (2026-11-17) with otherwise the same settings: its checkpoints are then upgraded (upgrade_checkpoint)."""
     path = root / "fingerprint.json"
     if path.exists():
         old = json.loads(path.read_text())
-        diff = [k for k in fp if old.get(k) != fp[k]]
+        old_order = old.get("batch_order", "consecutive")
+        diff = [k for k in fp if k != "batch_order" and old.get(k) != fp[k]]
         if diff:
             raise SystemExit(f"{root} holds checkpoints measured with other settings ({', '.join(diff)} differ). "
                              f"Use another --out, or move {root} away to measure every checkpoint again.")
-        return
+        if old_order == fp["batch_order"]:
+            return False
+        p1_tasks.atomic_json(path, {**fp, "upgraded_from": old_order, "upgraded_utc": utc()})
+        return True
     root.mkdir(parents=True, exist_ok=True)
     p1_tasks.atomic_json(path, fp)
+    return False
+
+
+def upgrade_checkpoint(d: Path, run_seed: int) -> list[str]:
+    """Give a checkpoint measured before the batch order (row.json) the fixed random pool order: its grad and h71_fit
+    tasks get order_seed, their saved statistics and result.json move to stats/consecutive/, so that the resume runs
+    those tasks again from the saved samples and merges the rest as saved. Returns the tasks to run again."""
+    rj = d / "row.json"
+    if not rj.exists():
+        return []
+    record = json.loads(rj.read_text())
+    changed = p1_tasks.upgrade_tasks(record, run_seed)
+    if not changed:
+        return []
+    old = d / "stats" / "consecutive"
+    old.mkdir(parents=True, exist_ok=True)
+    for name in changed:
+        p = p1_tasks.stats_path(d, name)
+        if p.exists():
+            os.replace(p, old / p.name)
+    if (d / "result.json").exists():
+        os.replace(d / "result.json", old / "result.json")
+    p1_tasks.atomic_json(rj, record)             # last: a stop in between leaves tasks to run, never stale results
+    return changed
 
 
 def ck_key(tag: str, repo: str, rev: str) -> str:
@@ -810,7 +851,10 @@ def main():
     prog = Progress(run.out_dir)
     ck_root = run.out_dir / "checkpoints"
     boot_chunk = max(1, int(args.h71_boot_chunk))
-    check_fingerprint(ck_root, fingerprint(cfg, run.seed, skip, density, boot_chunk))
+    upgrade = check_fingerprint(ck_root, fingerprint(cfg, run.seed, skip, density, boot_chunk))
+    if upgrade:
+        run.note(f"{ck_root} was measured before the batch order (2026-11-17): the grad and H7.1 main-fit statistics "
+                 f"of its checkpoints are computed again from their saved samples (old ones in stats/consecutive/)")
     start_cpus = os.sched_getaffinity(0) if hasattr(os, "sched_getaffinity") else set(range(os.cpu_count() or 1))
     cpus_now = cpu_rule(args.cpus_after, start_cpus)
     torch.set_num_threads(torch.get_num_threads())        # keep this process's thread pools as they are, then
@@ -819,8 +863,7 @@ def main():
     labels: dict = {}
     pool = StatPool(cpus_now, max(0, args.workers), density, grid_path, prog, labels)
     store = Store(run.out_dir, prog, run, args.keep_samples)
-    store.h71_kw = {"level": config.H71["level"], "inv_tol": config.H71["inv_tol"],
-                    "drift_tol": config.H71["drift_tol"]}
+    store.h71_kw = h71_kw()
     run.note(f"CPU statistics: {density} stable density; pool of {args.workers or 'one per CPU'} process(es) on "
              f"CPUs {fmt_cpus(cpus_now())}" + (f", then {args.cpus_after} once that job has ended"
                                                if args.cpus_after else ""))
@@ -943,7 +986,8 @@ def main():
                 params, dirs = directions(model, pool_v[:cfg["hessian_batch"]], dev, cfg["n_random_dirs"], 0, run.seed)
                 P = jvp_projections(model, pool_v[:n], params, [d_ for _, _, d_ in dirs], dev, jb)
                 p1_tasks.atomic_npy(sd / "grad.npy", P)
-            tasks.append(task(c, "grad", "grad", {"B": B, "n_blocks": cfg["coupling_blocks"], "T": T}))
+            tasks.append(task(c, "grad", "grad", {"B": B, "n_blocks": cfg["coupling_blocks"], "T": T,
+                                                  "order_seed": p1_tasks.order_seed(run.seed)}))
         # H7.1 at the four training stages
         if "h71" not in skip_here and c.get("stage") is not None:
             nb = h71cfg.get("n_blocks", config.H71["n_blocks"]) if size in h71cfg["full_res_sizes"] else h71cfg["coarse_blocks"]
@@ -959,7 +1003,8 @@ def main():
                              "nb": nb, "Bs": h71_Bs, "n_pool": int(len(P)), "n_boot": n_boot_h71,
                              "n_chunks": len(chunks)}
             for j, dname in enumerate(names):
-                tasks.append(task(c, f"h71_fit.{dname}", "h71_fit", {"j": j, "Bs": h71_Bs, "nb": nb}))
+                tasks.append(task(c, f"h71_fit.{dname}", "h71_fit", {"j": j, "Bs": h71_Bs, "nb": nb,
+                                                                     "order_seed": p1_tasks.order_seed(run.seed)}))
                 for ci, nbt in enumerate(chunks):
                     tasks.append(task(c, f"h71_boot.{dname}.{ci}", "h71_boot",
                                       {"j": j, "Bs": h71_Bs, "nb": nb, "n_boot": nbt}))
@@ -986,6 +1031,12 @@ def main():
         store.register(c)
         for rec in pool.collect():
             store.task_done(rec)
+        # a checkpoint measured before the batch order (row.json's tasks tell, so an upgrade stopped half-way goes on)
+        redo = upgrade_checkpoint(c["dir"], run.seed)
+        if redo:
+            counts["upgraded_batch_order"] += 1
+            prog.say(f"{c['label']}: measured before the batch order; {len(redo)} statistic(s) again from the "
+                     f"saved samples")
         if (c["dir"] / "result.json").exists():
             store.load_result(c)
             counts["resumed_complete"] += 1
@@ -1022,15 +1073,8 @@ def main():
             for i, c in enumerate(plan_a, 1):
                 c.update(i=i, n=len(plan_a))
                 process(c)
-            df_a = pd.DataFrame([r for r in store.rows() if r["pass"] == "spike_a"])
-            a_out = loss_jumps(df_a, sc)
+            a_out, windows = spike_windows(store.rows(), sc, run)
             spike_rows += a_out
-            jumps = [(r["step_from"], r["step_to"]) for r in a_out if r["jump"]]
-            if not jumps and run.smoke and sc.get("smoke_force_top") and a_out:
-                top = max(a_out, key=lambda r: r["robust_z"] if np.isfinite(r["robust_z"]) else -np.inf)
-                jumps = [(top["step_from"], top["step_to"])]
-                run.note(f"smoke: no loss jump found; pass (b) runs around the largest z ({top['step_to']}) to exercise the code")
-            windows = merge_windows(jumps, sc["window"])
 
             # ---- pass (b): alpha, alpha_ESD and K for every seed of that size around each jump
             skip_b = skip | {"dh", "htok", "h71", "scaling"}
@@ -1055,15 +1099,39 @@ def main():
     extra = {"stable_density": density, "cpu_tasks_run": pool.n_done,
              "cpu_task_hours": round(pool.cpu_seconds / 3600, 3), **{k: v for k, v in counts.items()}}
     if do_spike:
-        df_b = pd.DataFrame([r for r in rows if r["pass"] == "spike_b"])
-        for lo, hi, js in windows:
-            w = df_b[df_b.spike_window == f"{lo}-{hi}"] if len(df_b) else df_b
-            if not len(w):
-                continue
-            for r in spike_check(w, sc):
-                spike_rows.append({"pass": "b", "window": f"{lo}-{hi}",
-                                   "loss_jump_steps": ";".join(f"{a}-{b}" for a, b in js), **r})
+        spike_rows += spike_b_rows(rows, windows, sc)
     analyse(cfg, run, rows, skip, do_spike, sc, spike_rows, windows, extra)
+
+
+def h71_kw() -> dict:
+    """The H7.1 tolerances of the summary rows and their verdict (config.H71)."""
+    return {"level": config.H71["level"], "inv_tol": config.H71["inv_tol"], "drift_tol": config.H71["drift_tol"],
+            "wild_max": config.H71.get("wild_max_alpha", 1.9)}
+
+
+def spike_windows(rows, sc, run) -> tuple[list, list]:
+    """Pass (a) of the loss-spike check from the spike_a rows: its rows and the step windows of pass (b)."""
+    df_a = pd.DataFrame([r for r in rows if r["pass"] == "spike_a"])
+    a_out = loss_jumps(df_a, sc)
+    jumps = [(r["step_from"], r["step_to"]) for r in a_out if r["jump"]]
+    if not jumps and run.smoke and sc.get("smoke_force_top") and a_out:
+        top = max(a_out, key=lambda r: r["robust_z"] if np.isfinite(r["robust_z"]) else -np.inf)
+        jumps = [(top["step_from"], top["step_to"])]
+        run.note(f"smoke: no loss jump found; pass (b) runs around the largest z ({top['step_to']}) to exercise the code")
+    return a_out, merge_windows(jumps, sc["window"])
+
+
+def spike_b_rows(rows, windows, sc) -> list[dict]:
+    """Pass (b) of the loss-spike check: per window, the jumps of alpha, alpha_ESD and K across the seeds."""
+    out = []
+    df_b = pd.DataFrame([r for r in rows if r["pass"] == "spike_b"])
+    for lo, hi, js in windows:
+        w = df_b[df_b.spike_window == f"{lo}-{hi}"] if len(df_b) else df_b
+        if not len(w):
+            continue
+        for r in spike_check(w, sc):
+            out.append({"pass": "b", "window": f"{lo}-{hi}", "loss_jump_steps": ";".join(f"{a}-{b}" for a, b in js), **r})
+    return out
 
 
 def pin_only_report(cfg, run, pinned) -> None:

@@ -13,6 +13,15 @@ results do not depend on the number of processes, the order the tasks finish in,
 Tasks: grad (stable fit and CSN tails with Vuong tests of the minibatch noise at coupling_B), esd (alpha_ESD per
 layer), act (act_zeta per layer), dh (Delta h_rep, on the CPU), htok (H_tok with shuffled surrogates), and per H7.1
 direction h71_fit (alpha-hat at each B) and h71_boot (a chunk of the bootstrap replicates).
+
+Batch order (2026-11-17): the pools are consecutive chunks of the same documents, so grad and h71_fit form their
+blocks from the pool in a fixed random order (params["order_seed"], from order_seed(run seed): the same order at
+every checkpoint and direction), as SGD draws random batches; h71_boot resamples i.i.d. and needs no order
+(common/batch.py). A task without order_seed keeps the pool's order, as before: the tasks of a P1 job started with
+the earlier code compute what that job's other tasks computed, even in pool processes started after a pull.
+upgrade_tasks adds the order to such a job's tasks (p1_checkpoints.py on resume, p1_recompute.py). The reported
+Delta h_rep is NaN when the dimension clause fails or the width is negative (dh_rep_raw keeps the number), and
+each H7.1 summary row carries the verdict of common/h71_verdict.py.
 """
 
 from __future__ import annotations
@@ -28,7 +37,7 @@ from pathlib import Path
 import numpy as np
 
 from . import batch as batchmod
-from . import hurst, multifractal, spectra, stable, tails
+from . import h71_verdict, hurst, multifractal, spectra, stable, tails
 
 # a stats task raising one of these has a bug: the run stops (as common/hf.py treats them); others are recorded
 CODE_ERRORS = (AttributeError, TypeError, NameError, ImportError, KeyError)
@@ -77,6 +86,36 @@ def rng_for(seed: list[int]) -> np.random.Generator:
     return np.random.default_rng(np.random.SeedSequence(seed))
 
 
+# ----------------------------------------------------------------------------- batch order
+ORDERED_KINDS = ("grad", "h71_fit")       # tasks whose blocks are batches of the pool (h71_boot resamples i.i.d.)
+
+
+def order_seed(run_seed: int) -> list[int]:
+    """Seed of the fixed random pool order: the run seed only, so every checkpoint and direction shares it."""
+    return seed_for(run_seed, "batch order")
+
+
+def batch_order(params: dict) -> str:
+    return "shuffled" if params.get("order_seed") is not None else "consecutive"
+
+
+def ordered(values: np.ndarray, params: dict) -> np.ndarray:
+    """The pool in the task's batch order: shuffled with params["order_seed"], or as saved (tasks made before)."""
+    s = params.get("order_seed")
+    return values if s is None else batchmod.shuffled(values, s)
+
+
+def upgrade_tasks(record: dict, run_seed: int) -> list[str]:
+    """Give every grad and h71_fit task of a checkpoint's record (row.json) the fixed random pool order, in place.
+    Returns the names of the tasks changed (their saved statistics are out of date)."""
+    changed = []
+    for t in record.get("tasks", []):
+        if t["kind"] in ORDERED_KINDS and t["params"].get("order_seed") is None:
+            t["params"]["order_seed"] = order_seed(run_seed)
+            changed.append(t["name"])
+    return changed
+
+
 # ----------------------------------------------------------------------------- the statistics
 def noise_quantities(values: np.ndarray, B: int, n_blocks: int, T: dict, rng) -> dict:
     """Stable fit and both CSN tails of the minibatch noise at batch size B (block means of the projections)."""
@@ -106,7 +145,8 @@ def _samples(ck: Path) -> Path:
 
 def task_grad(ck, p, rng):
     P = np.load(_samples(ck) / "grad.npy")
-    return noise_quantities(P[:, 0], int(p["B"]), int(p["n_blocks"]), {**p["T"], "n_jobs": 1}, rng)
+    return noise_quantities(ordered(np.asarray(P[:, 0], dtype=float), p), int(p["B"]), int(p["n_blocks"]),
+                            {**p["T"], "n_jobs": 1}, rng)
 
 
 def task_esd(ck, p, rng):
@@ -138,10 +178,11 @@ def _h71_pool(ck, j):
 
 
 def task_h71_fit(ck, p, rng):
-    return {"per_B": batchmod.fit_over_batches(_h71_pool(ck, p["j"]), p["Bs"], int(p["nb"]))}
+    return {"per_B": batchmod.fit_over_batches(ordered(_h71_pool(ck, p["j"]), p), p["Bs"], int(p["nb"]))}
 
 
 def task_h71_boot(ck, p, rng):
+    # i.i.d. resampling: the pool's order does not matter, so the saved order is used (the same replicates as before)
     b, gap = batchmod.h71_bootstrap(_h71_pool(ck, p["j"]), p["Bs"], int(p["nb"]), int(p["n_boot"]), rng)
     return {"b": b, "gap": gap}
 
@@ -166,7 +207,9 @@ def init_worker(density: str, grid_path: str | None, nice: int = 10) -> None:
 
 
 def run_task(spec: dict) -> dict:
-    """Run one task: spec = {dir, name, kind, params, seed[, cpus]}; writes stats/<name>.json and returns it."""
+    """Run one task: spec = {dir, name, kind, params, seed[, cpus, samples_dir]}; writes <dir>/stats/<name>.json and
+    returns it. The samples are read from <samples_dir>/samples (default: dir; p1_recompute.py reads them from the
+    P1 job's folder and writes the statistics into its own)."""
     if spec.get("cpus"):
         try:
             os.sched_setaffinity(0, set(spec["cpus"]))
@@ -175,7 +218,7 @@ def run_task(spec: dict) -> dict:
     t0 = time.perf_counter()
     err = None
     try:
-        result = KINDS[spec["kind"]](Path(spec["dir"]), spec["params"], rng_for(spec["seed"]))
+        result = KINDS[spec["kind"]](Path(spec.get("samples_dir") or spec["dir"]), spec["params"], rng_for(spec["seed"]))
     except CODE_ERRORS:
         raise
     except Exception as e:  # noqa: BLE001  a statistic that cannot be computed: recorded, the run goes on
@@ -227,8 +270,11 @@ def assemble(record: dict, stats: dict, h71_defaults: dict | None = None) -> dic
     if "dh" in names:
         d = res("dh")
         if d:
-            row.update({"dh_rep": d["delta_h_rep"], "dh_scope": d["scope"], "dh_D2": d["D2"],
-                        "dh_clause_ok": d["clause_ok"], "dh_decades": d["decades_r"]})
+            rep, why = multifractal.reported_width(d)
+            row.update({"dh_rep": rep, "dh_rep_raw": d["delta_h_rep"], "dh_rep_note": why, "dh_scope": d["scope"],
+                        "dh_D2": d["D2"], "dh_D_max": d.get("D_max"), "dh_log10_n": d.get("log10_n"),
+                        "dh_clause_ok": d["clause_ok"], "dh_decades": d["decades_r"],
+                        "dh_local_D2": d.get("local_D2"), "dh_local_scale": d.get("local_scale")})
     if "htok" in names:
         m = res("htok")
         if m:
@@ -236,9 +282,12 @@ def assemble(record: dict, stats: dict, h71_defaults: dict | None = None) -> dic
             row["H_dep"] = m["H_dep_dfa"]
     if "grad" in names:
         row.update(res("grad") or {})
+        row["alpha_batch_order"] = batch_order(next(t for t in record["tasks"] if t["name"] == "grad")["params"])
     h = record.get("h71")
     if h:
-        kw = h71_defaults or {}
+        kw = dict(h71_defaults or {})
+        wild_max = kw.pop("wild_max", 1.9)
+        fit_params = {t["name"]: t["params"] for t in record["tasks"] if t["kind"] == "h71_fit"}
         for d in h["directions"]:
             fit = res(f"h71_fit.{d}")
             boots_b, boots_gap = [], []
@@ -253,6 +302,9 @@ def assemble(record: dict, stats: dict, h71_defaults: dict | None = None) -> dic
             rows_B = fit["per_B"]
             h71_rows.extend({**meta, **r} for r in rows_B)
             summ = batchmod.h71_summary(rows_B, boots_b, boots_gap, h["n_pool"], h["Bs"], h["nb"], **kw)
+            summ.pop("reading", None)      # slope only, from before the verdict: slope_reading below says the same
+            summ["batch_order"] = batch_order(fit_params.get(f"h71_fit.{d}", {}))
+            summ.update(h71_verdict.verdict_columns(summ, h["Bs"], wild_max=wild_max, **kw))
             h71_summ.append({**meta, **summ, "n_boot_requested": h["n_boot"]})
     for name, e in errors.items():
         row[f"error_{name}"] = e

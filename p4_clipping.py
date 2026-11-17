@@ -12,7 +12,9 @@ Lambda_max (power iteration), Hessian trace (Hutchinson), adaptive sharpness, an
 quantities at the final checkpoint: alpha and zeta of unclipped minibatch noise at the training
 batch size, alpha_ESD, K, Delta h_rep and H_grad (DFA and wavelet on per-step projections of the
 unclipped minibatch gradient on fixed random directions over the constant-eta phase), entered as
-|H_grad - H_shuf|.
+|H_grad - H_shuf|. The alpha pool is a fixed random draw of training examples in random order (pool_ids), so its
+blocks are random batches; dh_rep is NaN when the dimension clause fails or the width is negative (dh_rep_raw);
+h71_summary.csv carries the H7.1 verdict of common/h71_verdict.py (2026-11-17).
 
 H7.1 control: on one designated run, checkpoints at 1, 10, 50, 100% of training; per-example
 gradient projections (JVP, BatchNorm in eval mode) on n_blocks * max(B) augmented draws.
@@ -55,7 +57,7 @@ import torch.nn.functional as F
 
 import config
 from common import batch as batchmod
-from common import clipping, gradients, hf, hurst, lm, multifractal, runtime, spectra, stable, tails
+from common import clipping, gradients, h71_verdict, hf, hurst, lm, multifractal, runtime, spectra, stable, tails
 from common import units as units_mod
 
 
@@ -333,20 +335,25 @@ def measure(kind, model, data, cfg, run, rng, device, proj, warm):
     out["adaptive_sharpness"] = gradients.adaptive_sharpness(model, pel, hbatch, M["sharp_rho"], M["sharp_steps"],
                                                              chunk=mb)
     del hvp, p0
-    # alpha / zeta of unclipped minibatch noise at the training batch size, one random direction
+    # alpha / zeta of unclipped minibatch noise at the training batch size, one random direction. The pool is drawn
+    # without replacement in a fixed random order (pool_ids), so its blocks are random batches, as SGD draws them;
+    # before 2026-11-17 it was the first n_pool training sequences in order (adjacent chunks of the same documents)
     B = cfg["transformer"]["batch"] if is_lm else cfg["resnet18"]["batch"]
     n_avail = len(data["train"]) if is_lm else len(data["train"][0])
     n_pool = min(M["alpha_pool_blocks"] * B, n_avail)
+    ids = pool_ids(kind, n_avail, n_pool, run.seed)
     sel = gradients.select_params(model, None)
     d = gradients.random_directions(sel, 1, gen)
     vals_p = []
     bs = min(32, mb) if mb else 32
     for s in range(0, n_pool, bs):
-        b = data["train"][s:s + bs].to(device).long() if is_lm else (data["train"][0][s:s + bs].to(device), data["train"][1][s:s + bs].to(device))
+        i = ids[s:s + bs]
+        b = data["train"][i].to(device).long() if is_lm else (data["train"][0][i].to(device), data["train"][1][i].to(device))
         vals_p.append(gradients.per_example_projections(model, pel, b, sel, d)[:, 0].cpu())
     v = torch.cat(vals_p).numpy()
     noise = stable.block_noise(v, B)
     out["alpha_blocks"] = len(noise)
+    out["alpha_batch_order"] = "shuffled"
     if len(noise) >= 20:
         f = stable.fit_stable(noise)
         out.update({"alpha": f.alpha, "beta": f.beta, "gamma": f.gamma})
@@ -375,7 +382,10 @@ def measure(kind, model, data, cfg, run, rng, device, proj, warm):
         out["K"] = spectra.activation_stats(torch.tensor(X))["K"]
     X = X[rng.choice(len(X), min(len(X), M["probe_points"]), replace=False)]
     dh = multifractal.delta_h_rep(X, S["q_lo"], S["q_hi"], rng=rng, n_centres=min(5000, len(X)))
-    out.update({"dh_rep": dh["delta_h_rep"], "dh_scope": dh["scope"]})
+    rep, why = multifractal.reported_width(dh)      # NaN when the dimension clause fails or the width is negative
+    out.update({"dh_rep": rep, "dh_rep_raw": dh["delta_h_rep"], "dh_rep_note": why, "dh_scope": dh["scope"],
+                "dh_clause_ok": dh["clause_ok"], "dh_D_max": dh["D_max"], "dh_log10_n": dh["log10_n"],
+                "dh_decades": dh["decades_r"]})
     # H_grad over the constant-eta phase
     series = proj[warm:, :] if len(proj) > warm + 50 else proj
     if len(series) >= 10 * S["dfa_s_min"]:
@@ -388,6 +398,22 @@ def measure(kind, model, data, cfg, run, rng, device, proj, warm):
         out["Hgrad_len"] = len(series)
     model.train()
     return out
+
+
+def pool_ids(kind: str, n_avail: int, n_pool: int, seed: int) -> torch.Tensor:
+    """Training examples of the alpha pool: n_pool of n_avail drawn without replacement, in the drawn (random) order,
+    from a generator of the run seed and model only, so every arm and seed is measured on the same batches."""
+    g = units_mod.rng_for(units_mod.seed_for(seed, "alpha pool", kind))
+    return torch.from_numpy(g.choice(int(n_avail), int(n_pool), replace=False).astype(np.int64))
+
+
+def h71_summary_rows(summ: list[dict], cfg) -> list[dict]:
+    """h71_summary.csv rows with the verdict of common/h71_verdict.py (the slope-only reading dropped)."""
+    Bs = cfg["h71"]["batch_sizes"]
+    kw = {"level": config.H71["level"], "inv_tol": config.H71["inv_tol"], "drift_tol": config.H71["drift_tol"],
+          "wild_max": config.H71.get("wild_max_alpha", 1.9)}
+    return [{**{k: v for k, v in r.items() if k != "reading"}, **h71_verdict.verdict_columns(r, Bs, **kw)}
+            for r in summ]
 
 
 def h71_control(kind, cfg, data, stage_ckpts, seed, device, run, rng):
@@ -463,8 +489,9 @@ def main():
     plan = plan_runs(kinds, seeds, arms, cfg["matched_update_length"])
     # every run is saved as it ends (runs/<tag>.json, with the unclipped run's gradient norms in
     # runs/<model>_s<seed>_ref_norms.npy); a restart with the same --out runs only the others
-    units = units_mod.Units(run.out_dir, {"cfg": cfg, "seed": run.seed, "smoke": run.smoke, "no_h71": bool(args.no_h71)},
-                            "p4_clipping", sub="runs")
+    # batch_order: runs saved by the code before 2026-11-17 (alpha pool in file order) are not resumed into this folder
+    units = units_mod.Units(run.out_dir, {"cfg": cfg, "seed": run.seed, "smoke": run.smoke, "no_h71": bool(args.no_h71),
+                                          "batch_order": "shuffled"}, "p4_clipping", sub="runs")
     units.plan(run_tag(k, s, r, p, m) for k, s, m, r, p in plan)
     units.write_progress()
     data_kind, data = None, None
@@ -520,7 +547,7 @@ def main():
         runtime.write_csv(run.out_dir / "runs.csv", rows)
     runtime.write_csv(run.out_dir / "runs.csv", rows)
     runtime.write_csv(run.out_dir / "h71_per_B.csv", h71_rows)
-    runtime.write_csv(run.out_dir / "h71_summary.csv", h71_summ)
+    runtime.write_csv(run.out_dir / "h71_summary.csv", h71_summary_rows(h71_summ, cfg))
     runtime.finish_run(run, extra={"n_runs": len(rows)})
 
 

@@ -26,14 +26,15 @@ slope, as a stable law with alpha that close to 2 does, so the test cannot call 
 
 Every input is a column that h71_test already writes (b_lo, b_hi, alpha_mean, scale_exponent, scale_gap_lo,
 scale_gap_hi, n_pool, n_blocks), so the verdict is recomputed from saved CSVs without refitting: P0's
-block_check_bootstrap.csv, P0b's h71_trunc_tests.csv and h71_gauss_tests.csv, and the h71_summary.csv of P1 and P4
-from the cloud run, whose code stays as it is. The Gaussian reference depends only on (n_pool, n_blocks, batch
-sizes); P0b's h71null part simulates it for the settings of the full run, and this module simulates any other
-setting on demand. Both cache it in one CSV (one row per Gaussian pool).
+block_check_bootstrap.csv, P0b's h71_trunc_tests.csv and h71_gauss_tests.csv, and the h71_summary.csv of P1 and P4.
+The Gaussian reference depends only on (n_pool, n_blocks, batch sizes). reference/h71_gauss_null.csv holds it for
+the settings of the full run (400 pools each at 1,600 and 200 blocks, B = 8 ... 1,024: P0b's h71null part, the
+same seeds and fits), so P1 and P4 write the verdict into their h71_summary.csv as they run (verdict_columns,
+2026-11-17); a row whose setting has no pools there reads undecided ("no Gaussian reference for this setting").
+The command below simulates any missing setting and keeps those pools in --null (one row per Gaussian pool).
 
 Command (from the repo root):
-  python -m common.h71_verdict results/p1_pythia/h71_summary.csv results/p4_resnet18/h71_summary.csv \\
-      --null results/p0b_calibration/h71_gauss_null.csv --jobs 6
+  python -m common.h71_verdict results/p1_pythia/h71_summary.csv results/p4_resnet18/h71_summary.csv --jobs 6
 writes <name>_verdict.csv next to each input and prints the verdict counts.
 """
 
@@ -55,6 +56,7 @@ from .batch import _slopes, fit_over_batches
 from .stable import block_noise
 
 PILOT_ROOT = Path(__file__).resolve().parent.parent
+REFERENCE = PILOT_ROOT / "reference" / "h71_gauss_null.csv"   # Gaussian pools of the full-run settings (in git)
 VERDICTS = ("invariant (wild)", "flat at 2 (mild)", "drift", "undecided")
 NULL_CODE = 71        # part code in the Gaussian pools' seeds
 NULL_KEY = ["n_pool", "n_blocks", "batch_sizes"]
@@ -126,6 +128,36 @@ def load_null(path: Path | None) -> pd.DataFrame:
     df = pd.read_csv(path)
     df["batch_sizes"] = df["batch_sizes"].astype(str)
     return df
+
+
+def load_reference(*paths) -> pd.DataFrame:
+    """The Gaussian pools of reference/h71_gauss_null.csv and of any further null CSVs (duplicates dropped)."""
+    frames = [f for f in (load_null(p) for p in (REFERENCE, *paths) if p is not None) if len(f)]
+    if not frames:
+        return load_null(None)
+    df = pd.concat(frames, ignore_index=True)
+    return df.drop_duplicates(subset=NULL_KEY + ["seed", "replicate"], keep="first").reset_index(drop=True)
+
+
+_BOUNDS: dict = {}
+
+
+def verdict_columns(summary: dict, batch_sizes, level: float = 0.90, inv_tol: float = 0.03, drift_tol: float = 0.05,
+                    wild_max: float | None = 1.9, null: pd.DataFrame | None = None) -> dict:
+    """The verdict of one h71_test summary (P1, P4) against the shipped Gaussian reference (or `null`): the columns
+    apply_verdicts adds (reference bounds, the three readings, verdict, verdict_reason)."""
+    bsk = bs_key(batch_sizes)
+    key = (int(_f(summary["n_pool"])), int(_f(summary["n_blocks"])), bsk, float(level))
+    if null is not None or key not in _BOUNDS:
+        ref = null if null is not None else load_reference()
+        g = ref[(ref.n_pool == key[0]) & (ref.n_blocks == key[1]) & (ref.batch_sizes == bsk)] if len(ref) else ref
+        bnd = null_bounds(g, level) if len(g) else {"null_reps": 0, "alpha_null_q": np.nan,
+                                                     "s_null_lo": np.nan, "s_null_hi": np.nan}
+        if null is not None:
+            return {**bnd, "batch_sizes": bsk, **classify(summary, bnd, inv_tol, drift_tol, wild_max)}
+        _BOUNDS[key] = bnd
+    bnd = _BOUNDS[key]
+    return {**bnd, "batch_sizes": bsk, **classify(summary, bnd, inv_tol, drift_tol, wild_max)}
 
 
 def null_bounds(null: pd.DataFrame, level: float = 0.90) -> dict:
@@ -264,7 +296,8 @@ def main(argv=None):
     ap.add_argument("files", nargs="+", help="summary CSVs written by h71_test (h71_summary.csv, h71_*tests.csv, "
                                              "block_check_bootstrap.csv)")
     ap.add_argument("--null", default=str(PILOT_ROOT / "results" / "p0b_calibration" / "h71_gauss_null.csv"),
-                    help="Gaussian-pool reference (read, and extended when a setting is missing)")
+                    help="further Gaussian pools, read with reference/h71_gauss_null.csv; pools simulated for a "
+                         "missing setting are added to this file")
     ap.add_argument("--null-reps", type=int, default=config.H71_NULL_REPS,
                     help="Gaussian pools per setting (default %(default)s)")
     ap.add_argument("--seed", type=int, default=config.SEED)
@@ -281,7 +314,8 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     null_path = Path(args.null)
-    null = load_null(null_path)
+    extra = load_null(null_path)                 # this file only: what is written back
+    null = load_reference(null_path)
     for f in args.files:
         path = Path(f)
         if not path.exists() or path.stat().st_size == 0:
@@ -297,8 +331,9 @@ def main(argv=None):
         new = simulate_null(needed_keys(df, Bs), args.null_reps, args.seed, args.jobs, null)
         if len(new):
             null = pd.concat([null, new], ignore_index=True)
+            extra = pd.concat([extra, new], ignore_index=True)
             null_path.parent.mkdir(parents=True, exist_ok=True)
-            null.to_csv(null_path, index=False)
+            extra.to_csv(null_path, index=False)
             print(f"Gaussian reference extended: {null_path}")
         out = apply_verdicts(df, null, Bs, args.inv_tol, args.drift_tol, args.level, args.wild_max)
         dest = path.with_name(path.stem + args.suffix + ".csv")
