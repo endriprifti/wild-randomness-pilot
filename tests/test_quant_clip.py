@@ -18,6 +18,35 @@ def test_nf4_code_book_is_the_qlora_normal_map():
     assert np.allclose(quant.NF4_CODE.numpy(), v, atol=1e-6)
 
 
+def test_nf4_in_chunks_equals_one_pass():
+    W = torch.randn(300, 257) * 3                       # padding in the last block, many chunks
+    flat = torch.nn.functional.pad(W.reshape(-1), (0, (-W.numel()) % 64)).reshape(-1, 64)
+    am = flat.abs().amax(1, keepdim=True).clamp(min=1e-8)
+    one = (quant.NF4_CODE[((flat / am).unsqueeze(-1) - quant.NF4_CODE).abs().argmin(-1)] * am).reshape(-1)
+    one = one[:W.numel()].reshape(W.shape)
+    assert torch.equal(quant.quant_nf4(W, 64), one) and torch.equal(quant.quant_nf4(W, 64, chunk_blocks=7), one)
+
+
+def test_apply_scheme_frees_each_layer_as_it_goes():
+    import gc
+    import weakref
+    m = torch.nn.Sequential(*[torch.nn.Linear(16, 16) for _ in range(3)])
+    refs = [weakref.ref(l) for l in m]
+    seen = []
+    orig = quant.QuantLinear.__init__
+
+    def spy(self, lin, *a, **k):
+        gc.collect()
+        seen.append(sum(r() is not None for r in refs))
+        orig(self, lin, *a, **k)
+    quant.QuantLinear.__init__ = spy
+    try:
+        quant.apply_scheme(m, quant.Scheme("uniform", a_bits=None, group=8))
+    finally:
+        quant.QuantLinear.__init__ = orig
+    assert seen == [3, 2, 1]                            # the layers already replaced are gone
+
+
 def test_fwht_is_orthonormal():
     from scipy.linalg import hadamard
     x = torch.randn(3, 64, dtype=torch.float64)

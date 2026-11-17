@@ -1,15 +1,11 @@
-"""P3 saves every run as it finishes and goes on from the saved runs; the LRA designs; runs recovered from a process
-of the code before 2026-11-17 (p3_rescue.py) are adopted only with the same settings."""
+"""P3 saves every run as it finishes and goes on from the saved runs; the LRA designs; P3's GPU lock."""
 import json
-import shutil
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import pytest
 import torch
 
 import config
@@ -80,29 +76,6 @@ def test_saved_runs_are_reused_and_lost_ones_run_again(tmp_path):
     assert r.returncode != 0 and "weight_decay" in r.stderr
 
 
-def test_adopt_takes_runs_only_with_the_same_settings(tmp_path):
-    src = tmp_path / "src"
-    assert _p3(src).returncode == 0
-    rows = pd.read_csv(src / "runs.csv")
-    old_cols = ["task", "arch", "n_s", "H", "lr", "seed", "phase", "target_params", "data_source", "acc", "params",
-                "steps", "wall_s", "peak_mem_mb", "diverged", "tokens_seen", "flops_proxy"]   # the old code's row
-    cfg = config.get("p3_fractional_memory", smoke=True)
-    seed = json.loads((src / "runs" / "powerlaw" / "settings.json").read_text())["seed"]
-    rescued = {"rows": rows[old_cols].to_dict("records"), "cfg": cfg, "seed": seed, "smoke": True, "pid": 1,
-               "utc": "2026-11-17T00:00:00Z"}
-    rescued["rows"].append({**rescued["rows"][0], "steps": 999})        # not in this plan
-    (tmp_path / "rescued.json").write_text(json.dumps(rescued))
-    r = _p3(tmp_path / "new", "--adopt", str(tmp_path / "rescued.json"), "--plan")
-    assert r.returncode == 0 and "adopted 6, already saved 0, not in this plan 1" in r.stdout, r.stdout + r.stderr
-    assert "left: 0 runs" in r.stdout
-    new = pd.read_csv(tmp_path / "new" / "runs.csv")
-    assert new.origin.str.startswith("rescued").all() and np.allclose(new.acc, rows.acc)
-    bad = {**rescued, "cfg": {**cfg, "batch": 64}}                        # the process trained with another batch
-    (tmp_path / "bad.json").write_text(json.dumps(bad))
-    r = _p3(tmp_path / "new2", "--adopt", str(tmp_path / "bad.json"), "--plan")
-    assert r.returncode == 0 and "other settings 7" in r.stdout
-
-
 def test_p3_gpu_lock(tmp_path, monkeypatch):
     import argparse
     from common import gpu_locks, runtime
@@ -117,46 +90,3 @@ def test_p3_gpu_lock(tmp_path, monkeypatch):
     f.close()
     assert p3.gpu_lock(argparse.Namespace(smoke=True, plan=False), "cuda") == (None, 0.0)
     assert p3.gpu_lock(a, "cpu") == (None, 0.0)
-
-
-OLD_P3 = '''
-import time
-def main():
-    cfg = {"steps": 3000, "tasks": {"powerlaw": {"L": 8}}}
-    class R: seed = 5; smoke = False; out_dir = "x"
-    run = R()
-    rows = []
-    for i in range(10_000):
-        rows.append({"task": "powerlaw", "arch": "frac", "n_s": 2, "H": 4, "lr": 0.001, "seed": i, "phase": "main",
-                     "acc": float("nan") if i == 1 else i / 10, "steps": 3000})
-        if i == 2:
-            print("ready", flush=True)
-        if i >= 2:
-            time.sleep(0.05)
-main()
-'''
-
-
-@pytest.mark.skipif(shutil.which("gdb") is None or not sys.platform.startswith("linux"), reason="needs gdb on Linux")
-def test_rescue_reads_the_runs_of_a_running_process(tmp_path):
-    import p3_rescue
-    (tmp_path / "old").mkdir()
-    (tmp_path / "old" / "p3_fractional_memory.py").write_text(OLD_P3)
-    proc = subprocess.Popen([PY, str(tmp_path / "old" / "p3_fractional_memory.py")], stdout=subprocess.PIPE, text=True)
-    try:
-        assert proc.stdout.readline().strip() == "ready"
-        try:
-            data = p3_rescue.rescue(proc.pid, tmp_path / "out" / "rescued.json", timeout=120)
-        except SystemExit as e:
-            if "ptrace" in str(e) or "Operation not permitted" in str(e):
-                pytest.skip("ptrace not permitted here")
-            raise
-        assert proc.poll() is None                                     # still running
-        n = len(data["rows"])
-        assert n >= 3 and [r["seed"] for r in data["rows"]] == list(range(n)) and np.isnan(data["rows"][1]["acc"])
-        assert data["seed"] == 5 and data["cfg"]["steps"] == 3000 and data["how"] == "main() frame"
-        assert "recovered" in p3_rescue.summary(data)
-        time.sleep(0.3)
-        assert proc.poll() is None
-    finally:
-        proc.kill()

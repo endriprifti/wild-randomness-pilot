@@ -13,10 +13,20 @@ Checks, at the sizes in config.py (full runs, float32, eager attention as in com
       hessian_batch x example_len for the sizes that run H7.1
   p4  training step (AdamW / SGD state included) and every batch measure of measure() at its micro-batch
   p3  one training step of every arm, task and state size at matched parameters
+  p2  each model in its config dtype (bfloat16): a perplexity window, PopQA generation (a batch of prompts of
+      256 tokens, more than PopQA's few-shot prompts, then max_new_tokens steps with the cache), hidden states,
+      and every scheme's restore + quantization of the weights; perplexity and PopQA again under the rotation and
+      outlier schemes (their activations are rotated or copied in float32)
+  p5  the escape grid's largest steps: a full-batch gradient of all restarts at once (injected noise, the descent
+      of every exit check), the loss barrier on the segment, a minibatch gradient at the largest B, and the
+      HVP and per-example projections of alpha_at
 
-  python memory_check.py                    # all three parts against the L40S's 44.39 GiB
+  python memory_check.py                    # every part against the L40S's 44.39 GiB
   python memory_check.py p1 --limit 23.5    # one part against another card
   python memory_check.py p4 --calibrate     # adds the unchunked P4 HVP that failed on the L40S
+  python memory_check.py p2 --calibrate     # adds P2's quantization as before 2026-11-17 (every layer held)
+
+run_queue.py admits jobs by these peaks (its PEAK_GIB table; tests/test_run_queue.py checks it against this script).
 """
 
 from __future__ import annotations
@@ -48,9 +58,17 @@ OLMO2 = {"1b": (2048, 16, 16, 8192), "7b": (4096, 32, 32, 11008)}               
 class PeakTracker(TorchDispatchMode):
     """Bytes of distinct live storages, swept after every op; `keep` are tensors alive throughout."""
 
-    def __init__(self, keep=()):
+    def __init__(self, keep=(), ignore=()):
         super().__init__()
         self.refs, self.peak = {}, 0
+        # storages that live elsewhere (P2's CPU copies of the weights): an op that reads them (detach in deepcopy)
+        # returns them, and they would otherwise be counted from then on
+        self.ignore = set()
+        for t in ignore:
+            try:
+                self.ignore.add(StorageWeakRef(t.untyped_storage()).cdata)
+            except Exception:  # noqa: BLE001
+                pass
         for t in keep:
             self._add(t)
         self._sweep()
@@ -63,7 +81,7 @@ class PeakTracker(TorchDispatchMode):
         except Exception:  # noqa: BLE001  functorch wrappers carry no storage of their own
             return
         ref = StorageWeakRef(st)
-        if ref.cdata not in self.refs:
+        if ref.cdata not in self.refs and ref.cdata not in self.ignore:
             self.refs[ref.cdata] = (ref, st.nbytes())
 
     def _sweep(self):
@@ -81,6 +99,15 @@ class PeakTracker(TorchDispatchMode):
 
 def peak_gib(fn, keep) -> float:
     tr = PeakTracker(keep)
+    with tr:
+        fn()
+    return tr.peak / GiB
+
+
+def peak_gib_model(fn, model, *extra, ignore=()) -> float:
+    """As peak_gib, without holding the model's tensors: a step that replaces layers (P2's quantization) frees the
+    old weights as the real run does. `ignore`: tensors that are not on the GPU in the real run."""
+    tr = PeakTracker(state(model, *extra), ignore)    # the list dies here; the tracker keeps weak references only
     with tr:
         fn()
     return tr.peak / GiB
@@ -281,11 +308,146 @@ def check_p3(rows, log):
             log(f"p3 {task} n_s={n_s}: done ({time.time() - t0:.0f} s)")
 
 
+# ----------------------------------------------------------------------------- P2
+# public configs (config.json) of P2's models: family, hidden, layers, heads, intermediate, padded vocabulary
+P2_MODELS = {"EleutherAI/pythia-6.9b": ("pythia", 4096, 32, 32, 16384, 50432),
+             "allenai/OLMo-7B-hf": ("olmo", 4096, 32, 32, 11008, 50304)}
+POPQA_PROMPT = 256        # tokens; PopQA's 4-shot prompts are about 100
+
+
+def p2_model(name: str):
+    fam, h, n_layers, heads, inter, V = P2_MODELS[name]
+    if fam == "pythia":
+        from transformers import GPTNeoXConfig, GPTNeoXForCausalLM
+        c = GPTNeoXConfig(vocab_size=V, hidden_size=h, num_hidden_layers=n_layers, num_attention_heads=heads,
+                          intermediate_size=inter, max_position_embeddings=2048, rotary_pct=0.25,
+                          use_parallel_residual=True, tie_word_embeddings=False)
+        cls = GPTNeoXForCausalLM
+    else:
+        from transformers import OlmoConfig, OlmoForCausalLM
+        c = OlmoConfig(vocab_size=V, hidden_size=h, num_hidden_layers=n_layers, num_attention_heads=heads,
+                       num_key_value_heads=heads, intermediate_size=inter, max_position_embeddings=2048,
+                       tie_word_embeddings=False)
+        cls = OlmoForCausalLM
+    c._attn_implementation = "eager"
+    return cls(c).eval()
+
+
+def nograd_generate(model, x, new):
+    """Mirrors generate() without sampling: the prompt with the cache, then one token at a time (full logits)."""
+    with torch.no_grad():
+        out = model(input_ids=x, use_cache=True)
+        pkv, nxt = out.past_key_values, out.logits[:, -1:].argmax(-1)
+        for _ in range(new):
+            out = model(input_ids=nxt, past_key_values=pkv, use_cache=True)
+            pkv, nxt = out.past_key_values, out.logits[:, -1:].argmax(-1)
+
+
+def check_p2(rows, log, calibrate=False):
+    import copy
+    import p2_w4a4 as p2
+    from common import quant
+    import torch.fx.experimental._config as fx_config
+    fx_config.meta_nonzero_assume_all_nonzero = True      # boolean masks (outlier channels) select every channel:
+    cfg = config.get("p2_w4a4", False)                     # a slight overestimate on the meta device
+    dtype = getattr(torch, cfg["dtype"])
+    pq = cfg["popqa"]
+    for name in cfg["models"]:
+        t0 = time.time()
+        out = []
+        with torch.device("meta"):
+            model = p2_model(name).to(dtype)
+            V = model.config.vocab_size
+            out.append(("weights", cfg["dtype"], sum(p.numel() * p.element_size() for p in model.parameters()) / GiB))
+            win = torch.randint(0, V, (1, cfg["ppl"]["ctx"]))
+            prompt = torch.randint(0, V, (pq["batch"], POPQA_PROMPT))
+            probe = torch.randint(0, V, (4, cfg["probe"]["len"]))
+
+            def forwards(tag):
+                out.append((f"perplexity window{tag}", f"1 x {cfg['ppl']['ctx']}",
+                            peak_gib_model(lambda: nograd_losses(model, win), model, win)))
+                out.append((f"PopQA generation{tag}", f"{pq['batch']} x {POPQA_PROMPT}+{pq['max_new_tokens']}",
+                            peak_gib_model(lambda: nograd_generate(model, prompt, pq["max_new_tokens"]), model, prompt)))
+            forwards("")
+            out.append(("hidden states", f"4 x {cfg['probe']['len']}",
+                        peak_gib_model(lambda: nograd_hidden(model, probe), model, probe)))
+            lins = quant.linear_layers(model)
+            absmax = {n: torch.rand(m.in_features) for n, m in lins.items()}
+            bank = p2.WeightBank.__new__(p2.WeightBank)          # the real bank holds CPU copies: not counted
+            bank.orig = {n: copy.deepcopy(m) for n, m in lins.items()}
+            on_cpu = [t for m in bank.orig.values() for t in m.parameters()]
+            del lins
+            schemes = [(arm, quant.Scheme(**s)) for arm, ss in cfg["arms"].items() for s in ss]
+            schemes.append(("control", quant.Scheme("isotropic", a_bits=None)))
+            for arm, s in schemes:
+                noise = {"sigma_w": 0.1, "sigma_a": 0.1, "seed": 0} if s.name == "isotropic" else None
+
+                def step():
+                    bank.restore(model, "meta")
+                    quant.apply_scheme(model, s, absmax if s.name != "isotropic" else None, seed=0, noise=noise)
+                out.append((f"restore + quantize: {arm} {s.name}", "weights",
+                            peak_gib_model(step, model, absmax, ignore=on_cpu)))
+                if arm == "w4a4" and s.name in ("rotation", "outlier"):
+                    forwards(f" ({s.name} W4A4)")
+                if calibrate and arm == "weight_only" and s.name == "nf4":
+                    def old_step():
+                        bank.restore(model, "meta")
+                        held = list(quant.linear_layers(model).values())       # the old loop held every layer
+                        quant.apply_scheme(model, s, absmax, seed=0)
+                        del held
+                    out.append(("calibration: quantize, every layer held (before 2026-11-17)", "weights",
+                                peak_gib_model(old_step, model, absmax, ignore=on_cpu)))
+        rows.extend({"part": "p2", "job": "rerun_p2_bf16", "model": name.split("/")[-1], "step": st, "shape": sh,
+                     "peak_GiB": g} for st, sh, g in out)
+        log(f"p2 {name}: {max(g for st, _, g in out if st != 'weights' and not st.startswith('calibration')):.1f} GiB "
+            f"({time.time() - t0:.0f} s)")
+
+
+# ----------------------------------------------------------------------------- P5
+def check_p5(rows, log):
+    import p5_escape as p5
+    cfg = config.get("p5_escape", False)
+    R, n, act = cfg["restarts"], cfg["n_train"], cfg["act"]
+    t0 = time.time()
+    out = []
+    with torch.device("meta"):
+        P = p5.init_params(R, 784, cfg["hidden"], 10, 0, "meta")
+        X, Y = torch.randn(n, 784), torch.randint(0, 10, (n,))
+        keep = lambda *e: [*P, X, Y, *e]                          # noqa: E731
+        out.append(("full-batch gradient, all restarts", f"{R} x {n}", peak_gib(lambda: p5.grads(P, X, Y, act), keep())))
+        out.append(("loss barrier on the segment", f"{R} x {n} x {cfg['segment_points']}",
+                    peak_gib(lambda: p5.barrier(P, P, X, Y, act, cfg["segment_points"], with_end=True), keep())))
+        idx = torch.randint(0, n, (R, max(cfg["batch_sizes"])))
+        out.append(("minibatch gradient", f"{R} x {max(cfg['batch_sizes'])}",
+                    peak_gib(lambda: p5.grads(P, X[idx], Y[idx], act), keep(idx))))
+
+        class Wrap(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                for i, t in enumerate(P):
+                    self.register_parameter(f"p{i}", torch.nn.Parameter(t[0:1].clone()))
+
+            def forward(self, x):
+                return p5.forward([getattr(self, f"p{i}") for i in range(len(P))], x, act)[0]
+        m = Wrap()
+        pel = lambda run, b: F.cross_entropy(run(b[0]), b[1], reduction="none")      # noqa: E731
+        params = gradients.select_params(m, None)
+        b = (X[:1000], Y[:1000])
+        f, extra = hvp_step(m, pel, b, params)
+        out.append(("alpha at W_S: HVP", "1000", peak_gib(f, state(m, *extra))))
+        f, extra = jvp_step(m, pel, b, params)
+        out.append(("alpha at W_S: per-example projections", "1000", peak_gib(f, state(m, *extra))))
+    rows.extend({"part": "p5", "job": "rerun_p5", "model": f"MLP {cfg['hidden']}x2", "step": st, "shape": sh,
+                 "peak_GiB": g} for st, sh, g in out)
+    log(f"p5: {max(g for _, _, g in out):.2f} GiB ({time.time() - t0:.0f} s)")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("parts", nargs="*", default=["p1", "p4", "p3"], choices=["p1", "p4", "p3"])
+    ap.add_argument("parts", nargs="*", default=["p1", "p4", "p3", "p2", "p5"], choices=["p1", "p4", "p3", "p2", "p5"])
     ap.add_argument("--limit", type=float, default=L40S_GIB, help="GPU memory in GiB (default: the L40S)")
-    ap.add_argument("--calibrate", action="store_true", help="P4: add the unchunked HVP that failed on the L40S")
+    ap.add_argument("--calibrate", action="store_true", help="P4: add the unchunked HVP that failed on the L40S; "
+                                                             "P2: add the quantization as before 2026-11-17")
     ap.add_argument("--csv", default=None, help="also write the rows to this CSV")
     args = ap.parse_args(argv)
     warnings.filterwarnings("ignore")
@@ -293,7 +455,8 @@ def main(argv=None) -> int:
     rows = []
     for part in args.parts:
         {"p1": lambda: check_p1(rows, log), "p4": lambda: check_p4(rows, log, args.calibrate),
-         "p3": lambda: check_p3(rows, log)}[part]()
+         "p3": lambda: check_p3(rows, log), "p2": lambda: check_p2(rows, log, args.calibrate),
+         "p5": lambda: check_p5(rows, log)}[part]()
     bad = 0
     print(f"{'job':16} {'model':22} {'step':40} {'shape':14} {'GiB':>8}  vs {args.limit:.1f} GiB")
     for r in rows:

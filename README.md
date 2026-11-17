@@ -33,7 +33,7 @@ WSL2, **T4** = Kaggle's 16 GB T4 (not the P100, see below), **5090** = RTX 5090 
 | 0 | Calibration | CPU | CPU only | `python p0_calibration.py`; extra calibrations: `python p0b_calibration.py --jobs 6` (laptop, see P0b below) |
 | 1 | Emmy check | ~1 (ours) | 5090 (Emmy's own benchmark GPU); needs nvcc and the Emmy env | `python emmy_check.py --frontend-only` (CPU), then `python emmy_check.py --probe-only`, then `python emmy_check.py` |
 | 2 | Escape grid, H3.3 / H6.1 | 25 | 4 GB, T4, 5090 | `python p5_escape.py` and `python p5_escape.py --part h31` |
-| 3 | W4A4 and weight-only, H6.2 (simulated quantization) | 30 | 5090 (Pythia-6.9B and OLMo-7B in bfloat16, about 14 GB each); L40S also fine | `python p2_w4a4.py` (one model: `--models EleutherAI/pythia-6.9b`) |
+| 3 | W4A4 and weight-only, H6.2 (simulated quantization) | 30 | 5090 (Pythia-6.9B and OLMo-7B in bfloat16, 12.8 GiB of weights each, peak 16.5 GiB); L40S also fine | `python p2_w4a4.py` (one model: `--models EleutherAI/pythia-6.9b`) |
 | 4 | Clipping sweep, H6.1 / H7.1 control | 30 | 5090 (transformer peak ~21 GiB, see GPU memory below); ResNet-18 also T4 | `python p4_clipping.py --model transformer` and `python p4_clipping.py --model resnet18` |
 | 5 | Checkpoint measurements, with the 410M loss-spike check (pass (a) downloads about 391 GB, see below) | 45 | Pythia: 5090 (H7.1's HVP at 14M to 160M peaks ~16 GiB); PolyPythias: T4; OLMo 2 1B: 5090 | `python p1_checkpoints.py --pin-only`, then `--suite pythia`, `--suite polypythia,polypythia_data,polypythia_weight`, `--suite olmo` |
 | 6 | Fractional memory, H4.1 | 65 | 5090; T4 is tight (Mamba at n_s = 64 peaks ~13 GiB) | `python p3_fractional_memory.py` (LRA image in its reduced design by default, see "P3" below; drop LRA first if time runs short: `--tasks powerlaw,exponential`) |
@@ -209,8 +209,9 @@ tail -f logs/progress.txt
   wall time.
 - **Failures and resume.** A failed job does not stop the rest. A job that exits with 0 leaves `logs/<job>.done`,
   and a rerun of `run_all.sh` skips it, so after an interruption you simply start the script again. Failed or
-  interrupted jobs run again from their start (a job has no checkpoints of its own). Delete `logs/<job>.done` to
-  rerun a finished job. `--only job1,job2` and `--skip job1,job2` select jobs, and only one `run_all.sh` can run at
+  interrupted jobs run again, from their saved units where they have them (P1, P2, P3, P4 and P5's escape grid save
+  each finished unit, see "A third lane" below; P0 starts again). Delete `logs/<job>.done` to rerun a finished
+  job. `--only job1,job2` and `--skip job1,job2` select jobs, and only one `run_all.sh` can run at
   a time. Stopping the script (Ctrl-C, `kill`) stops the running GPU job and P0 and records both as interrupted.
 - **Archives.** After each job (also after a failure) `results_archive/<job>.tar.gz` holds `results/<job>/` and
   the job's log, and `results_archive/pins.json` is refreshed. At the end the script prints the `scp` line to run
@@ -271,8 +272,7 @@ it lost everything. Now:
   command again and it goes on from the saved runs; a run stopped in the middle starts again. A run's result
   depends only on its settings (each run seeds itself from its seed; the synthetic data are drawn from the run seed
   in config order, as before, whatever `--tasks` says), so the order of runs and restarts change nothing: a smoke
-  run stopped with SIGTERM and resumed, and one started from runs recovered from an old-code process, give the same
-  `runs.csv` and `curves.csv` as an uninterrupted old-code run. `runs/<task>/settings.json` holds the settings
+  run stopped with SIGTERM and resumed gives the same `runs.csv` and `curves.csv` as an uninterrupted old-code run. `runs/<task>/settings.json` holds the settings
   that decide a run's result (the task's data, batch, layers, H_ref, weight decay, seed); a restart with others
   stops. Main runs go seed by seed (every arm and n_s of seed 1, then seed 2, ...), so a P3 stopped early leaves
   whole seeds. Each run logs a line with its accuracy, seconds per step and the hours left by the measured step
@@ -297,41 +297,88 @@ it lost everything. Now:
 - **Locks.** P3 holds `logs/.p3_gpu.lock` while it runs on the GPU; `p1_olmo7b` takes the same lock (see the lane's
   "p1_olmo7b stays last" above). `run_lane.sh p3_fractional` runs P3 with run_all.sh's command and records, in a
   lane of its own next to the P1 lane.
-- **Runs held by an old-code P3.** `p3_rescue.py` attaches gdb to the running process for a moment and, at a safe
-  moment (its main thread has released the GIL and is not in the C allocator), runs a few lines of Python inside it
-  that write the list of finished runs, the config and the seed to `rescued_runs.json`; the process keeps running
-  (tested 46 times against one smoke run, whose results then equalled an undisturbed run's).
-  `--adopt rescued_runs.json` saves those runs after checking that the process used the same settings and that
-  each run belongs to this plan (old LRA runs of 31,240 steps do not belong to the reduced design).
-
-Replacing the first P3 (run by `run_all.sh` since 2026-11-16) by the new one, next to the P1 lane:
+The first P3 (run by `run_all.sh` since 2026-11-16) was stopped on 2026-11-17. A gdb-based tool meant to copy its
+finished runs out of the running process (`p3_rescue.py`) froze it instead (gdb: "The program being debugged was
+signaled while in a function called from GDB"), so its runs were lost; the tool and P3's `--adopt` option are
+removed. The new P3 runs from scratch in a lane of its own next to the P1 lane:
 
 ```bash
-cd ~/pilot                                  # venv active
-# 1. pull as in "Pulling on the L40S" below (the running jobs keep the code they loaded; run_all.sh is unchanged)
-# 2. GPU memory now
-nvidia-smi --query-gpu=memory.used,memory.total --format=csv
-nvidia-smi --query-compute-apps=pid,used_memory --format=csv
-# 3. recover the first P3's finished runs (it keeps running); gdb: sudo apt-get install -y gdb
-P3PID=$(pgrep -f 'p3_fractional_memory.py --out results/p3_fractional'); echo "$P3PID"
-python p3_rescue.py --pid "$P3PID"          # if gdb says "ptrace: Operation not permitted": sudo "$(which python)" p3_rescue.py --pid "$P3PID"
-python p3_fractional_memory.py --out results/p3_fractional --adopt results/p3_fractional/rescued_runs.json --plan
-# 4. keep P1's statistics on CPUs 7-10 while P3 is replaced (run_all.sh's END line for P3 would widen them)
-echo 7-10 > logs/p1_cpus
-# 5. stop the first P3 (its Python process only: run_all.sh writes "END p3_fractional exit 143", packs the
-#    archive and starts p1_olmo7b, which waits for the lanes and P3 without touching the GPU)
-kill -TERM "$P3PID"
-sleep 20; tail -3 logs/progress.txt; tail -2 logs/p1_olmo7b.log      # START p1_olmo7b, then "waiting for run_lane.sh"
-# 6. start the new P3 in its own lane (it waits until the GPU has 12.9 + 4 GiB free)
 nohup taskset -c 0-6 bash run_lane.sh p3_fractional > logs/run_lane_p3.out 2>&1 &
-sleep 60; tail -2 logs/progress.txt; tail -3 logs/p3_fractional.log
-rm logs/p1_cpus                             # progress.txt shows P3 running again: the P1 pool stays on 7-10
-nvidia-smi --query-compute-apps=pid,used_memory --format=csv
+python p3_fractional_memory.py --out results/p3_fractional --plan      # saved runs and hours left, any time
 ```
 
-Step 6 is refused until progress.txt shows run_all.sh at `p1_olmo7b` (step 5's check). When the new P3 ends,
-its END line widens the P1 pool to every CPU as before, and `logs/p3_fractional.done` makes a later `run_all.sh`
-skip P3. `p1_olmo7b` starts when the P1 lane and the new P3 have both ended.
+When it ends, its END line widens the P1 pool to every CPU, and `logs/p3_fractional.done` makes a later
+`run_all.sh` skip P3. `p1_olmo7b` starts when the P1 lane, the P3 lane and the queue below have all ended.
+
+### A third lane for the reruns: `run_queue.py` (2026-11-17)
+
+`run_queue.py` runs the remaining reruns, each as soon as the GPU has room for it, next to the P1 and P3 lanes,
+with the same records as the lanes (START/END lines in `logs/progress.txt` tagged "(queue)", `logs/<job>.log`,
+`logs/<job>.done`, `results_archive/<job>.tar.gz`, `results_archive/pins.json`). `run_all.sh` is unchanged.
+
+| Job | Command (each with `--out`) | GPU peak (GiB) |
+|---|---|---|
+| `rerun_p5_floor10` | `p5_escape.py --floor-from results/p5_escape --alphas 1.5,1.8,2.0 --fine-check 10:250` → `results/p5_escape_floor10` | 1.1 |
+| `rerun_p5_a12` | `p5_escape.py --modes injected --alphas 1.2 --fine-check 10:250 --second-reading --log-checks` → `results/p5_escape_a12` | 1.1 |
+| `rerun_p5_refit` | `p5_escape.py --part refit --base results/p5_escape --replace results/p5_escape_floor10,results/p5_escape_a12` → `results/p5_escape_refit`, after both | CPU |
+| `rerun_p5_h31_flags` | `p5_escape.py --part h31-flags --base results/p5_escape_h31` → `results/p5_escape_h31_flags` | CPU |
+| `rerun_p2_popqa` | `-m common.popqa results/p2_w4a4` → `results/p2_w4a4_popqa` | CPU |
+| `rerun_p2_bf16` | `p2_w4a4.py` → `results/p2_w4a4_bf16` | 16.5 |
+| `p4_transformer` | `p4_clipping.py --model transformer` → `results/p4_transformer` (run_all.sh's job; its `.done` makes run_all.sh skip it) | 21.4 |
+
+- **When a job starts.** Every process on the GPU is counted at 1.05 × its peak (`python memory_check.py`, tensors
+  only) + 0.6 GiB (allocator rounding, CUDA context): the queue's running jobs, `run_all.sh`'s running job, and
+  each running lane at the largest peak of the jobs it has left (the P1 lane: `p1_pythia`, `p1_polypythia`,
+  `p1_olmo` without a `.done`; the P3 lane: `p3_fractional`). A GPU job starts when (1) the sum with it, plus
+  1.5 GiB, is at most 44.39 GiB; (2) every lane with a job still to start keeps room for that job's peak plus the
+  4 GiB `run_lane.sh` waits for, so a lane never waits for the queue; and (3) `nvidia-smi` shows the job's own
+  share free. Otherwise it checks again every minute. CPU jobs start at once, one at a time; the refit waits for
+  both P5 reruns. Jobs start in list order whenever they fit, so P2 (about 9 h in the first run) goes before P4
+  when both fit only one at a time. A failed job runs once more (it goes on from its saved units); a job whose
+  dependency failed does not run.
+- **What overlaps** (`python run_queue.py --combos`, everything at its peak, lanes included):
+
+  | Lanes running | Queue jobs that fit together | GiB counted |
+  |---|---|---|
+  | P1 lane (a job still to start) + P3 lane: now | both P5 reruns | 36.4 |
+  | P3 lane | both P5 reruns + P2, or both P5 reruns + P4 | 35.6 / 40.7 |
+  | P1 lane | both P5 reruns + P2, or P4 alone | 40.2 / 41.8 |
+  | none | P2 + P4 + one P5 rerun, or both P5 reruns with P2 or P4 | 42.8 / 21.4 / 26.6 |
+
+  P2 and P4 never run next to both lanes; P2 and P4 run together only when no lane runs. The P5 reruns and the CPU
+  jobs start at once.
+- **olmo7b stays last and alone.** `p1_olmo7b` waits until no `logs/.run_lane*.lock` is held, and the queue holds
+  `logs/.run_lane.queue.lock` for its whole run (also while it waits), so olmo7b starts only after the queue ends.
+  If olmo7b is already on the GPU when the queue starts (`logs/.p3_gpu.lock` held without a P3 lane), the queue
+  starts no GPU job until it ends. Start the queue while the lanes still run.
+- **Resume.** P2, P4 and P5's escape grid now save every finished unit (`common/units.py`): P2 a model's baseline or
+  one scheme with its isotropic control (`units/`), P4 one training run with its measurements (`runs/`, seed by
+  seed), P5 one grid cell (`cells/`, with W_S, α at W_S and g_max saved by the folder's first session). A restart
+  with the same `--out` runs only the units not saved; a unit stopped in the middle runs again; a `settings.json`
+  in the folder stops a restart with other settings. Each unit draws its random numbers from its own seed, so
+  stopped and resumed smoke runs give the same CSVs as uninterrupted ones (unit tests). The CPU jobs take minutes
+  and run again whole. P4's token IDs (300M tokens) are cached in `data/cache/` after the first start.
+- **Hours.** No time estimate here rests on CPU timings. Each resumable job writes `progress.json` in its folder
+  (the measured hours of every unit, their mean, and the hours left at that mean) and a log line after every unit;
+  `python run_queue.py --status` shows them for every job. The first full-size unit of each job is the first
+  measurement to rely on: one P2 scheme, one P4 training run (95 runs: 5 seeds × (10 arms + 9 matched)), one P5
+  cell (cells differ: those that exit early are quick; `python rerun_hours.py` bounds the P5 reruns at 1.4 and
+  4.1 h from the first run's cells). P2 took 9.0 h for both models in the first run.
+
+```bash
+cd ~/pilot && source ~/.venv-pilot/bin/activate
+# pull as in "Pulling on the L40S" below (the running lanes and olmo7b keep the code they loaded)
+python run_queue.py --combos                      # what fits next to what
+python run_queue.py --dry-run                     # what would start now and why the others wait
+nohup taskset -c 0-6 python run_queue.py > logs/run_queue.out 2>&1 &
+sleep 120; tail -5 logs/run_queue.out; tail -4 logs/progress.txt
+python run_queue.py --status                      # any time: units done, measured hours per unit, hours left
+nvidia-smi --query-compute-apps=pid,used_memory --format=csv
+# stop: kill -TERM <pid of run_queue.py> (its jobs stop, saved units stay); start it again to go on
+```
+
+CPUs 0-6 are shared with the P3 lane: P3 and each queue job keep about one CPU busy, and each job's thread pools
+are capped at 2 (`--threads`). A job with `logs/<job>.done` is skipped; delete the file to run it again.
 
 ### GPU memory on the L40S
 
@@ -365,6 +412,15 @@ top, so a step above 85% of the card reads "tight"). It reproduces the failure (
 | `p1_olmo` | per-example JVP, 32 × 128 tokens | 17.3 |
 | `p3_fractional` | Mamba training step at n_s = 64, 32 × 1,024 | 12.9 |
 | `p1_olmo7b` | per-example JVP, 8 × 128 tokens (27.2 of it weights) | 31.5 |
+| `rerun_p2_bf16` (`p2_w4a4`) | OLMo-7B's rotation scheme being applied, bfloat16 (12.8 of it weights; PopQA generation of 16 × 272 tokens: 16.3) | 16.5 |
+| `rerun_p5_*` (`p5_escape`) | full-batch gradient of all 50 restarts on 10^4 images | 1.1 |
+
+**P2's quantization** (2026-11-17). `quant.apply_scheme` held every original layer until the whole model was
+quantized, so the model was on the GPU twice for a moment: 26.2 GiB in bfloat16 (`python memory_check.py p2
+--calibrate`). It now frees each original layer as it is replaced (16.5 GiB). NF4 finds each weight's nearest code
+2^16 blocks at a time instead of building a [blocks, 64, 16] distance tensor for the whole matrix (4.3 GiB in float32
+for a 4096 × 16384 weight); each code depends only on its own value and block, so the result is identical (unit
+test). In P2's check, `memory_check.py` leaves out the weight bank's copies, which live on the CPU.
 
 ### Reruns after the first L40S run (2026-11-15)
 
@@ -393,26 +449,9 @@ Fixes in the `.py` files (`run_all.sh` is unchanged):
   −0.01 λ_max where λ_min is measured) and `converged`; λ_max, the Hessian trace and adaptive sharpness are kept only
   for converged runs (raw values in `*_raw`), and `h31_summary.csv` averages over converged runs.
 
-Run on the L40S once `run_all.sh` has finished, one GPU job at a time. Every rerun writes to a new folder, so the
-first results stay as they are:
-
-```bash
-cd ~/pilot && source ~/.venv-pilot/bin/activate && git pull
-python rerun_hours.py                                   # expected hours, from this card's first-run timings
-# CPU only, minutes: refits and flags from the saved first-run files
-python -m common.popqa results/p2_w4a4 --out results/p2_w4a4_popqa
-python p5_escape.py --part h31-flags --base results/p5_escape_h31 --out results/p5_escape_h31_flags
-# GPU, one after another
-nohup sh -c '
-python p5_escape.py --floor-from results/p5_escape --alphas 1.5,1.8,2.0 --fine-check 10:250 --out results/p5_escape_floor10 > logs/rerun_p5_floor10.log 2>&1
-python p5_escape.py --modes injected --alphas 1.2 --fine-check 10:250 --second-reading --log-checks --out results/p5_escape_a12 > logs/rerun_p5_a12.log 2>&1
-python p5_escape.py --part refit --base results/p5_escape --replace results/p5_escape_floor10,results/p5_escape_a12 --out results/p5_escape_refit > logs/rerun_p5_refit.log 2>&1
-python p2_w4a4.py --out results/p2_w4a4_bf16 > logs/rerun_p2_bf16.log 2>&1
-' > logs/reruns.out 2>&1 &
-# afterwards
-tar czf results_archive/reruns-2026-11-15.tar.gz results/p2_w4a4_bf16 results/p2_w4a4_popqa results/p5_escape_floor10 \
-    results/p5_escape_a12 results/p5_escape_refit results/p5_escape_h31_flags logs/rerun_*.log
-```
+`run_queue.py` (above) runs these reruns as soon as the GPU has room for each. Every rerun writes to a new folder,
+so the first results stay as they are. `python rerun_hours.py` gives the P5 bounds from this card's first-run
+timings.
 
 The floor rerun takes every cell of the first run where at least one restart exited at the first check (those
 exits are known only to lie in (0, 250]); the log and `python rerun_hours.py` list the cells. It leaves out
@@ -749,7 +788,7 @@ before the run.
 
 ## Unit tests
 
-`python -m pytest -q` (173 tests, about 3.5 min on a CPU; `-m "not slow"` skips the two slowest). Synthetic data with
+`python -m pytest -q` (186 tests, about 5.5 min on a 4-core CPU; `-m "not slow"` skips the slowest). Synthetic data with
 known parameters:
 
 - stable density against the Gaussian and Cauchy closed forms and against SciPy; ML fit recovers α ∈ {1.2, 1.5, 1.8},
@@ -792,8 +831,19 @@ known parameters:
 - P3: the LRA designs' run counts and steps (31,240 per run in the first plan, 4,686 in the reduced one; no main
   run repeats a tuning run; main runs seed by seed); the synthetic data are the old code's draws whatever tasks
   run; saved runs are reused and deleted ones run again with the same results; other settings in the folder stop
-  the run; `--adopt` takes old-code rows only with the same settings and only rows of the plan; P3's GPU lock;
-  `p3_rescue.py` reads the list of runs out of a running process (with gdb) and leaves it running;
+  the run; P3's GPU lock;
+- resume of P2, P4 and P5 (`common/units.py`): smoke runs with units deleted (P2's baseline and a scheme, P4's
+  unclipped reference run and a matched run, two P5 cells) run only those again and give the same CSVs; P2 with
+  every unit saved does not load the model; other settings in the folder stop the job; P4's token IDs come back
+  from the cache; NF4 in chunks equals NF4 in one pass, and P2's quantization frees each original layer as it
+  replaces it;
+- `run_queue.py`: the admission rule (only the P5 reruns next to both lanes; P3 next to P2 or P4, not both; a lane
+  with a job to start keeps its peak plus 4 GiB; nvidia-smi has the last word), every set `--combos` lists fits
+  with room for the lanes, the peaks agree with `run_lane.sh` and `memory_check.py p5`; with stand-in jobs: records
+  in run_all.sh's format, `.done`, archives, a dependency waits and a failed one stops its dependents, one retry, a
+  missing input; a 25 GiB job waits while a P1 lane has a job to start and while olmo7b holds the GPU, then
+  starts; olmo7b waits for the queue's lock; SIGTERM stops the jobs and records them, a restart goes on; a second
+  queue and a job left by an earlier queue are refused;
 - P2's outlier scheme: a kept channel 1000 times larger leaves every other channel's activation error, the other
   weight columns and the layer's output error unchanged (before the fix it rounded most of them to zero); the
   rotation arm in bfloat16 adds no rounding beyond bfloat16 storage;

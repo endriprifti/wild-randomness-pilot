@@ -22,6 +22,15 @@ augmentation; base-image ids are saved so the analysis can check the effect.
 Outputs (results/p4_clipping/[smoke/]): runs.csv, hgrad_series/*.npy, h71_per_B.csv,
 h71_summary.csv, run.json
 
+Resume: every run is saved as it ends, in runs/<tag>.json (its row and H7.1 rows; the unclipped run's gradient
+norms, which set the fixed thresholds, in runs/<model>_s<seed>_ref_norms.npy), and progress.json holds the measured
+hours of every run and the hours left at the measured mean. Started again with the same --out, the job runs only
+the runs not saved (runs/settings.json refuses other settings); a run stopped in the middle runs again. Runs go
+seed by seed, so a job stopped early leaves whole seeds. Each run draws the random numbers of its measurements
+from its own seed (its tag), so restarts and the order of runs change nothing; before 2026-11-17 the runs of one
+job shared one generator (p4_resnet18 of the first L40S run). The transformer's token IDs are cached (see
+transformer_data).
+
 Commands:
   python p4_clipping.py --model transformer
   python p4_clipping.py --model resnet18
@@ -31,8 +40,12 @@ Commands:
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import math
+import os
 import time
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -43,27 +56,67 @@ import torch.nn.functional as F
 import config
 from common import batch as batchmod
 from common import clipping, gradients, hf, hurst, lm, multifractal, runtime, spectra, stable, tails
+from common import units as units_mod
 
 
 # ----------------------------------------------------------------------------- data and models
+def token_cache_dir() -> Path:
+    return Path(os.environ.get("P4_TOKEN_CACHE") or runtime.PILOT_ROOT / "data" / "cache")
+
+
 def transformer_data(cfg, run):
+    """Token IDs of the training, test and OOD sequences. Tokenizing 300M tokens takes a while, so the IDs are kept in
+    data/cache/p4_tokens_<hash>.pt (int32, about 1.2 GB; P4_TOKEN_CACHE sets another folder), keyed by the data
+    settings, the tokenizer commit and the seed; a restart reads them back (the pins and fallbacks noted while they
+    were made are recorded again)."""
     c = cfg["transformer"]
     tok = None
     try:
         from transformers import AutoTokenizer
-        tok = AutoTokenizer.from_pretrained(c["tokenizer"], revision=hf.PINS.resolve(c["tokenizer"], None, run))
+        rev = hf.PINS.resolve(c["tokenizer"], None, run)
+        tok = AutoTokenizer.from_pretrained(c["tokenizer"], revision=rev)
     except Exception as e:
         if not run.offline_ok:
             raise
         run.fallback(f"tokenizer {c['tokenizer']}: byte tokenizer ({type(e).__name__})")
-        tok = hf.ByteTokenizer(512)
+        tok, rev = hf.ByteTokenizer(512), "byte512"
     n_train = c["tokens"] // c["seq_len"]
     n_eval = c["eval_seqs"]
+    key = {**{k: c[k] for k in ("dataset", "tokenizer", "tokens", "seq_len", "eval_seqs", "ood_dataset")},
+           "tokenizer_revision": rev, "seed": run.seed, "smoke": run.smoke}
+    path = token_cache_dir() / f"p4_tokens_{hashlib.sha256(json.dumps(key, sort_keys=True, default=str).encode()).hexdigest()[:16]}.pt"
+    if path.exists():
+        try:
+            d = torch.load(path, map_location="cpu")
+        except Exception as e:       # noqa: BLE001  a damaged cache is made again
+            run.note(f"token cache {path} unreadable ({type(e).__name__}); tokenizing again")
+            d = None
+        if d is not None and d.get("key") == json.loads(json.dumps(key, default=str)):
+            run.pins.update(d["pins"])
+            for f in d["fallbacks"]:
+                run.fallback(f)
+            run.note(f"token IDs read from {path} ({d['ids'].shape[0]} sequences of {d['ids'].shape[1]})")
+            ids = d["ids"]
+            return {"train": ids[:-n_eval], "test": ids[-n_eval:], "ood": d["ood"], "vocab": int(d["vocab"]),
+                    "source": d["source"]}
+    pins0, fb0 = dict(run.pins), len(run.fallbacks)
     texts, src = hf.load_texts(c["dataset"], n=max(64, (n_train + n_eval) * c["seq_len"] // 300 + 64), run=run, seed=run.seed)
     ids = hf.tokenize_stream(texts, tok, c["seq_len"], n_train + n_eval)
+    del texts
     ood_texts, _ = hf.load_texts(c["ood_dataset"], n=2000, run=run, min_chars=1, seed=run.seed + 7)
     ood = hf.tokenize_stream(["\n".join(ood_texts)], tok, c["seq_len"], n_eval)
-    return {"train": ids[:-n_eval], "test": ids[-n_eval:], "ood": ood, "vocab": tokenizer_vocab(tok), "source": src}
+    vocab = tokenizer_vocab(tok)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        torch.save({"key": json.loads(json.dumps(key, default=str)), "ids": ids, "ood": ood, "vocab": vocab,
+                    "source": src, "pins": {k: v for k, v in run.pins.items() if pins0.get(k) != v},
+                    "fallbacks": run.fallbacks[fb0:]}, tmp)
+        os.replace(tmp, path)
+        run.note(f"token IDs saved to {path}")
+    except OSError as e:
+        run.note(f"token IDs not cached ({e})")
+    return {"train": ids[:-n_eval], "test": ids[-n_eval:], "ood": ood, "vocab": vocab, "source": src}
 
 
 def tokenizer_vocab(tok) -> int:
@@ -375,6 +428,24 @@ def h71_control(kind, cfg, data, stage_ckpts, seed, device, run, rng):
     return rows, summ
 
 
+def run_tag(kind, seed, rule, p, matched) -> str:
+    return f"{kind}_s{seed}_{rule}{'' if p is None else p}{'_matched' if matched else ''}"
+
+
+def plan_runs(kinds, seeds, arms, matched_update_length) -> list[tuple]:
+    """(kind, seed, matched, rule, p) in the order they run: per model and seed the nominal arms, then the matched
+    ones (each needs its nominal run and the unclipped run of the same seed)."""
+    out = []
+    for kind in kinds:
+        for seed in seeds:
+            for matched in ([False, True] if matched_update_length else [False]):
+                for rule, p in arms:
+                    if matched and rule == "fixed" and p == 0.0:
+                        continue  # the unclipped run is the reference
+                    out.append((kind, seed, matched, rule, p))
+    return out
+
+
 def main():
     ap = runtime.base_parser(__doc__)
     ap.add_argument("--model", default=None, help="transformer | resnet18 (default: both)")
@@ -383,50 +454,70 @@ def main():
     args = ap.parse_args()
     cfg = config.get("p4_clipping", args.smoke)
     run = runtime.start_run("p4_clipping", cfg, args)
-    rng = runtime.rng(run.seed)
     dev = run.device
     kinds = [args.model] if args.model else cfg["models"]
     seeds = [int(s) for s in args.seeds.split(",")] if args.seeds else cfg["seeds"]
     arms = [("fixed", p) for p in cfg["p_clip"]] + [(r, None) for r in cfg["adaptive"]]
     rows, h71_rows, h71_summ = [], [], []
     (run.out_dir / "hgrad_series").mkdir(exist_ok=True)
-    for kind in kinds:
-        data = transformer_data(cfg, run) if kind == "transformer" else cifar_data(cfg, run)
-        for seed in seeds:
-            ref_len, ref_norms = None, None
-            for matched in ([False, True] if cfg["matched_update_length"] else [False]):
-                for rule, p in arms:
-                    if matched and rule == "fixed" and p == 0.0:
-                        continue  # the unclipped run is the reference
-                    scale = 1.0
-                    if matched:
-                        nominal = next(r for r in rows if r["model"] == kind and r["seed"] == seed and r["rule"] == rule
-                                       and r.get("p_clip_target") == p and not r["matched"])
-                        scale = ref_len / nominal["mean_update_len"] if nominal["mean_update_len"] > 0 else 1.0
-                    hc = cfg["h71"]["run"]
-                    want_h71 = (not args.no_h71 and not matched and kind == hc["model"] and seed == hc["seed"]
-                                and ((rule == "fixed" and p == 0.0) if hc["rule"] == "none" else rule == hc["rule"]))
-                    model, info, proj, ckpts = train(kind, cfg, data, rule if rule != "fixed" or p else "none",
-                                                     p or 0.0, seed, scale, dev, run,
-                                                     save_stages=cfg["stages"] if want_h71 else None,
-                                                     ref_norms=ref_norms)
-                    norms = info.pop("norms_post_warmup")
-                    tag = f"{kind}_s{seed}_{rule}{'' if p is None else p}{'_matched' if matched else ''}"
-                    np.save(run.out_dir / "hgrad_series" / f"{tag}.npy", proj)
-                    row = {"model": kind, "seed": seed, "rule": rule, "p_clip_target": p, "matched": matched,
-                           "lr_scale": scale, "data_source": data["source"], **info}
-                    if not info["diverged"]:
-                        row.update(measure(kind, model, data, cfg, run, rng, dev, proj, info["warmup_steps"]))
-                    rows.append(row)
-                    if rule == "fixed" and p == 0.0 and not matched:
-                        ref_len, ref_norms = info["mean_update_len"], norms
-                    run.note(f"{tag}: steps={info['steps']} p_clip={info['p_clip_realized']:.3g} "
-                             f"diverged={info['diverged']} test_loss={row.get('test_loss', float('nan')):.4f}")
-                    if want_h71 and ckpts:
-                        r1, r2 = h71_control(kind, cfg, data, ckpts, seed, dev, run, rng)
-                        h71_rows += r1
-                        h71_summ += r2
-                    del model
+    plan = plan_runs(kinds, seeds, arms, cfg["matched_update_length"])
+    # every run is saved as it ends (runs/<tag>.json, with the unclipped run's gradient norms in
+    # runs/<model>_s<seed>_ref_norms.npy); a restart with the same --out runs only the others
+    units = units_mod.Units(run.out_dir, {"cfg": cfg, "seed": run.seed, "smoke": run.smoke, "no_h71": bool(args.no_h71)},
+                            "p4_clipping", sub="runs")
+    units.plan(run_tag(k, s, r, p, m) for k, s, m, r, p in plan)
+    units.write_progress()
+    data_kind, data = None, None
+    ref_len, ref_norms = None, None
+    for kind, seed, matched, rule, p in plan:
+        if (kind, seed) != (rows[-1]["model"], rows[-1]["seed"]) if rows else True:
+            ref_len, ref_norms = None, None          # the unclipped run of this model and seed comes first
+        tag = run_tag(kind, seed, rule, p, matched)
+        is_ref = rule == "fixed" and p == 0.0 and not matched
+        norms_path = units.dir / f"{kind}_s{seed}_ref_norms.npy"
+        saved = units.get(tag)
+        if saved is None:
+            if data_kind != kind:
+                data = None
+                data = transformer_data(cfg, run) if kind == "transformer" else cifar_data(cfg, run)
+                data_kind = kind
+            units.start(tag)
+            scale = 1.0
+            if matched:
+                nominal = next(r for r in rows if r["model"] == kind and r["seed"] == seed and r["rule"] == rule
+                               and r.get("p_clip_target") == p and not r["matched"])
+                scale = ref_len / nominal["mean_update_len"] if nominal["mean_update_len"] > 0 else 1.0
+            hc = cfg["h71"]["run"]
+            want_h71 = (not args.no_h71 and not matched and kind == hc["model"] and seed == hc["seed"]
+                        and ((rule == "fixed" and p == 0.0) if hc["rule"] == "none" else rule == hc["rule"]))
+            # each run draws its measurement random numbers from its own seed, so a restart changes nothing
+            rng = units_mod.rng_for(units_mod.seed_for(run.seed, tag))
+            model, info, proj, ckpts = train(kind, cfg, data, rule if rule != "fixed" or p else "none",
+                                             p or 0.0, seed, scale, dev, run,
+                                             save_stages=cfg["stages"] if want_h71 else None,
+                                             ref_norms=ref_norms)
+            norms = info.pop("norms_post_warmup")
+            np.save(run.out_dir / "hgrad_series" / f"{tag}.npy", proj)
+            row = {"model": kind, "seed": seed, "rule": rule, "p_clip_target": p, "matched": matched,
+                   "lr_scale": scale, "data_source": data["source"], **info}
+            if not info["diverged"]:
+                row.update(measure(kind, model, data, cfg, run, rng, dev, proj, info["warmup_steps"]))
+            run.note(f"{tag}: steps={info['steps']} p_clip={info['p_clip_realized']:.3g} "
+                     f"diverged={info['diverged']} test_loss={row.get('test_loss', float('nan')):.4f}")
+            r1, r2 = [], []
+            if want_h71 and ckpts:
+                r1, r2 = h71_control(kind, cfg, data, ckpts, seed, dev, run, rng)
+            del model, ckpts
+            if is_ref:
+                np.save(norms_path, np.asarray(norms, dtype=float))
+            saved = {"row": row, "h71_per_B": r1, "h71_summary": r2}
+            units.put(tag, saved)
+        rows.append(saved["row"])
+        h71_rows += saved["h71_per_B"]
+        h71_summ += saved["h71_summary"]
+        if is_ref:
+            ref_len, ref_norms = saved["row"]["mean_update_len"], np.load(norms_path)
+        runtime.write_csv(run.out_dir / "runs.csv", rows)
     runtime.write_csv(run.out_dir / "runs.csv", rows)
     runtime.write_csv(run.out_dir / "h71_per_B.csv", h71_rows)
     runtime.write_csv(run.out_dir / "h71_summary.csv", h71_summ)

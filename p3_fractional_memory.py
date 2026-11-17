@@ -32,7 +32,6 @@ seeds. A run stopped in the middle is lost and runs again from its start.
 Commands:
   python p3_fractional_memory.py
   python p3_fractional_memory.py --plan              # saved and remaining runs, hours by measured step times
-  python p3_fractional_memory.py --adopt rescued_runs.json --plan   # runs recovered by p3_rescue.py
   python p3_fractional_memory.py --tasks powerlaw,exponential      # drop LRA first if time runs short
   python p3_fractional_memory.py --smoke
 """
@@ -296,58 +295,6 @@ def hours_for(specs: list[dict], per: dict) -> tuple[float | None, bool]:
     return total / 3600, rough
 
 
-# ----------------------------------------------------------------------------- runs recovered from the old code
-def adopt(path: str, store: RunStore, cfg: dict, seed: int, smoke: bool, settings: dict, widths: Widths,
-          archs: list[str]) -> dict:
-    """Save the runs that p3_rescue.py recovered from a P3 process of the code before 2026-11-17 as finished runs,
-    after checking that the process used the same settings and that every run belongs to this plan. Returns
-    counts by outcome."""
-    d = json.loads(Path(path).read_text())
-    old_cfg, old_seed = d.get("cfg") or {}, d.get("seed")
-    origin = f"rescued from P3 pid {d.get('pid')} ({d.get('utc', '?')})"
-    ok_tasks = {}
-    for task in settings:
-        if task not in old_cfg.get("tasks", {}):
-            continue
-        try:
-            same = result_settings(old_cfg, task, old_seed, bool(d.get("smoke"))) == result_settings(cfg, task, seed, smoke)
-        except KeyError:
-            same = False
-        ok_tasks[task] = same
-        if not same:
-            print(f"[p3_fractional_memory] adopt: {task}: the rescued process used other settings; its runs are not used",
-                  flush=True)
-    counts = {"adopted": 0, "already saved": 0, "not in this plan": 0, "other settings": 0}
-    for r in d["rows"]:
-        task = r.get("task")
-        if task not in settings:
-            counts["not in this plan"] += 1
-            continue
-        if not ok_tasks.get(task):
-            counts["other settings"] += 1
-            continue
-        s = settings[task]
-        n_s, seed_r, phase = int(r["n_s"]), int(r["seed"]), r["phase"]
-        in_plan = (r["arch"] in archs and int(r["steps"]) == s["steps"] and r["lr"] in s["lr_grid"] and (
-            (phase == "tune" and n_s == s["tune_n_states"] and seed_r == s["tune_seed"]) or
-            (phase == "main" and n_s in s["n_states"] and seed_r in s["seeds"])))
-        target, w = widths(task, n_s) if in_plan else (None, {})
-        if not in_plan or int(r["H"]) != w[r["arch"]][0] or int(r["target_params"]) != target:
-            counts["not in this plan"] += 1
-            continue
-        spec = {"phase": phase, "arch": r["arch"], "n_s": n_s, "seed": seed_r, "lr": float(r["lr"]),
-                "steps": int(r["steps"])}
-        key = run_key(spec)
-        if store.get(task, key) is not None:
-            counts["already saved"] += 1
-            continue
-        store.check_settings(task, result_settings(cfg, task, seed, smoke))
-        store.put(task, key, {**r, "design": s["design"], "origin": origin})
-        counts["adopted"] += 1
-    print(f"[p3_fractional_memory] adopt {path}: " + ", ".join(f"{k} {v}" for k, v in counts.items()), flush=True)
-    return counts
-
-
 # ----------------------------------------------------------------------------- outputs
 def planned_rows(store: RunStore, plans: dict, archs: list[str]) -> list[dict]:
     """The saved rows of the plan, in plan order; main runs of an arm count once its tuning runs are all saved."""
@@ -445,9 +392,6 @@ def main():
                     help="lra_image design from config.py lra_designs (default: config's lra_design, reduced)")
     ap.add_argument("--plan", action="store_true",
                     help="print the saved and the remaining runs with hours by measured step times; train nothing")
-    ap.add_argument("--adopt", default=None,
-                    help="JSON from p3_rescue.py: save the runs it recovered as finished runs (checked against "
-                         "this plan's settings), then go on (or stop, with --plan)")
     args = ap.parse_args()
     cfg = config.get("p3_fractional_memory", args.smoke)
     design = args.lra_design or cfg["lra_design"]
@@ -465,9 +409,6 @@ def main():
     plans = {t: (settings[t], *plan_task(t, settings[t], archs)) for t in cfg["tasks"]}
     for t in tasks:
         store.check_settings(t, result_settings(cfg, t, run.seed, run.smoke))
-    if args.adopt:
-        adopt(args.adopt, store, cfg, run.seed, run.smoke, settings, widths, archs)
-        write_outputs(run.out_dir, planned_rows(store, plans, archs), cfg)
     if args.plan:
         print_plan(store, {t: plans[t] for t in tasks}, archs, run.out_dir)
         return
@@ -541,8 +482,7 @@ def main():
         raise
     rows = planned_rows(store, plans, archs)
     write_outputs(run.out_dir, rows, cfg)
-    runtime.finish_run(run, extra={"n_runs": len(rows), "trained_now": done_here, "lra_design": design,
-                                   "adopted": sum(1 for r in rows if str(r.get("origin", "")).startswith("rescued"))})
+    runtime.finish_run(run, extra={"n_runs": len(rows), "trained_now": done_here, "lra_design": design})
 
 
 if __name__ == "__main__":

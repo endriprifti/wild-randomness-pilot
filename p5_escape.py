@@ -30,6 +30,12 @@ alpha_at_WS.csv, checks.csv (--log-checks: every check of every restart), run.js
 writes results/p5_escape_h31/[smoke/]: h31.csv (with diverged / minimum / converged flags;
 sharpness only for converged runs, raw values in *_raw), h31_summary.csv, run.json
 
+Resume (escape part): every grid cell is saved as it ends, in cells/cell<gi>.json (its grid row, restarts and
+checks), with W_S, alpha at W_S and g_max in cells/w_s.pt from the folder's first session; restarts.csv and
+grid.csv are rewritten after every cell, and progress.json holds the measured hours per cell. Started again with
+the same --out, the job runs only the cells not saved (cells/settings.json refuses other settings); a cell stopped
+in the middle runs again. Each cell draws from its own seed (run.seed + gi), so restarts change nothing.
+
 Commands:
   python p5_escape.py                 # escape grid (80 grid points x 50 restarts)
   python p5_escape.py --part h31      # injected-noise arm of H3.1
@@ -51,6 +57,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import time
 from pathlib import Path
 
@@ -61,6 +68,7 @@ import torch.nn.functional as F
 
 import config
 from common import escape, gradients, runtime, stable
+from common import units as units_mod
 
 
 # ----------------------------------------------------------------------------- data
@@ -571,17 +579,34 @@ def main():
         runtime.finish_run(run, extra={"n": len(rows), "converged": int(df.converged.sum())})
         return
 
-    P_S, L_S, gn_S = converge(X, Y, cfg, dev, act, run.seed)
+    # every cell is saved as it ends (cells/cell<gi>.json); a restart with the same --out runs only the others,
+    # from the W_S, alpha and g_max saved by the folder's first session
+    units = units_mod.Units(run.out_dir, {"cfg": cfg, "seed": run.seed, "smoke": run.smoke, "data_source": src,
+                                          "log_checks": bool(args.log_checks)}, "p5_escape", sub="cells")
+    state = units.dir / "w_s.pt"
+    if state.exists():
+        st = torch.load(state, map_location="cpu")
+        P_S, L_S, gn_S = [t.to(dev) for t in st["P_S"]], float(st["L_S"]), float(st["gn_S"])
+        a_rows, g_maxes = st["alpha_rows"], [float(v) for v in st["g_maxes"]]
+        run.note(f"W_S, alpha at W_S and g_max read from {state} (saved by this folder's first session)")
+    else:
+        P_S, L_S, gn_S = converge(X, Y, cfg, dev, act, run.seed)
+        a_rows = alpha_at(P_S, X, Y, cfg, dev, act, rng)
+        P_rep = [p.repeat(cfg["restarts"], *([1] * (p.ndim - 1))) for p in P_S]
+        # g_max from quantiles of minibatch gradient norms at W_S (B = 64)
+        idx = torch.randint(0, len(X), (cfg["restarts"], 64), generator=torch.Generator().manual_seed(1)).to(dev)
+        gr, _ = grads(P_rep, X[idx], Y[idx], act)
+        norms = gnorm(gr).cpu().numpy()
+        g_maxes = [float(np.quantile(norms, q)) for q in cfg["g_max_quantiles"]]
+        del P_rep, gr
+        tmp = state.with_name(f"w_s.{os.getpid()}.tmp")
+        torch.save({"P_S": [p.detach().cpu() for p in P_S], "L_S": L_S, "gn_S": gn_S,
+                    "alpha_rows": runtime.to_jsonable(a_rows), "g_maxes": g_maxes}, tmp)
+        os.replace(tmp, state)
     run.note(f"W_S: loss {L_S:.4f}, |grad| {gn_S:.2e}")
-    a_rows = alpha_at(P_S, X, Y, cfg, dev, act, rng)
     alpha_hat = a_rows[0]["alpha"]
     runtime.write_csv(run.out_dir / "alpha_at_WS.csv", a_rows)
     P_S = [p.repeat(cfg["restarts"], *([1] * (p.ndim - 1))) for p in P_S]
-    # g_max from quantiles of minibatch gradient norms at W_S (B = 64)
-    idx = torch.randint(0, len(X), (cfg["restarts"], 64), generator=torch.Generator().manual_seed(1)).to(dev)
-    gr, _ = grads(P_S, X[idx], Y[idx], act)
-    norms = gnorm(gr).cpu().numpy()
-    g_maxes = [float(np.quantile(norms, q)) for q in cfg["g_max_quantiles"]]
     grid = full_grid(cfg, g_maxes)
     if args.modes:
         grid = [c for c in grid if c[1][0] in args.modes.split(",")]
@@ -599,27 +624,40 @@ def main():
         run.note("no grid cells selected; nothing to run")
         runtime.finish_run(run, status="empty", extra={"grid_points": 0})
         return
+    units.plan(f"cell{gi:03d}" for gi, _ in grid)
+    units.write_progress()
     rest_rows, grid_rows, check_rows = [], [], []
     for gi, (mode, B, eta, gm, q, a) in grid:
-        gamma1 = None
-        if mode == "injected":
-            iqr_std = stable.stable_iqr(a) if a < 2 else 2 * math.sqrt(2) * 0.6744897501960817
-            gamma1 = cfg["inject_iqr"] / iqr_std
-        t0 = time.perf_counter()
-        out = run_point(mode, P_S, X, Y, cfg, B, eta, gm, a, gamma1, run.seed + gi, dev, act, L_S, args.log_checks)
-        cell = {"mode": mode, "B": B, "eta": eta, "g_max": gm, "g_max_q": q, "alpha_injected": a}
-        rate = escape.censored_rate(out["k"], out["exited"], out["k_lo"])
-        dl = escape.censored_rate(out["k_dl"], out["exited_dl"], out["k_lo_dl"])
-        grid_rows.append({**cell, "gi": gi, "p_clip": out["p_clip"], **rate,
-                          **{f"dl_{k}": v for k, v in dl.items() if k in ("exits", "E_k_ic", "E_k_ic_lo95", "E_k_ic_hi95", "floor")},
-                          "wall_s": time.perf_counter() - t0})
-        per = ("k", "k_lo", "exited", "k_dl", "k_lo_dl", "exited_dl", "k_stop", "loss_exit", "dist_exit",
-               "loss_final", "dist_final", "dist_max")
-        rest_rows += [{**cell, "restart": r, **{c: (bool(out[c][r]) if c.startswith("exited") else float(out[c][r]))
+        key = f"cell{gi:03d}"
+        saved = units.get(key)
+        if saved is None:
+            units.start(key)
+            gamma1 = None
+            if mode == "injected":
+                iqr_std = stable.stable_iqr(a) if a < 2 else 2 * math.sqrt(2) * 0.6744897501960817
+                gamma1 = cfg["inject_iqr"] / iqr_std
+            t0 = time.perf_counter()
+            out = run_point(mode, P_S, X, Y, cfg, B, eta, gm, a, gamma1, run.seed + gi, dev, act, L_S, args.log_checks)
+            cell = {"mode": mode, "B": B, "eta": eta, "g_max": gm, "g_max_q": q, "alpha_injected": a}
+            rate = escape.censored_rate(out["k"], out["exited"], out["k_lo"])
+            dl = escape.censored_rate(out["k_dl"], out["exited_dl"], out["k_lo_dl"])
+            g_row = {**cell, "gi": gi, "p_clip": out["p_clip"], **rate,
+                     **{f"dl_{k}": v for k, v in dl.items() if k in ("exits", "E_k_ic", "E_k_ic_lo95", "E_k_ic_hi95", "floor")},
+                     "wall_s": time.perf_counter() - t0}
+            per = ("k", "k_lo", "exited", "k_dl", "k_lo_dl", "exited_dl", "k_stop", "loss_exit", "dist_exit",
+                   "loss_final", "dist_final", "dist_max")
+            r_rows = [{**cell, "restart": r, **{c: (bool(out[c][r]) if c.startswith("exited") else float(out[c][r]))
                                                 for c in per}, "L_S": out["L_S"]} for r in range(cfg["restarts"])]
-        check_rows += [{**cell, **row} for row in out["checks"]]
-        run.note(f"{mode} B={B} eta={eta} g_max={gm} alpha={a}: exits {rate['exits']}/{rate['n']} "
-                 f"(first check {rate['first_check_exits']}), distance-or-loss exits {dl['exits']}")
+            saved = {"cell": cell_label((mode, B, eta, gm, q, a)), "grid_row": g_row, "restarts": r_rows,
+                     "checks": [{**cell, **row} for row in out["checks"]]}
+            run.note(f"{mode} B={B} eta={eta} g_max={gm} alpha={a}: exits {rate['exits']}/{rate['n']} "
+                     f"(first check {rate['first_check_exits']}), distance-or-loss exits {dl['exits']}")
+            units.put(key, saved)
+        grid_rows.append(saved["grid_row"])
+        rest_rows += saved["restarts"]
+        check_rows += saved["checks"]
+        runtime.write_csv(run.out_dir / "restarts.csv", _norm_key(pd.DataFrame(rest_rows)).to_dict("records"))
+        runtime.write_csv(run.out_dir / "grid.csv", grid_rows)
     rest = _norm_key(pd.DataFrame(rest_rows))
     fits = fit_all(rest, alpha_hat)
     runtime.write_csv(run.out_dir / "restarts.csv", rest.to_dict("records"))

@@ -109,16 +109,21 @@ def quant_act(x: torch.Tensor, bits: int, keep: torch.Tensor | None = None) -> t
     return xq
 
 
-def quant_nf4(W: torch.Tensor, block: int = 64) -> torch.Tensor:
+def quant_nf4(W: torch.Tensor, block: int = 64, chunk_blocks: int = 1 << 16) -> torch.Tensor:
+    """Blockwise absmax NF4. The nearest code is found chunk_blocks blocks at a time: each element's code depends
+    on its own value and block only, so the result is the same as in one pass, without the [blocks, block, 16]
+    distance tensor of the whole matrix (4.3 GiB in float32 for a 4096 x 16384 weight)."""
     flat = W.reshape(-1)
     pad = (-flat.numel()) % block
     fp = F.pad(flat, (0, pad)) if pad else flat
     blocks = fp.reshape(-1, block)
     absmax = blocks.abs().amax(dim=1, keepdim=True).clamp(min=1e-8)
-    normed = blocks / absmax
     code = NF4_CODE.to(W.device, W.dtype)
-    idx = (normed.unsqueeze(-1) - code).abs().argmin(dim=-1)
-    deq = code[idx] * absmax
+    deq = torch.empty_like(blocks)
+    for s in range(0, blocks.shape[0], chunk_blocks):
+        normed = blocks[s:s + chunk_blocks] / absmax[s:s + chunk_blocks]
+        idx = (normed.unsqueeze(-1) - code).abs().argmin(dim=-1)
+        deq[s:s + chunk_blocks] = code[idx] * absmax[s:s + chunk_blocks]
     return deq.reshape(-1)[: flat.numel()].reshape(W.shape)
 
 
@@ -232,9 +237,13 @@ def calibrate_absmax(model: nn.Module, batches, device) -> dict[str, torch.Tenso
 
 def apply_scheme(model: nn.Module, scheme: Scheme, absmax: dict | None = None, seed: int = 0,
                  noise: dict | None = None) -> nn.Module:
-    """Replace every linear layer (except embeddings and LM head) in place."""
+    """Replace every linear layer (except embeddings and LM head) in place. Each layer is looked up when it is
+    replaced and no reference to it is kept, so the original weights are freed one layer at a time: the peak is
+    the model plus one layer (python memory_check.py p2), not the model twice (holding every original layer
+    until the end, as before 2026-11-17, gave about 25 GiB for a 7B model in bfloat16)."""
     rotations: dict[int, Rotation] = {}
-    for name, lin in list(linear_layers(model).items()):
+    for name in list(linear_layers(model)):
+        lin = model.get_submodule(name)
         rot = None
         if scheme.name == "rotation":
             d = lin.in_features
@@ -251,4 +260,5 @@ def apply_scheme(model: nn.Module, scheme: Scheme, absmax: dict | None = None, s
         parent_name, _, child = name.rpartition(".")
         parent = model.get_submodule(parent_name) if parent_name else model
         setattr(parent, child, q)
+        del lin, q
     return model
