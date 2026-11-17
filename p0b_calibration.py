@@ -77,14 +77,7 @@ def task_rng(seed: int, part: str, *idx: int) -> np.random.Generator:
 
 
 # ----------------------------------------------------------------------------- samplers
-def random_binomial_series(depth: int, a: float, rng: np.random.Generator) -> np.ndarray:
-    """Random-order binomial cascade of length 2^depth: each split gives weights a and 1-a to its two halves in
-    random order. Same multiset of values at every dyadic level as hurst.binomial_series (so the same h(q))."""
-    x = np.ones(1)
-    for _ in range(depth):
-        left = np.where(rng.random(len(x)) < 0.5, a, 1.0 - a)
-        x = np.stack([x * left, x * (1.0 - left)], axis=1).reshape(-1)
-    return x
+random_binomial_series = hurst.random_binomial_series     # moved to common/hurst.py (also used by h_link.py)
 
 
 def trunc_levy_pool(alpha: float, cutoff: float, n: int, rng: np.random.Generator) -> np.ndarray:

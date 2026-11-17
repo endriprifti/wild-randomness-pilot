@@ -15,6 +15,7 @@ plus `run.json` (config, git commit, GPU type and memory, library versions, wall
 | `p4_clipping.py` | H6.1, H7.1 control, H_grad | clipping sweep (fixed p_clip, AutoClip, ZClip, AGC), matched update length, flatness and tail measures |
 | `p1_checkpoints.py` | α, α_ESD, K, H, Δh across Pythia, PolyPythias, OLMo | measurement only on public checkpoints; H7.1 at training stages; exploratory coupling |
 | `p3_fractional_memory.py` | H4.1 | fractional block against S4 (LegS), S4D and Mamba at matched parameters and equal tuning budget |
+| `h_link.py` | H_link (exploratory, added 2026-11-17) | memory of the magnitudes and MFDFA width of P1's token-surprisal series and P4's gradient-noise series against surrogates, from saved samples (CPU) |
 | `memory_check.py` | (tooling) | peak GPU memory of the largest steps of P1, P3 and P4, estimated on the meta device (no GPU, no downloads) |
 
 Notation follows the paper: ζ is the fitted Pareto (survival) exponent, α = min(ζ, 2) only for the stable index.
@@ -182,6 +183,106 @@ B = 1,024 a stable law with α above about 1.9 cannot be told from finite varian
 convergence to the Gaussian); without a margin the rule reads both "invariant (wild)". Hence the margin:
 "invariant (wild)" needs ᾱ ≤ 1.9, and pools between 1.9 and the Gaussian quantile read "undecided". The
 per-example tail fit of §7.1 (ζ) separates these cases where the batch-size test cannot.
+
+## H_link: memory of the magnitudes and multifractality (exploratory, added 2026-11-17)
+
+Added on 2026-11-17, after the first results, and fixed before any H_link value was computed (Endri). It is
+exploratory: it is not in the hypothesis register, the coupling family or its Holm correction.
+
+**Claim.** The Noah variable's magnitudes carry Joseph-type memory (volatility clustering), and the series are
+multifractal.
+
+**Series.** Only what the jobs saved, read without changing anything:
+
+- (a) the token-surprisal series of every P1 checkpoint whose GPU pass is done (`row.json` present):
+  `checkpoints/<pass>/<checkpoint>/samples/htok.npy`, 16 documents of 2,048 tokens one after another
+  (n = 32,768);
+- (b) the gradient-noise series of every finished P4 run (a row in `runs/<tag>.json` or `runs.csv`):
+  `hgrad_series/<tag>.npy`, the unclipped minibatch gradient projected on 8 fixed random directions at every step,
+  after warm-up as for H_grad (transformer 9,064 steps, ResNet-18 about 11,500). A run's statistics are means over
+  its 8 directions, and every surrogate replicate replaces each direction by its own surrogate.
+
+**Test** (`common/hlink.py`; 99 surrogates of each kind; one-sided p = (1 + #{surrogate ≥ observed}) / 100):
+
+1. memory of the magnitudes: H of m = |x − median(x)| by DFA-1 and by the wavelet estimator (Abry–Veitch, db3,
+   octaves 3 up to the coarsest with four coefficients), against shuffled surrogates of x (same values, no memory:
+   the pass rule) and phase-randomized surrogates (same spectrum, Gaussian: reported as `p_phase_*` and
+   `memory_beyond_linear`, memory beyond what the linear correlations of x give);
+2. multifractality: MFDFA width Δh = h(0.5) − h(4) of x against IAAFT surrogates (same values and spectrum).
+
+**Pass:** p_shuf < 0.05 by DFA and by the wavelet estimator, each over at least two decades of scale, AND
+p_iaaft < 0.05.
+
+**Scales.** DFA and MFDFA use 20 log-spaced scales from 8 to n/10. §7.2 uses 10 to n/10; the minimum was lowered
+to 8 before any H_link value was computed, because P4's transformer series (9,064 steps after warm-up) span only
+1.96 decades from 10 to 906 and 2.05 from 8. Every series also gets a sensitivity row at §7.2's 10 to n/10, on the
+same surrogates (`scales` = "sensitivity"; the wavelet estimator has no minimum scale and is the same in both
+rows). There the transformer series fail the two-decade clause and cannot pass: `two_decades` is False and
+`decades_flag` reads "below 2 decades (DFA 1.96, wavelet 2.11)". `pass_ignoring_decades` (reported only) gives
+the p-value part without that clause.
+
+**Calibration** (`python h_link.py --calibrate`, run first; 100 series per kind and length, at P1's length 32,768
+and at the shortest P4 length 9,064, scales 8 to n/10; parameters ours, fixed before the calibration ran: SαS
+α = 1.5; fGn H = 0.75; multifractal random walk with λ² = 0.05 and integral scale n, Δh = 0.0875 in theory;
+random-order binomial cascade with a = 0.75, Δh = 0.439 in theory). This environment's CPU, 4 workers at nice 19,
+57 min. Shipped as `reference/h_link_calibration.csv` (one row per series and scale range) and
+`reference/h_link_calibration_summary.csv`. Rates over 100 series; the medians are of the main rows:
+
+| Series (expected) | n | Pass | Memory part | Width part | Memory beyond linear (reported) | H(\|x\|) DFA: series / shuffled | Δh: series / IAAFT | Pass at 10 to n/10 (ignoring decades) |
+|---|---|---|---|---|---|---|---|---|
+| Lévy, i.i.d. SαS, α = 1.5 (Noah only: fail) | 32,768 | 0.00 | 0.02 | 0.07 | 0.05 | 0.50 / 0.50 | 0.392 / 0.399 | 0.00 (0.00) |
+| Lévy, i.i.d. SαS, α = 1.5 (Noah only: fail) | 9,064 | 0.00 | 0.01 | 0.05 | 0.06 | 0.50 / 0.50 | 0.392 / 0.395 | 0.00 (0.00) |
+| fGn, H = 0.75 (Joseph only: fail) | 32,768 | 0.02 | 1.00 | 0.02 | 0.01 | 0.57 / 0.50 | 0.008 / 0.006 | 0.04 (0.04) |
+| fGn, H = 0.75 (Joseph only: fail) | 9,064 | 0.02 | 0.98 | 0.03 | 0.03 | 0.58 / 0.50 | 0.011 / 0.009 | 0.00 (0.05) |
+| MRW, λ² = 0.05 (both: pass) | 32,768 | 0.86 | 1.00 | 0.86 | 1.00 | 0.87 / 0.50 | 0.086 / 0.047 | 0.90 (0.90) |
+| MRW, λ² = 0.05 (both: pass) | 9,064 | 0.81 | 1.00 | 0.81 | 1.00 | 0.84 / 0.50 | 0.087 / 0.055 | 0.00 (0.81) |
+| binomial cascade, a = 0.75 (both: pass) | 32,768 | 0.10 | 1.00 | 0.10 | 1.00 | 0.83 / 0.50 | 0.443 / 0.385 | 0.17 (0.17) |
+| binomial cascade, a = 0.75 (both: pass) | 9,064 | 0.01 | 1.00 | 0.01 | 0.98 | 0.82 / 0.50 | 0.446 / 0.419 | 0.00 (0.01) |
+
+- **Size.** Lévy and fGn pass in 0 to 2% of series.
+- **MRW.** It passes in 81% (9,064) and 86% (32,768) of series; its Δh, 0.087, is the theoretical 0.0875.
+- **Cascade.** It does not pass (1% and 10%). Its memory part always passes, but IAAFT surrogates keep most of its
+  width (0.39 to 0.42 of 0.44): that width comes mostly from its very broad marginal (values over about seven
+  decades) and its spectrum, which IAAFT keeps. The width part therefore credits only multifractality beyond the
+  marginal and the spectrum, the MRW kind, and a cascade-like series with a very broad marginal fails it.
+- **Memory part alone.** It does not separate volatility clustering from linear long memory: fGn's magnitudes pass
+  it in 98 to 100% of series (H(|x|) 0.57 against 0.50), through its correlations (the correlation of |x| at lag k
+  is about ρ(k)², which decays as 1/k at H = 0.75). The phase-surrogate column separates the two (fGn 1 to 3%, MRW
+  100%, cascade 98 to 100%); in the pass rule only the width part keeps fGn at 2%.
+- **10 to n/10.** No series of 9,064 values can pass there (1.96 decades); without that clause the rates are those
+  of the main rows.
+
+**Commands** (in the pilot folder inside the venv, after pulling; the lanes, the queue and olmo7b keep the code they
+loaded, and this job only reads their folders):
+
+```bash
+python h_link.py --dry-run          # the P1 and P4 folders and the finished series it would compute
+nohup taskset -c 0-10 python h_link.py > logs/h_link.log 2>&1 &
+```
+
+CPU only: `CUDA_VISIBLE_DEVICES` is emptied before anything is imported, torch is not imported, and 2 worker
+processes (`--workers`) run at nice 19 with one thread each. It finds every `results/p1_*/` with checkpoints (not the
+`*_recomputed` copies, which share their source's samples) and every `results/p4_*/` with `hgrad_series/`.
+Series that do not exist yet (the queued p4_transformer, checkpoints still to come) are not listed; the same
+command later computes only the new series (and any whose file changed) and rewrites the CSVs. It writes
+`results/h_link/`: `p1_tokens.csv` and `p4_grad.csv` (two rows per series, `scales` main and sensitivity, with
+every H, surrogate mean and 95% quantile, p-value and flag), `summary.csv` (pass rates per folder, model size in P1
+or model in P4, and scale range; diverged P4 runs are in `p4_grad.csv` only), `data/units/` (one JSON per series)
+and `progress.json` (measured hours per series and hours left, summed over workers). On this environment's CPU a
+P1 series takes about 30 s and a P4 transformer run (8 directions) about 85 s per worker; the server's own times
+are in `progress.json` once the first series are saved.
+
+**Caveats.**
+
+- P1's series joins 16 documents. A change of surprisal level from one document to the next is a slow change in
+  the magnitudes, which DFA and the wavelet estimator read as memory and shuffling removes, so the memory part
+  cannot tell document-level shifts from clustering within documents (one document, 2,048 tokens, spans only 1.4
+  decades from 8 to n/10).
+- P4's projections include the full-batch gradient, which changes slowly over training; that drift also raises H
+  of the magnitudes. The series are H_grad's, by the same definition.
+- Linear memory alone passes the memory part (fGn above), so read `memory_beyond_linear` beside `memory_pass`; and a
+  failed width part does not rule out cascade-type multifractality with a very broad marginal (the cascade above).
+- Rates are per series; the checkpoints of one run, and the runs of one seed, are not independent.
 
 ## Full run on one L40S: `run_all.sh`
 
@@ -848,7 +949,7 @@ before the run.
 
 ## Unit tests
 
-`python -m pytest -q` (194 tests, about 5.5 min on a 4-core CPU; `-m "not slow"` skips the slowest). Synthetic data with
+`python -m pytest -q` (203 tests, about 6 min on a 4-core CPU; `-m "not slow"` skips the slowest). Synthetic data with
 known parameters:
 
 - stable density against the Gaussian and Cauchy closed forms and against SciPy; ML fit recovers α ∈ {1.2, 1.5, 1.8},
@@ -933,7 +1034,14 @@ known parameters:
   `lr_test_gaussian`;
 - the GPU stable sampler against the NumPy one (same distribution for α from 1 to 2, skewed or not; reproducible
   from its seed);
-- the Emmy check's streaming kurtosis and logit metrics, and the fast-math lanes' environments.
+- the Emmy check's streaming kurtosis and logit metrics, and the fast-math lanes' environments;
+- H_link: the synthetic series (fGn's H, the MRW's heavy marginal, the cascade positive), p-values with ties, the
+  main and sensitivity rows on the same surrogates (a 9,064-step series has two decades from 8 and not from 10, is
+  flagged and cannot pass there; the wavelet columns agree), the MRW's magnitudes above all shuffled surrogates,
+  i.i.d. Gaussian magnitudes near 1/2, a matrix's statistics as the mean over its columns, and `h_link.py` on stand-in
+  P1 and P4 folders: only finished checkpoints and runs, warm-up cut as for H_grad, `*_recomputed` and empty
+  folders skipped, the folders left unchanged, resume without recomputing, a changed file computed again, short
+  series skipped, diverged runs left out of the summary.
 
 ## Deviations, choices of ours, and items to verify
 

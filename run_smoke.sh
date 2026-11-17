@@ -37,6 +37,8 @@ run_job p2_w4a4         $PY p2_w4a4.py --smoke $EXTRA
 run_job p4_clipping     $PY p4_clipping.py --smoke $EXTRA
 run_job p1_checkpoints  $PY p1_checkpoints.py --smoke $EXTRA
 run_job p1_recompute    $PY p1_recompute.py results/p1_checkpoints/smoke
+run_job h_link_calibration $PY h_link.py --smoke --calibrate
+run_job h_link          $PY h_link.py --smoke
 run_job p3_fractional   $PY p3_fractional_memory.py --smoke $EXTRA
 
 echo

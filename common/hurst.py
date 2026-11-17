@@ -10,7 +10,8 @@
   (Kantelhardt et al. 2002, sec. IV.A).
 * MFDFA generalized Hurst exponents h(q) and the width Delta h = h(q_lo) - h(q_hi).
 * Generators: fractional Gaussian noise (Davies-Harte), SaS Levy-motion increments, the
-  binomial multifractal series of Kantelhardt et al. (2002).
+  binomial multifractal series of Kantelhardt et al. (2002) and its random-order version, and the
+  increments of a multifractal random walk (Bacry, Delour and Muzy 2001).
 * A crude nonstationarity check (Beran et al. 2013, Ch. 7): H on consecutive quarters.
 """
 
@@ -57,6 +58,33 @@ def binomial_series(depth: int, a: float = 0.75) -> np.ndarray:
         ones += t & 1
         t >>= 1
     return a ** ones * (1 - a) ** (depth - ones)
+
+
+def random_binomial_series(depth: int, a: float, rng: np.random.Generator) -> np.ndarray:
+    """Random-order binomial cascade of length 2^depth: each split gives weights a and 1-a to its two halves in
+    random order. Same multiset of values at every dyadic level as binomial_series (so the same h(q))."""
+    x = np.ones(1)
+    for _ in range(depth):
+        left = np.where(rng.random(len(x)) < 0.5, a, 1.0 - a)
+        x = np.stack([x * left, x * (1.0 - left)], axis=1).reshape(-1)
+    return x
+
+
+def mrw_increments(n: int, lam2: float, rng: np.random.Generator, T: int | None = None) -> np.ndarray:
+    """Increments of a multifractal random walk (Bacry, Delour and Muzy 2001): x_t = eps_t exp(omega_t), eps i.i.d.
+    N(0, 1), omega Gaussian with Cov(omega_t, omega_{t+k}) = lam2 ln(T / (|k| + 1)) for |k| < T and 0 beyond
+    (integral scale T, default n), mean -Var(omega). Volatility clustering with log-correlated magnitudes, and
+    multifractal: h(q) = 1/2 + lam2 (1 - q/2) for MFDFA below T, so Delta h(q_lo, q_hi) = lam2 (q_hi - q_lo) / 2.
+    omega comes from circulant embedding (negative eigenvalues, if any, set to 0)."""
+    T = int(T or n)
+    k = np.arange(n + 1, dtype=float)
+    cov = np.where(k < T, lam2 * np.log(T / (k + 1.0)), 0.0)
+    c = np.concatenate([cov, cov[-2:0:-1]])
+    lam = np.clip(np.fft.fft(c).real, 0, None)
+    m = len(c)
+    w = rng.normal(size=m) + 1j * rng.normal(size=m)
+    omega = np.fft.fft(np.sqrt(lam / m) * w)[:n].real - cov[0]
+    return rng.normal(size=n) * np.exp(omega)
 
 
 def binomial_series_h(q: np.ndarray, a: float = 0.75) -> np.ndarray:
@@ -176,7 +204,8 @@ def iaaft_surrogate(x, rng, max_iter: int = 100, tol: float = 1e-8):
     for _ in range(max_iter):
         Y = np.fft.rfft(y)
         y = np.fft.irfft(amp * np.exp(1j * np.angle(Y)), n=len(x))
-        ranks = np.argsort(np.argsort(y))
+        ranks = np.empty(len(y), dtype=np.intp)      # = argsort(argsort(y)), with one sort
+        ranks[np.argsort(y)] = np.arange(len(y))
         y = sorted_x[ranks]
         err = np.mean((np.abs(np.fft.rfft(y)) - amp) ** 2)
         if prev is not None and abs(prev - err) < tol * (prev + 1e-300):
