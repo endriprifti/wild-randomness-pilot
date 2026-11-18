@@ -469,6 +469,162 @@ directions, four rows) about 4 min per worker; the server's own times are in `pr
   failed width part does not rule out cascade-type multifractality with a very broad marginal (the cascade above).
 - Rates are per series; the checkpoints of one run, and the runs of one seed, are not independent.
 
+## P6: a factorial test of a causal Noah–Joseph link (added 2026-11-18, not run yet)
+
+Fixed on 2026-11-18, before any P6 run, and written into `s7-appendix-pilot-design.tex` as an added experiment.
+New files only (`p6_streams.py`, `p6_stats.py`, `p6_noah_joseph.py`, `p6_queue_small.json`, `p6_queue_full.json`,
+`reference/p6_stream_checks.csv`, `tests/test_p6.py`); `run_all.sh`, `run_lane.sh`, `run_queue.py`,
+`p1_checkpoints.py`, `common/` and `config.py` are unchanged (P6 imports them).
+
+**Question.** Does Noah in the data cause Joseph in the model (heavy-tailed token frequencies → memory in the
+token surprisals or the gradient noise), or Joseph in the data cause Noah in the model (long-memory topic
+switching → heavier activation or gradient-noise tails), or do the two interact? The public checkpoints cannot
+answer it (one corpus, one optimizer); P6 trains identical small models on synthetic streams in which the two are
+set independently.
+
+**Streams** (`p6_streams.py`). Token = (rank − 1)·8 + variant: 8 topics × 6,288 ranks = Pythia's 50,304 tokens.
+
+| factor | levels (corners in bold) | what changes |
+|---|---|---|
+| Noah: rank law, i.i.d. | **light** (p_r ∝ exp(−(r−1)/205.87), entropy-matched to Zipf 1.0: 6.327 nats), Zipf 1.25 (full design), **Zipf 1.0** | the tail of the token frequencies, not their entropy |
+| Joseph: H of the fGn under the switching hazard | **0.5** (no memory), 0.7 (full design), **0.9** | how topic switches cluster, not how often they happen |
+
+The variant equals the current topic with probability 0.75 (else uniform), so the topic is read from the context
+(1.13 nats per token if known). Switches are Bernoulli per token with a hazard constant over blocks of 64 tokens,
+p_b = p̄·exp(g_b)/mean(exp(g)), g = fGn(H) over the blocks, p̄ = 1/128: dividing by the stream's own mean fixes every
+stream's switch rate (with H = 0.9 the mean of a long-memory path over 4 million blocks still varies by about 20%
+between seeds, which would move the loss floor from seed to seed). Loss floors: 7.278 nats at the corners if the
+topic is known, 8.407 if it is ignored. **Common random numbers:** a stream's random numbers depend on the seed
+and role only, so the cells of one seed share their uniforms, the white noise under the fGn, the window order and
+the initial weights; seeds are blocks in the analysis. Training stream: 2^28 tokens (131,072 windows of 2,048),
+each window used once in a fixed random order; held-out stream (2^25 tokens) for the measurement sets. Streams are
+drawn on demand (no stream files on disk). `p6_streams.fgn` is `common/hurst.fgn` with the autocovariance computed
+without cancellation: `hurst.fgn` fails at 4 million points with H = 0.9 (negative circulant eigenvalues).
+
+**Checks of every stream** (before a model sees it; a failure stops the job): the Zipf exponent by discrete MLE
+over ranks 1..R and over the tail 100..R within 0.01 of the set value, or the light control's τ within 1%, and the
+right family winning the likelihood by ≥ 0.05 nats per token; the share of variants equal to the topic within
+0.002 of 0.781; the switch rate within 1% of p̄; the fGn's H by DFA and by wavelet within 0.04; the H of the switch
+counts per block (DFA, 100 blocks to n/10) inside the band calibrated for its level and length. Calibration
+(`python p6_streams.py --calibrate --reps 50 --workers 3`, 300 latent processes, seeds 1000+, 34 min on 3 CPUs;
+`reference/p6_stream_checks.csv`):
+
+| stream | H set | fGn H by DFA, max dev. | by wavelet, max dev. | switch rate, max dev. | switch-count H (mean ± sd) | band |
+|---|---|---|---|---|---|---|
+| train (4.2M blocks) | 0.5 / 0.7 / 0.9 | 0.013 / 0.015 / 0.015 | 0.002 / 0.005 / 0.006 | 0.25% | 0.499 ± 0.008 / 0.659 ± 0.009 / 0.861 ± 0.011 | ± 0.038 / 0.044 / 0.054 |
+| held-out (0.5M blocks) | 0.5 / 0.7 / 0.9 | 0.016 / 0.020 / 0.023 | 0.006 / 0.008 / 0.009 | 0.53% | 0.498 ± 0.011 / 0.645 ± 0.013 / 0.845 ± 0.013 | ± 0.054 / 0.066 / 0.065 |
+
+The switch counts read below H because of their Poisson noise; the three bands do not overlap.
+
+**Training** (the same in every cell; OURS): Pythia-14M shape (31M shape too in the full design), AdamW (0.9, 0.95),
+lr 10^-3, weight decay 0.1, warm-up 1% then constant (P4's schedule), 16 × 2,048 tokens per step, 8,192 steps, no
+clipping, bf16 autocast with float32 weights, sdpa attention (eager for the measurements, as P1). The loss is
+computed in chunks of 4,096 tokens with recomputation (the same value and gradient as one pass, tested). Every step
+saves the unclipped gradient projected on 8 fixed random directions (P4's hgrad series).
+
+**Measurements** at P1's stages (1, 10, 50, 100% of training) with P1's code and settings (`config.py`
+`p1_checkpoints`; `p1_tasks` statistics in P1's pool): K, K_max, Kurt0, outlier channels, act_zeta, alpha and the
+CSN tails at B = 8, alpha_ESD, Δh_rep, eval loss; H7.1 (200 blocks, B = 8…1,024, bootstrap, verdict) at every stage
+in the full design and at 50 and 100% in the small one; H_tok on 64 consecutive held-out windows (P1 takes 16), whole
+and split into its rank part −log p(rank) and variant part −log p(variant | rank) from the same logits; H_link
+(`h_link.run_unit`, unchanged) on the whole surprisal series at every stage (P1 rows: main, sensitivity,
+standardized, window control) and on the hgrad series (P4 rows: main, sensitivity, detrended, rescaled).
+
+Why 64 windows: the surprisal series is mostly the rank part's i.i.d. noise, and with 16 windows the data's H
+barely shows. An oracle predictor of the streams (topic filter with the mean hazard, 3 seeds; DFA H minus the
+shuffled mean) gives:
+
+| windows | whole, light: H 0.5 → 0.9 | whole, Zipf 1.0: H 0.5 → 0.9 | variant part: H 0.5 → 0.9 |
+|---|---|---|---|
+| 16 | +0.002 → +0.017 (sd 0.013-0.015) | −0.010 → −0.002 | +0.020 → +0.031 (sd 0.01-0.02) |
+| 64 | +0.011 → +0.032 (sd 0.005-0.011) | +0.001 → +0.012 | +0.018 → +0.042 (sd 0.007-0.018) |
+| 256 | +0.002 → +0.023 (sd 0.006) | −0.001 → (not run) | +0.005 → +0.037 (sd 0.006-0.007) |
+
+Two things follow. At 64 windows the Joseph effect is about twice its seed-to-seed spread (256 would be better
+but quadruples the H_link CPU time: about 4-6 CPU min per series at 64). And the Zipf tail halves the visible memory
+of the whole series (its rank noise is larger): a negative Noah effect on a whole-series memory measure can be
+dilution, not a link. The variant part carries the data's memory without the rank noise and is the referee.
+
+**Pre-stated predictions and pass rules** (`p6_stats.py`). Per outcome, Y = seed block + b_N n + b_J j + b_NJ n j +
+e, with n, j = ±1/2 at the corners; each term two-sided by Freedman–Lane permutation (residuals of the model without
+the term permuted within seed blocks, t statistic, 9,999 permutations), the OLS t-test beside it. The confirmatory
+family: the 14M corners at the final stage, 14 tests, Holm at 0.05.
+
+| direction | outcome | term tested (prediction) | and |
+|---|---|---|---|
+| Joseph → Noah | K (median over layers) | b_J > 0 | b_NJ |
+| Joseph → Noah | alpha (minibatch noise, B = 8) | b_J < 0 | b_NJ |
+| Noah → Joseph | H_tok excess (DFA H − shuffled mean, whole series) | b_N > 0 | b_NJ |
+| Noah → Joseph | H_link magnitude memory, token surprisals (H_abs − shuffled mean, main row) | b_N > 0 | b_NJ |
+| Noah → Joseph | H_link width, token surprisals (Δh − IAAFT mean, main row) | b_N > 0 | b_NJ |
+| Noah → Joseph | H_link magnitude memory, hgrad | b_N > 0 | b_NJ |
+| Noah → Joseph | H_link width, hgrad | b_N > 0 | b_NJ |
+
+A test passes (a link) if its Holm-adjusted p < 0.05: "as predicted" with the predicted sign, "opposite to the
+prediction" with the other; an interaction counts as a link. Dilution rule: a negative N or N×J term on one of the
+three token-surprisal outcomes is a link only if the same term on the variant part's H_tok excess is negative at
+p < 0.05 too; otherwise it reads "dilution by the rank noise". If no test passes, the result is reported as "no
+link detected" with each effect's 95% interval and the effect detectable with 80% power at the first Holm threshold
+(0.05/14). Surrogate-adjusted (excess) measures are used so that a change of the marginal alone (the Zipf tail
+widens the surprisal distribution) is not read as memory or multifractality. Manipulation checks, reported and not
+corrected: every stream passed; eval loss within 0.15 nats of the oracle floor and below the topic-blind floor by at
+least half the topic information; the own effects as positive controls (Joseph on the variant part's memory, on
+H_tok and on the magnitude memory; Noah on alpha_ESD, K and alpha). Everything else (other stages, the middle levels
+with ordinal scores, 31M, act_zeta, alpha_ESD, outlier channels, the CSN tails, H7.1, the rank part) is exploratory,
+uncorrected (`secondary.csv`).
+
+**Designs and cost.** Full: 3 Noah × 3 Joseph × 5 seeds × {14M, 31M} = 90 runs, H7.1 at all four stages. Small: the
+full design's 14M corners, 2 × 2 × 5 seeds = 20 runs, H7.1 at 50 and 100%; the confirmatory family is the same in
+both. Prior from FLOPs and bytes moved (`python p6_noah_joseph.py --plan`; not a measurement; L40S at 35% of its
+bf16/fp32 peak and 70% of its bandwidth: the logits of 50,304 per token dominate both training and the JVPs):
+
+| | per run, 14M | per run, 31M | GPU memory (tensors) | runs | L40S hours | cost at $0.69/h |
+|---|---|---|---|---|---|---|
+| small | 15 min training + 4 × 0.5 min + 2 × 4.6 min H7.1 = 26 min | | ~4.7 GiB (queue counts 7) | 20 | 8.8 | $6 |
+| full | 15 + 4 × 0.5 + 4 × 4.6 = 35 min | 18 + 4 × 0.6 + 4 × 5.3 = 42 min | ~5.8 GiB at 31M (queue counts 8) | 90 | 57.5 | $40 |
+
+The full design does not fit 12 L40S hours; the small one does on the prior. CPU: about 30-45 CPU min per run
+(H_link about 4-6 CPU min per series, H7.1 1-2 min per direction and stage), in each job's pool next to the GPU.
+`--budget-hours` makes the hours binding: each queued job reads the L40S timing and runs the first k seeds, k the
+largest number (at most 5, at least 3) whose runs fit the budget (12 h small, 80 h full) at the measured hours; with
+fewer than 3 it starts nothing. This depends on the timing only, never on results.
+
+**Commands.**
+
+```bash
+# laptop (RTX 2050, 4 GB): 300 steps of one cell (Zipf 1.0, H 0.9, 14M) and one measurement stage, then the
+# L40S estimate (6-15x faster, a prior) per run and per design; about 10 min. Smaller micro-batch, loss chunk and
+# measurement batches fit the 4 GB; the gradient and the loss are the same
+python p6_noah_joseph.py --timing --size 14m --steps 300 --micro-batch 2 --loss-chunk 1024 --eval-batch 1 \
+    --jvp-batch 8 --out results/p6_timing_laptop
+# the same on the L40S, through run_queue.py, later: after the running queue and p1_olmo7b have ended (one
+# run_queue.py at a time; olmo7b waits for the queue lock). The timing job alone first (about 15 min):
+nohup taskset -c 0-10 python run_queue.py --jobs-file p6_queue_small.json --only p6_timing_14m \
+    > logs/run_queue_p6.out 2>&1 &
+# then the whole small design (the timing job is skipped once logs/p6_timing_14m.done exists):
+nohup taskset -c 0-10 python run_queue.py --jobs-file p6_queue_small.json > logs/run_queue_p6.out 2>&1 &
+python run_queue.py --jobs-file p6_queue_small.json --status    # jobs, runs done, measured hours per run
+# the full design instead: p6_queue_full.json (timing jobs for 14M and 31M, 10 jobs, analysis)
+# a job by hand, and the analysis:
+python p6_noah_joseph.py --design small --seeds 1 --out results/p6_small/14m_s1
+python p6_noah_joseph.py --design small --analyse --from results/p6_small --out results/p6_small/analysis
+python p6_noah_joseph.py --plan                  # runs and the prior
+python p6_noah_joseph.py --smoke --device cpu --out results/p6_smoke      # tiny model and streams, about 12 min
+```
+
+Each queued job is one seed of one size (4 runs in the small design, 9 in the full one, one after another,
+resumable per run and from the last stage reached, with one CPU pool process); the jobs of different seeds share
+the GPU as memory allows (all five small-design jobs fit at once). Outputs per job: `runs/<run>/`
+(`stream_check_*.json`, `train_log.csv`, `hgrad.npy`, `checkpoints/stage<s>/` in P1's layout with `result.json`),
+`units/`, `progress.json`, `checkpoints.csv`; the analysis job writes `checkpoints.csv`, `family.csv`,
+`manipulation_checks.csv`, `secondary.csv` and `summary.md` with the verdict.
+
+**Caveats.** Synthetic streams: a link here shows that the mechanism can work in these models, not that it does in
+natural text. 14M and 31M models at 2^28 tokens may not develop the outlier features of larger, longer-trained
+models (then the Joseph → Noah tests have little to act on; the K and alpha ranges are reported). Five seeds per
+cell detect only effects of about 3-4 residual standard deviations after Holm (the MDE column says how large).
+The L40S hours are a prior until the timing job has run.
+
 ## Full run on one L40S: `run_all.sh`
 
 No RTX 5090 was available, so stage 1 runs on a CloudRift L40S (48 GB; the smoke run there passed all 9 jobs,
@@ -1134,7 +1290,7 @@ before the run.
 
 ## Unit tests
 
-`python -m pytest -q` (222 tests, about 9 min on a 4-core CPU; `-m "not slow"` skips the slowest). Synthetic data with
+`python -m pytest -q` (243 tests, about 8 min on a 4-core CPU; `-m "not slow"` skips the slowest). Synthetic data with
 known parameters:
 
 - stable density against the Gaussian and Cauchy closed forms and against SciPy; ML fit recovers α ∈ {1.2, 1.5, 1.8},
@@ -1239,7 +1395,16 @@ known parameters:
   is reused by a later run, refuses losses shifted by one token (checked again only with `--eos-retry`), leaves a
   group above `--eos-max-params` unverified until the limit is raised, marks a repo whose revisions give
   different streams as ambiguous, and `h_link.py` attaches the cuts to the P1 rows (and drops them with
-  `--no-eos`).
+  `--no-eos`);
+- P6 (`tests/test_p6.py`): the light control's entropy equals Zipf 1.0's; the fGn generator against `hurst.fgn` and
+  at 4.2 million points with H = 0.9 (where `hurst.fgn` fails); the cells of a seed share their latent draws and
+  windows are read back the same in any order; the switch rate does not move with H; the rank checks pass on the law
+  that was set and fail on a neighbouring one; a correct stream passes its checks and a failed check is named; the
+  shipped calibration, where each level's switch-count band excludes the other levels; the held-out layout; the
+  chunked loss and its gradient against the plain loss, sdpa against eager attention, the rank and variant parts of
+  the surprisal, the flat gradient directions; the plans (20 and 90 runs, stage steps), Holm, the within-block
+  permutation test on a planted effect and on none, the family's readings (as predicted, opposite to the prediction,
+  dilution, no link), a missing outcome kept in the Holm family, both queue files and the budget guard's seed choice.
 
 ## Deviations, choices of ours, and items to verify
 

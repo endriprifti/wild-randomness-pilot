@@ -1,0 +1,313 @@
+[
+ {
+  "name": "p6_timing_14m",
+  "args": [
+   "p6_noah_joseph.py",
+   "--timing",
+   "--size",
+   "14m",
+   "--steps",
+   "300"
+  ],
+  "out": "results/p6_timing_l40s_14m",
+  "gpu": 7.0
+ },
+ {
+  "name": "p6_timing_31m",
+  "args": [
+   "p6_noah_joseph.py",
+   "--timing",
+   "--size",
+   "31m",
+   "--steps",
+   "300"
+  ],
+  "out": "results/p6_timing_l40s_31m",
+  "gpu": 8.0
+ },
+ {
+  "name": "p6_full_14m_s1",
+  "args": [
+   "p6_noah_joseph.py",
+   "--design",
+   "full",
+   "--sizes",
+   "14m",
+   "--seeds",
+   "1",
+   "--budget-hours",
+   "80.0",
+   "--timing-json",
+   "results/p6_timing_l40s_14m/timing.json",
+   "--timing-json-extra",
+   "results/p6_timing_l40s_31m/timing.json",
+   "--workers",
+   "1"
+  ],
+  "out": "results/p6_full/14m_s1",
+  "gpu": 7.0,
+  "after": [
+   "p6_timing_14m",
+   "p6_timing_31m"
+  ]
+ },
+ {
+  "name": "p6_full_14m_s2",
+  "args": [
+   "p6_noah_joseph.py",
+   "--design",
+   "full",
+   "--sizes",
+   "14m",
+   "--seeds",
+   "2",
+   "--budget-hours",
+   "80.0",
+   "--timing-json",
+   "results/p6_timing_l40s_14m/timing.json",
+   "--timing-json-extra",
+   "results/p6_timing_l40s_31m/timing.json",
+   "--workers",
+   "1"
+  ],
+  "out": "results/p6_full/14m_s2",
+  "gpu": 7.0,
+  "after": [
+   "p6_timing_14m",
+   "p6_timing_31m"
+  ]
+ },
+ {
+  "name": "p6_full_14m_s3",
+  "args": [
+   "p6_noah_joseph.py",
+   "--design",
+   "full",
+   "--sizes",
+   "14m",
+   "--seeds",
+   "3",
+   "--budget-hours",
+   "80.0",
+   "--timing-json",
+   "results/p6_timing_l40s_14m/timing.json",
+   "--timing-json-extra",
+   "results/p6_timing_l40s_31m/timing.json",
+   "--workers",
+   "1"
+  ],
+  "out": "results/p6_full/14m_s3",
+  "gpu": 7.0,
+  "after": [
+   "p6_timing_14m",
+   "p6_timing_31m"
+  ]
+ },
+ {
+  "name": "p6_full_14m_s4",
+  "args": [
+   "p6_noah_joseph.py",
+   "--design",
+   "full",
+   "--sizes",
+   "14m",
+   "--seeds",
+   "4",
+   "--budget-hours",
+   "80.0",
+   "--timing-json",
+   "results/p6_timing_l40s_14m/timing.json",
+   "--timing-json-extra",
+   "results/p6_timing_l40s_31m/timing.json",
+   "--workers",
+   "1"
+  ],
+  "out": "results/p6_full/14m_s4",
+  "gpu": 7.0,
+  "after": [
+   "p6_timing_14m",
+   "p6_timing_31m"
+  ]
+ },
+ {
+  "name": "p6_full_14m_s5",
+  "args": [
+   "p6_noah_joseph.py",
+   "--design",
+   "full",
+   "--sizes",
+   "14m",
+   "--seeds",
+   "5",
+   "--budget-hours",
+   "80.0",
+   "--timing-json",
+   "results/p6_timing_l40s_14m/timing.json",
+   "--timing-json-extra",
+   "results/p6_timing_l40s_31m/timing.json",
+   "--workers",
+   "1"
+  ],
+  "out": "results/p6_full/14m_s5",
+  "gpu": 7.0,
+  "after": [
+   "p6_timing_14m",
+   "p6_timing_31m"
+  ]
+ },
+ {
+  "name": "p6_full_31m_s1",
+  "args": [
+   "p6_noah_joseph.py",
+   "--design",
+   "full",
+   "--sizes",
+   "31m",
+   "--seeds",
+   "1",
+   "--budget-hours",
+   "80.0",
+   "--timing-json",
+   "results/p6_timing_l40s_14m/timing.json",
+   "--timing-json-extra",
+   "results/p6_timing_l40s_31m/timing.json",
+   "--workers",
+   "1"
+  ],
+  "out": "results/p6_full/31m_s1",
+  "gpu": 8.0,
+  "after": [
+   "p6_timing_14m",
+   "p6_timing_31m"
+  ]
+ },
+ {
+  "name": "p6_full_31m_s2",
+  "args": [
+   "p6_noah_joseph.py",
+   "--design",
+   "full",
+   "--sizes",
+   "31m",
+   "--seeds",
+   "2",
+   "--budget-hours",
+   "80.0",
+   "--timing-json",
+   "results/p6_timing_l40s_14m/timing.json",
+   "--timing-json-extra",
+   "results/p6_timing_l40s_31m/timing.json",
+   "--workers",
+   "1"
+  ],
+  "out": "results/p6_full/31m_s2",
+  "gpu": 8.0,
+  "after": [
+   "p6_timing_14m",
+   "p6_timing_31m"
+  ]
+ },
+ {
+  "name": "p6_full_31m_s3",
+  "args": [
+   "p6_noah_joseph.py",
+   "--design",
+   "full",
+   "--sizes",
+   "31m",
+   "--seeds",
+   "3",
+   "--budget-hours",
+   "80.0",
+   "--timing-json",
+   "results/p6_timing_l40s_14m/timing.json",
+   "--timing-json-extra",
+   "results/p6_timing_l40s_31m/timing.json",
+   "--workers",
+   "1"
+  ],
+  "out": "results/p6_full/31m_s3",
+  "gpu": 8.0,
+  "after": [
+   "p6_timing_14m",
+   "p6_timing_31m"
+  ]
+ },
+ {
+  "name": "p6_full_31m_s4",
+  "args": [
+   "p6_noah_joseph.py",
+   "--design",
+   "full",
+   "--sizes",
+   "31m",
+   "--seeds",
+   "4",
+   "--budget-hours",
+   "80.0",
+   "--timing-json",
+   "results/p6_timing_l40s_14m/timing.json",
+   "--timing-json-extra",
+   "results/p6_timing_l40s_31m/timing.json",
+   "--workers",
+   "1"
+  ],
+  "out": "results/p6_full/31m_s4",
+  "gpu": 8.0,
+  "after": [
+   "p6_timing_14m",
+   "p6_timing_31m"
+  ]
+ },
+ {
+  "name": "p6_full_31m_s5",
+  "args": [
+   "p6_noah_joseph.py",
+   "--design",
+   "full",
+   "--sizes",
+   "31m",
+   "--seeds",
+   "5",
+   "--budget-hours",
+   "80.0",
+   "--timing-json",
+   "results/p6_timing_l40s_14m/timing.json",
+   "--timing-json-extra",
+   "results/p6_timing_l40s_31m/timing.json",
+   "--workers",
+   "1"
+  ],
+  "out": "results/p6_full/31m_s5",
+  "gpu": 8.0,
+  "after": [
+   "p6_timing_14m",
+   "p6_timing_31m"
+  ]
+ },
+ {
+  "name": "p6_full_analysis",
+  "args": [
+   "p6_noah_joseph.py",
+   "--design",
+   "full",
+   "--analyse",
+   "--from",
+   "results/p6_full"
+  ],
+  "out": "results/p6_full/analysis",
+  "gpu": 0.0,
+  "after": [
+   "p6_full_14m_s1",
+   "p6_full_14m_s2",
+   "p6_full_14m_s3",
+   "p6_full_14m_s4",
+   "p6_full_14m_s5",
+   "p6_full_31m_s1",
+   "p6_full_31m_s2",
+   "p6_full_31m_s3",
+   "p6_full_31m_s4",
+   "p6_full_31m_s5"
+  ]
+ }
+]
