@@ -529,6 +529,11 @@ in the full design and at 50 and 100% in the small one; H_tok on 64 consecutive 
 and split into its rank part −log p(rank) and variant part −log p(variant | rank) from the same logits; H_link
 (`h_link.run_unit`, unchanged) on the whole surprisal series at every stage (P1 rows: main, sensitivity,
 standardized, window control) and on the hgrad series (P4 rows: main, sensitivity, detrended, rescaled).
+One difference from P1 in how a quantity is computed, not in what (2026-11-18, before any P6 run): the Hessian-vector
+products behind H7.1's Hessian direction run on micro-batches of 16 of P1's 64 sequences (`common/gradients.hvp_fn`
+with `chunk`; the loss is a mean over sequences, so H v is the same up to float summation order, and a test checks
+the direction against P1's function). On all 64 at once they need 15.4 GiB at 14M, which the queue's 7 GiB per job
+did not cover; in micro-batches 3.9 GiB.
 
 Why 64 windows: the surprisal series is mostly the rank part's i.i.d. noise, and with 16 windows the data's H
 barely shows. An oracle predictor of the streams (topic filter with the mean hazard, 3 seeds; DFA H minus the
@@ -580,8 +585,23 @@ bf16/fp32 peak and 70% of its bandwidth: the logits of 50,304 per token dominate
 
 | | per run, 14M | per run, 31M | GPU memory (tensors) | runs | L40S hours | cost at $0.69/h |
 |---|---|---|---|---|---|---|
-| small | 15 min training + 4 × 0.5 min + 2 × 4.6 min H7.1 = 26 min | | ~4.7 GiB (queue counts 7) | 20 | 8.8 | $6 |
-| full | 15 + 4 × 0.5 + 4 × 4.6 = 35 min | 18 + 4 × 0.6 + 4 × 5.3 = 42 min | ~5.8 GiB at 31M (queue counts 8) | 90 | 57.5 | $40 |
+| small | 15 min training + 4 × 0.5 min + 2 × 4.6 min H7.1 = 26 min | | 6.0 GiB (queue counts 7) | 20 | 8.8 | $6 |
+| full | 15 + 4 × 0.5 + 4 × 4.6 = 35 min | 18 + 4 × 0.6 + 4 × 5.3 = 42 min | 6.8 GiB at 31M (queue counts 8) | 90 | 57.5 | $40 |
+
+GPU memory per job (`python p6_noah_joseph.py --memory`, tensors, GiB; the CUDA context and allocator rounding come
+on top, which run_queue.py adds as 1.05 × peak + 0.6 GiB). Measurement steps on the meta device with
+`memory_check.py`'s tracker, plus the training state the GPU keeps meanwhile (gradients, AdamW moments, the 8 hgrad
+directions); training from the sizes of weights, state, activations and one loss chunk (a prior: the meta device
+cannot run the flash kernel; the same step in bfloat16 on the CPU gave 3.9 and 5.6 GiB):
+
+| step | 14M | 31M | laptop flags, 14M |
+|---|---|---|---|
+| training, micro-batch 16 × 2,048, loss chunk 4,096 (laptop 2, 1,024) | 4.2 | 5.9 | 1.5 |
+| surprisal parts / eval loss, 4 × 2,048 (laptop 1) | 3.1 / 4.7 | 3.2 / 4.7 | 0.8 / 0.8 |
+| per-example JVP, 32 × 128, 3 directions (laptop 8) | 5.4 | 5.5 | 1.4 |
+| HVP, 64 × 128 in micro-batches of 16 (laptop 4); all 64 at once: 15.4 | 3.9 | 4.0 | 1.0 |
+| training state kept while measuring | 0.6 | 1.3 | 0.6 |
+| job peak | 6.0 | 6.8 | 2.0 |
 
 The full design does not fit 12 L40S hours; the small one does on the prior. CPU: about 30-45 CPU min per run
 (H_link about 4-6 CPU min per series, H7.1 1-2 min per direction and stage), in each job's pool next to the GPU.
@@ -593,17 +613,21 @@ fewer than 3 it starts nothing. This depends on the timing only, never on result
 
 ```bash
 # laptop (RTX 2050, 4 GB): 300 steps of one cell (Zipf 1.0, H 0.9, 14M) and one measurement stage, then the
-# L40S estimate (6-15x faster, a prior) per run and per design; about 10 min. Smaller micro-batch, loss chunk and
-# measurement batches fit the 4 GB; the gradient and the loss are the same
+# L40S estimate (6-15x faster, a prior) per run and per design; about 10 min. Smaller micro-batches for training,
+# the loss, the forwards, the JVPs and the Hessian-vector products fit the 4 GB (2.0 GiB of tensors by --memory);
+# every quantity is the same (the first run of this command, without --hvp-batch, ran out of memory in the Hessian
+# direction: 64 sequences at once need 15.4 GiB)
 python p6_noah_joseph.py --timing --size 14m --steps 300 --micro-batch 2 --loss-chunk 1024 --eval-batch 1 \
-    --jvp-batch 8 --out results/p6_timing_laptop
-# the same on the L40S, through run_queue.py, later: after the running queue and p1_olmo7b have ended (one
-# run_queue.py at a time; olmo7b waits for the queue lock). The timing job alone first (about 15 min):
-nohup taskset -c 0-10 python run_queue.py --jobs-file p6_queue_small.json --only p6_timing_14m \
-    > logs/run_queue_p6.out 2>&1 &
-# then the whole small design (the timing job is skipped once logs/p6_timing_14m.done exists):
-nohup taskset -c 0-10 python run_queue.py --jobs-file p6_queue_small.json > logs/run_queue_p6.out 2>&1 &
-python run_queue.py --jobs-file p6_queue_small.json --status    # jobs, runs done, measured hours per run
+    --jvp-batch 8 --hvp-batch 4 --out results/p6_timing_laptop
+python p6_noah_joseph.py --memory --sizes 14m --micro-batch 2 --loss-chunk 1024 --eval-batch 1 --jvp-batch 8 \
+    --hvp-batch 4                                  # GPU memory of each step with these flags (meta device, seconds)
+# the L40S: p6_after_queue.py waits until the running run_queue.py has ended (with every job it started), then
+# runs the small design through run_queue.py (timing job first, then the runs with the budget guard, then the
+# analysis) before run_all.sh's p1_olmo7b, which keeps waiting until P6 has ended (see "Starting P6 before
+# p1_olmo7b" below). Safe to start while the queue, the lanes and olmo7b run:
+python p6_after_queue.py --check                 # read-only: locks, running jobs and the commit each loaded
+setsid nohup nice -n 10 taskset -c 0-10 python p6_after_queue.py > logs/p6_after_queue.out 2>&1 < /dev/null &
+python run_queue.py --jobs-file p6_queue_small.json --status    # once it runs: jobs, runs done, hours per run
 # the full design instead: p6_queue_full.json (timing jobs for 14M and 31M, 10 jobs, analysis)
 # a job by hand, and the analysis:
 python p6_noah_joseph.py --design small --seeds 1 --out results/p6_small/14m_s1
@@ -618,6 +642,37 @@ the GPU as memory allows (all five small-design jobs fit at once). Outputs per j
 (`stream_check_*.json`, `train_log.csv`, `hgrad.npy`, `checkpoints/stage<s>/` in P1's layout with `result.json`),
 `units/`, `progress.json`, `checkpoints.csv`; the analysis job writes `checkpoints.csv`, `family.csv`,
 `manipulation_checks.csv`, `secondary.csv` and `summary.md` with the verdict.
+
+**Starting P6 before p1_olmo7b** (`p6_after_queue.py`, 2026-11-18). What the processes running on the L40S do,
+from the code each loaded (each job's commit is in the `### git` header of `logs/<job>.log`; `--check` prints them):
+
+- run_queue.py has one version (92d594e). It holds `logs/.run_lane.queue.lock` from its start until it exits, and
+  it exits only when every job it started has ended (or, on SIGTERM, after stopping them). So the lock becomes free
+  only once rerun_p2_bf16 and p4_transformer are no longer running.
+- p1_olmo7b (run_all.sh) started on 2026-11-17 when the first P3 stopped, after p3_rescue.py had run, which exists
+  only from 3463b1c on; so it loaded 3463b1c or later (`--check` reads its commit and warns if it is older). It runs
+  `p1_checkpoints.gpu_lock`: before CUDA starts it waits until no `logs/.run_lane*.lock` is held, checking every
+  60 s (`common/gpu_locks.wait_for_lanes`, unchanged since 3463b1c; the glob is read at every check, so it sees the
+  queue's lock and any new one), then takes `logs/.p3_gpu.lock` and `logs/.p1_gpu.lock`. It never checks the lanes
+  again after that.
+- A plain `wait for the queue's pid; run_queue.py ...` leaves a gap of a second or so with no lane lock held
+  (`tests/test_p6_after_queue.py` shows olmo7b's wait getting through it); if the P1 and P3 lanes have ended by
+  then, olmo7b would start, and the P6 queue would then wait for it.
+
+`p6_after_queue.py` refuses to start unless a run_queue.py runs and olmo7b is not on the GPU. It waits for the queue
+lock with a blocking flock (invisible to the others' non-blocking checks, so nothing running changes), then, still
+holding it, for any leftover P2, P4 or P5 process (pid files of run_queue.py's jobs, and any python process running
+p2_w4a4.py, p4_clipping.py, p5_escape.py or common.popqa: a queue killed with -9 leaves its jobs running). It then
+takes `logs/.run_lane.p6.lock`, releases the queue lock, starts `run_queue.py --jobs-file p6_queue_small.json`
+(output in `logs/run_queue_p6.out`) and releases `.run_lane.p6.lock` once that queue holds the queue lock; one of the
+two is held at every moment. The P6 queue counts the P1 and P3 lanes, if they still run, by run_queue.py's rule (a
+lane with a job to start keeps its peak + 4 GiB), and starts no GPU job while olmo7b is on the GPU. With `nice -n
+10` its jobs give way to the lanes on the CPUs; on the GPU they share time with a lane as the reruns did. A P6
+timing job measured next to a lane is slower than alone, so the budget guard may pick fewer seeds; that depends on
+the timing only. `kill -TERM $(cat logs/p6_after_queue.pid)` stops the wait (nothing started) or, after the start,
+the P6 queue (saved runs stay; starting `run_queue.py --jobs-file p6_queue_small.json` again goes on). To restart
+the old queue while this waits, stop this first: it takes the queue lock the moment the old queue stops, and the
+restarted queue would refuse to start.
 
 **Caveats.** Synthetic streams: a link here shows that the mechanism can work in these models, not that it does in
 natural text. 14M and 31M models at 2^28 tokens may not develop the outlier features of larger, longer-trained
@@ -1290,7 +1345,7 @@ before the run.
 
 ## Unit tests
 
-`python -m pytest -q` (243 tests, about 8 min on a 4-core CPU; `-m "not slow"` skips the slowest). Synthetic data with
+`python -m pytest -q` (253 tests, about 8 min on a 4-core CPU; `-m "not slow"` skips the slowest). Synthetic data with
 known parameters:
 
 - stable density against the Gaussian and Cauchy closed forms and against SciPy; ML fit recovers α ∈ {1.2, 1.5, 1.8},
@@ -1404,7 +1459,16 @@ known parameters:
   chunked loss and its gradient against the plain loss, sdpa against eager attention, the rank and variant parts of
   the surprisal, the flat gradient directions; the plans (20 and 90 runs, stage steps), Holm, the within-block
   permutation test on a planted effect and on none, the family's readings (as predicted, opposite to the prediction,
-  dilution, no link), a missing outcome kept in the Holm family, both queue files and the budget guard's seed choice.
+  dilution, no link), a missing outcome kept in the Holm family, both queue files and the budget guard's seed choice;
+  the Hessian direction from micro-batches against P1's function, and each queue job's GPU figure against the job's
+  peak (`--memory`), the laptop flags under 2.5 GiB;
+- `p6_after_queue.py` (`tests/test_p6_after_queue.py`, stand-in processes): the P6 queue starts only after the
+  running queue has released its lock, and p1_olmo7b's own lane wait (`gpu_locks.wait_for_lanes`, checking every 10
+  ms) gets through only after the P6 queue has ended, while a plain wait-then-start lets it through the gap; a job
+  the old queue left running (its pid file) holds both back until it ends; it refuses to start with no queue running,
+  without the jobs file, next to another waiter or a P6 queue; stopped while waiting it starts nothing; `--check`
+  changes no file and flags an olmo7b started from code older than 3463b1c; SIGTERM after the start stops the P6
+  queue's jobs; both queue files pass run_queue.py's `--dry-run`.
 
 ## Deviations, choices of ours, and items to verify
 

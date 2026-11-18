@@ -38,10 +38,13 @@ manipulation_checks.csv, secondary.csv and summary.md into --out.
 
 Commands (in the pilot folder inside the venv):
   python p6_noah_joseph.py --plan                       # the runs of both designs and the cost model
-  python p6_noah_joseph.py --timing --size 14m --steps 300 --micro-batch 2 --out results/p6_timing_laptop
+  python p6_noah_joseph.py --timing --size 14m --steps 300 --micro-batch 2 --loss-chunk 1024 --eval-batch 1 \
+      --jvp-batch 8 --hvp-batch 4 --out results/p6_timing_laptop        # 4 GB laptop GPU (2.0 GiB by --memory)
+  python p6_noah_joseph.py --memory [--sizes 14m] [batch flags]         # GPU memory of each step (meta device)
   python p6_noah_joseph.py --design small --seeds 1 --out results/p6_small/14m_s1    # one job of the small design
   python p6_noah_joseph.py --analyse --from results/p6_small --out results/p6_small/analysis
-  nohup taskset -c 0-6 python run_queue.py --jobs-file p6_queue_small.json > logs/run_queue_p6.out 2>&1 &
+  setsid nohup nice -n 10 taskset -c 0-10 python p6_after_queue.py > logs/p6_after_queue.out 2>&1 < /dev/null &
+                                    # the L40S: the small design through run_queue.py once the running queue ends
   python p6_noah_joseph.py --smoke --out results/p6_smoke   # tiny model and streams on the CPU (minutes)
 """
 
@@ -70,7 +73,7 @@ import config
 import p1_checkpoints
 import p6_stats
 import p6_streams
-from common import hf, hlink, lm, p1_tasks, runtime, spectra, stable
+from common import gradients, hf, hlink, lm, p1_tasks, runtime, spectra, stable
 from common import units as units_mod
 
 TEST = "p6_noah_joseph"
@@ -84,7 +87,12 @@ TRAIN = {"tokens": 2 ** 28, "batch_seqs": 16, "lr": 1e-3, "weight_decay": 0.1, "
          "diverge_factor": 3.0, "stages": list(config.TRAINING_STAGES)}
 MEASURE = {"surprisal_docs": 64,          # held-out windows of seq_len tokens for H_tok and H_link (P1: 16)
            "h71_blocks": "coarse",        # P1's coarse resolution (200 blocks) at every size and stage
-           "hlink_stages": "all"}
+           "hlink_stages": "all",
+           # sequences per micro-batch of the Hessian-vector products for H7.1's Hessian direction (P1: one batch
+           # of hessian_batch = 64). The same H v up to float summation order (common/gradients.hvp_fn: the loss is a
+           # mean over examples), at 3.9 instead of 15.4 GiB (14M, 64 x 128 tokens; --memory). Added 2026-11-18,
+           # before any P6 run.
+           "hvp_batch": 16}
 DESIGNS = {
     # the confirmatory family is tested on the 14M corners at the final stage in both designs
     # small: H7.1 at the 50% and final stages only (the other measurements at all four), to stay near 12 L40S hours
@@ -99,7 +107,7 @@ SMOKE_STREAM = dict(copy.deepcopy(p6_streams.P6), vocab=512, K=4, R=128, block=1
                     heldout_windows=400)
 SMOKE_TRAIN = dict(TRAIN, tokens=24 * 4 * 128, batch_seqs=4, micro_batch=2, loss_chunk=96, n_hgrad_dirs=2,
                    stages=[0.5, 1.0], precision="fp32")
-SMOKE_MEASURE = dict(MEASURE, surprisal_docs=4)
+SMOKE_MEASURE = dict(MEASURE, surprisal_docs=4, hvp_batch=4)      # smoke hessian_batch 8: two micro-batches
 SMOKE_DESIGN = {"sizes": ["tiny"], "noah": ["light", "zipf1.0"], "joseph": ["H0.5", "H0.9"], "seeds": [1, 2],
                 "h71_stages": [1.0]}
 
@@ -123,6 +131,7 @@ def settings(smoke: bool, design: dict | None = None) -> dict:
                             "coupling_blocks", "probe_seqs", "probe_len", "dh_points", "eval_seqs", "eval_len",
                             "tails", "scale", "batch_sizes_h71")}
     m["surprisal_docs"] = int(me["surprisal_docs"])
+    m["hvp_batch"] = int(me["hvp_batch"])
     m["surprisal_len"] = int(P["seq_len"])
     m["h71"] = {"coarse_blocks": int(p1["h71"]["coarse_blocks"]),
                 "batch_sizes": [int(b) for b in p1["h71"].get("batch_sizes", p1["batch_sizes_h71"])],
@@ -200,6 +209,22 @@ def lm_loss(model, x: torch.Tensor, chunk: int) -> torch.Tensor:
     return tot / len(tgt)
 
 
+def directions(model, ids_hess, device, n_random: int, n_hessian: int, seed: int, hvp_batch: int | None):
+    """P1's directions (p1_checkpoints.directions: random directions, then the top Hessian eigenvectors by power
+    iteration), with the Hessian-vector products on micro-batches of at most hvp_batch sequences. With hvp_batch
+    covering the batch (or None) it is P1's function itself."""
+    if not hvp_batch or n_hessian <= 0 or hvp_batch >= len(ids_hess):
+        return p1_checkpoints.directions(model, ids_hess, device, n_random, n_hessian, seed)
+    names = lm.grad_param_names(model)
+    params = {n: p for n, p in model.named_parameters() if n in names}
+    gen = torch.Generator().manual_seed(seed)
+    dirs = [("random", i, d) for i, d in enumerate(gradients.random_directions(params, n_random, gen))]
+    hvp, p0 = gradients.hvp_fn(model, lm.per_example_lm_loss, ids_hess.to(device), params, chunk=int(hvp_batch))
+    vals, vecs = gradients.top_eigvecs(hvp, p0, k=n_hessian, iters=20, generator=gen)
+    dirs += [("hessian", i, v) for i, v in enumerate(vecs)]
+    return params, dirs
+
+
 def flat_directions(params, k: int, seed: int, device) -> torch.Tensor:
     """k unit directions in the space of all parameters (as P4's flat_dirs), as one k x P matrix."""
     g = torch.Generator().manual_seed(int(seed))
@@ -219,16 +244,21 @@ def surprisal_parts(model, ids: torch.Tensor, device, K: int, batch: int = 4) ->
     log p(rank) = logsumexp over the rank's K tokens and the variant part is the rest."""
     outs = [[], [], []]
     for s in range(0, len(ids), batch):
-        x = ids[s:s + batch].to(device).long()
-        lp = torch.log_softmax(model(input_ids=x).logits.float()[:, :-1], dim=-1)
-        y = x[:, 1:]
-        tok = -lp.gather(-1, y[..., None])[..., 0]
-        V = lp.shape[-1]
-        lr = torch.logsumexp(lp.reshape(*lp.shape[:-1], V // K, K), dim=-1)
-        rank = -lr.gather(-1, (y // K)[..., None])[..., 0]
+        tok, rank = _surprisal_batch(model, ids[s:s + batch].to(device).long(), K)
         for o, v in zip(outs, (tok, rank, tok - rank)):
             o.append(v.cpu())
     return tuple(torch.cat(o).numpy() for o in outs)
+
+
+def _surprisal_batch(model, x: torch.Tensor, K: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """(whole, rank part) surprisal of one micro-batch, on its device (also run on the meta device by --memory)."""
+    lp = torch.log_softmax(model(input_ids=x).logits.float()[:, :-1], dim=-1)
+    y = x[:, 1:]
+    tok = -lp.gather(-1, y[..., None])[..., 0]
+    V = lp.shape[-1]
+    lr = torch.logsumexp(lp.reshape(*lp.shape[:-1], V // K, K), dim=-1)
+    rank = -lr.gather(-1, (y // K)[..., None])[..., 0]
+    return tok, rank
 
 
 # ----------------------------------------------------------------------------- the CPU pool
@@ -264,10 +294,11 @@ def heldout_sets(held: p6_streams.Stream, m: dict) -> dict:
 
 
 def gpu_pass(model, c: dict, sets: dict, st: dict, dev: str, prog, eb: int = 4, jb: int = 32,
-             h71_pool: int | None = None) -> dict:
+             h71_pool: int | None = None, hb: int | None = None) -> dict:
     """P1's GPU pass (p1_checkpoints.py gpu_pass) on a model in memory: samples/ and row.json in P1's layout, the
     CPU tasks in P1's task specs (p1_tasks.assemble reads them unchanged), plus the P6 series. h71_pool limits the
-    H7.1 pool (timing only). Returns the record; timings in record["seconds"]."""
+    H7.1 pool (timing only); hb: sequences per micro-batch of the Hessian-vector products (default
+    MEASURE["hvp_batch"]). Returns the record; timings in record["seconds"]."""
     m = st["measure"]
     d = c["dir"]
     if d.exists():
@@ -367,8 +398,8 @@ def gpu_pass(model, c: dict, sets: dict, st: dict, dev: str, prog, eb: int = 4, 
         n_take = 0
     if n_take:
         with timed(f"H7.1 projections ({n_take} examples)"):
-            params, dirs = p1_checkpoints.directions(model, pool[:m["hessian_batch"]], dev, m["n_random_dirs"],
-                                                     m["n_hessian_dirs"], st["seed"])
+            params, dirs = directions(model, pool[:m["hessian_batch"]], dev, m["n_random_dirs"],
+                                      m["n_hessian_dirs"], st["seed"], int(hb or m["hvp_batch"]))
             P = p1_checkpoints.jvp_projections(model, pool[:n_take], params, [d_ for _, _, d_ in dirs], dev, jb)
     record["h71_examples_timed"] = int(n_take)
     if n_take and n_take == n_pool:
@@ -496,7 +527,8 @@ def train_run(c: dict, st: dict, args, run, pool: P6Pool, prog: Progress) -> dic
                       "dir": rd / "checkpoints" / f"stage{stage:g}"}
                 if (ck["dir"] / "row.json").exists():
                     continue
-                rec = gpu_pass(model, ck, sets, st, dev, prog, eb=args.eval_batch, jb=args.jvp_batch)
+                rec = gpu_pass(model, ck, sets, st, dev, prog, eb=args.eval_batch, jb=args.jvp_batch,
+                               hb=args.hvp_batch)
                 for t in rec["tasks"]:
                     pool.submit(t)
                 torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(),
@@ -682,7 +714,8 @@ def timing(args, run, st: dict, prog: Progress) -> dict:
     h = st["measure"]["h71"]
     n_pool = int(h["coarse_blocks"]) * max(h["batch_sizes"])
     take = min(n_pool, int(args.timing_pool))
-    rec = gpu_pass(model, c, sets, st, dev, prog, eb=args.eval_batch, jb=args.jvp_batch, h71_pool=take)
+    rec = gpu_pass(model, c, sets, st, dev, prog, eb=args.eval_batch, jb=args.jvp_batch, h71_pool=take,
+                   hb=args.hvp_batch)
     peak_measure = torch.cuda.max_memory_allocated() / 2 ** 30 if cuda else float("nan")
     sec = rec["seconds"]
     h71_key = next(k for k in sec if k.startswith("H7.1 projections"))
@@ -693,6 +726,8 @@ def timing(args, run, st: dict, prog: Progress) -> dict:
     lo, hi, measured = ratio_range(name)
     out = {"gpu": name, "device": dev, "size": size, "cell": f"{noah}|{joseph}", "steps_timed": len(times),
            "micro_batch": mb, "batch_seqs": B, "seq_len": L, "step_seconds": step_s,
+           "eval_batch": args.eval_batch, "jvp_batch": args.jvp_batch,
+           "hvp_batch": int(args.hvp_batch or st["measure"]["hvp_batch"]),
            "step_seconds_p90": float(np.quantile(times, 0.9)), "tokens_per_second": B * L / step_s,
            "peak_train_gib": peak_train, "peak_measure_gib": peak_measure,
            "measure_seconds": sec, "h71_examples_timed": take, "h71_examples_full": n_pool,
@@ -770,17 +805,84 @@ def prior_component_hours(size: str, st: dict, spec: dict = L40S_SPEC) -> dict:
     return {"train": train / 3600, "stage": stage / 3600, "h71": h71 / 3600}
 
 
-def prior_peak_gib(size: str, st: dict) -> dict:
-    """GPU memory (GiB, tensors): training at micro-batch 16 with the chunked loss; measurement at eval batch 4 and
-    JVP batch 32 (float32 logits, their log-softmax and the tangent's)."""
+def prior_peak_gib(size: str, st: dict, mb: int | None = None, chunk: int | None = None, eb: int = 4, jb: int = 32,
+                   hb: int | None = None) -> dict:
+    """GPU memory (GiB, tensors). Training (bfloat16, flash attention, micro-batch mb with the loss in chunks of
+    `chunk` tokens): from the sizes of the weights, optimizer state, saved activations and one chunk of logits (a
+    prior: the meta device cannot run the flash kernel; a CPU bfloat16 run of the same step gave 3.9 GiB at 14M and
+    5.6 at 31M, 2026-11-18). Measurements: measured on the meta device (measure_peaks)."""
     c = size_cfg(size)
     d, L, ff, V = c["hidden_size"], c["num_hidden_layers"], c["intermediate_size"], st["stream"]["vocab"]
     n_par = L * (4 * d * d + 2 * d * ff) + 2 * d * V
     static = n_par * (16 + 4 * st["train"]["n_hgrad_dirs"] + 4)       # weights, grads, AdamW, directions, flat grad
-    act = st["train"]["micro_batch"] * st["stream"]["seq_len"] * L * (20 * d + 4 * ff)
-    logits = st["train"]["loss_chunk"] * V * 14
-    meas = n_par * 4 + 4 * 2048 * V * 4 * 3
-    return {"train": (static + act + logits) / 2 ** 30, "measure": (meas + n_par * 4) / 2 ** 30}
+    act = int(mb or st["train"]["micro_batch"]) * st["stream"]["seq_len"] * L * (20 * d + 4 * ff)
+    logits = int(chunk or st["train"]["loss_chunk"]) * V * 14
+    meas = measure_peaks(size, st, eb, jb, hb)
+    return {"train": (static + act + logits) / 2 ** 30, "measure": meas["measure"], "measure_steps": meas["steps"],
+            "training_state": meas["training_state"]}
+
+
+def measure_peaks(size: str, st: dict, eb: int = 4, jb: int = 32, hb: int | None = None) -> dict:
+    """Peak GPU memory (GiB, tensors) of each step of a measurement stage, run on torch's meta device under
+    memory_check.py's tracker (shapes only: no GPU, no data, seconds), plus the training state the GPU keeps while
+    it measures (gradients, AdamW moments, the hgrad directions). The CUDA context and allocator rounding come on
+    top, as for run_queue.py's peaks (1.05 x peak + 0.6 GiB)."""
+    import memory_check as mc
+    m, V, K = st["measure"], int(st["stream"]["vocab"]), int(st["stream"]["K"])
+    hb = int(hb or m["hvp_batch"])
+    with torch.device("meta"):
+        model = build_model(size, 1, V)
+    model.eval()
+    names = lm.grad_param_names(model)
+    params = {n: p for n, p in model.named_parameters() if n in names}
+    T = int(m["example_len"])
+
+    def ids(n, t):
+        return torch.randint(0, V, (int(n), int(t)), device="meta")
+
+    out = {}
+    x = ids(eb, m["probe_len"])
+    out[f"probe loss ({eb} x {m['probe_len']})"] = mc.peak_gib(lambda: mc.nograd_losses(model, x), mc.state(model, x))
+    out[f"hidden states ({eb} x {m['probe_len']})"] = mc.peak_gib(lambda: mc.nograd_hidden(model, x),
+                                                                  mc.state(model, x))
+    xs = ids(eb, st["stream"]["seq_len"])
+
+    def sur():
+        with torch.no_grad():
+            _surprisal_batch(model, xs, K)
+    out[f"surprisal parts ({eb} x {st['stream']['seq_len']})"] = mc.peak_gib(sur, mc.state(model, xs))
+    xe = ids(eb, m["eval_len"])
+    out[f"eval loss ({eb} x {m['eval_len']})"] = mc.peak_gib(lambda: mc.nograd_losses(model, xe), mc.state(model, xe))
+    k = int(m["n_random_dirs"]) + int(m["n_hessian_dirs"])
+    dirs = [{n: torch.randn_like(p) for n, p in params.items()} for _ in range(k)]
+    xj = ids(jb, T)
+    out[f"per-example JVP ({jb} x {T}, {k} directions)"] = mc.peak_gib(
+        lambda: gradients.per_example_projections(model, lm.per_example_lm_loss, xj, params, dirs),
+        mc.state(model, dirs, xj))
+    nh = int(m["hessian_batch"])
+    xh = ids(nh, T)
+    hvp, _ = gradients.hvp_fn(model, lm.per_example_lm_loss, xh, params, chunk=hb if hb < nh else None)
+    v = {n: torch.randn_like(p) for n, p in params.items()}
+    out[f"HVP, Hessian direction ({nh} x {T} in micro-batches of {min(hb, nh)})"] = mc.peak_gib(
+        lambda: hvp(v), mc.state(model, v, xh))
+    n_par = sum(p.numel() for p in model.parameters())
+    state = n_par * (4 + 8 + 4 * int(st["train"]["n_hgrad_dirs"])) / 2 ** 30
+    return {"steps": out, "training_state": state, "measure": state + max(out.values())}
+
+
+def print_memory(args, st: dict) -> None:
+    sizes = [x for x in (args.sizes or ",".join(SIZES)).split(",") if x]
+    eb, jb = args.eval_batch, args.jvp_batch
+    for size in sizes:
+        r = prior_peak_gib(size, st, args.micro_batch, args.loss_chunk, eb, jb, args.hvp_batch)
+        mb = int(args.micro_batch or st["train"]["micro_batch"])
+        chunk = int(args.loss_chunk or st["train"]["loss_chunk"])
+        print(f"{size}: GPU memory, tensors (GiB); the CUDA context and allocator rounding come on top")
+        print(f"  training, micro-batch {mb} x {st['stream']['seq_len']}, loss chunk {chunk}: {r['train']:.2f} (prior)")
+        for name, g in r["measure_steps"].items():
+            print(f"  {name}: {g:.2f}")
+        print(f"  training state kept during the measurements: {r['training_state']:.2f}")
+        print(f"  measuring, largest step + state: {r['measure']:.2f}; job peak {max(r['train'], r['measure']):.2f}")
 
 
 MIN_SEEDS = 3
@@ -866,6 +968,11 @@ def main(argv=None) -> int:
                                                                   "softmax (default 4,096; the same loss)")
     ap.add_argument("--eval-batch", type=int, default=4)
     ap.add_argument("--jvp-batch", type=int, default=32)
+    ap.add_argument("--hvp-batch", type=int, default=None, help="sequences per micro-batch of the Hessian-vector "
+                                                                 "products of H7.1's Hessian direction (default 16; "
+                                                                 "the same H v)")
+    ap.add_argument("--memory", action="store_true", help="GPU memory of each step on the meta device (no GPU); "
+                                                           "with the batch flags given")
     ap.add_argument("--workers", type=int, default=2, help="CPU pool processes")
     ap.add_argument("--budget-hours", type=float, default=None)
     ap.add_argument("--timing-json", default=None, help="timing.json of the queue's L40S timing job")
@@ -888,8 +995,11 @@ def main(argv=None) -> int:
             c, m = comp[s], prior_peak_gib(s, st)
             print(f"  prior per run, {s}: training {c['train'][0] * 60:.0f} min, measurements "
                   f"{c['stage'][0] * 60:.1f} min per stage + H7.1 {c['h71'][0] * 60:.1f} min per stage; GPU memory "
-                  f"about {m['train']:.1f} GiB training, {m['measure']:.1f} GiB measuring (tensors)")
-        print("  (prior from FLOPs and bytes moved, not a measurement: --timing measures)")
+                  f"about {m['train']:.1f} GiB training, {m['measure']:.1f} GiB measuring (tensors; --memory)")
+        print("  (hours: a prior from FLOPs and bytes moved, not a measurement: --timing measures)")
+        return 0
+    if args.memory:
+        print_memory(args, st)
         return 0
     run = runtime.start_run(TEST, {**st, "design": args.design if not args.smoke else "smoke"}, args)
     prog = Progress(run.out_dir)

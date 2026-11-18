@@ -192,6 +192,44 @@ def test_flat_directions_are_unit_and_fixed(tiny_model):
     assert torch.equal(D, p6.flat_directions(params, 3, 7, "cpu"))
 
 
+def test_hessian_direction_in_micro_batches_is_p1s(tiny_model):
+    import p1_checkpoints
+    import p6_noah_joseph as p6
+    ids = torch.randint(0, 512, (8, 32))
+    _, ref = p1_checkpoints.directions(tiny_model, ids, "cpu", 2, 1, 5)
+    _, same = p6.directions(tiny_model, ids, "cpu", 2, 1, 5, None)       # no micro-batches: P1's function
+    _, big = p6.directions(tiny_model, ids, "cpu", 2, 1, 5, 8)           # one micro-batch covers the batch
+    _, mb = p6.directions(tiny_model, ids, "cpu", 2, 1, 5, 3)            # micro-batches of 3, 3 and 2
+
+    def flat(d):
+        return torch.cat([d[n].reshape(-1) for n in sorted(d)])
+    assert [(k, i) for k, i, _ in ref] == [(k, i) for k, i, _ in mb] == [("random", 0), ("random", 1), ("hessian", 0)]
+    for (_, _, a), (_, _, b), (_, _, c), (_, _, e) in zip(ref, same, big, mb):
+        assert torch.equal(flat(a), flat(b)) and torch.equal(flat(a), flat(c))
+        assert float(flat(a) @ flat(e) / (flat(a).norm() * flat(e).norm())) > 1 - 1e-5
+
+
+def test_memory_fits_the_queue_and_the_laptop():
+    import p6_noah_joseph as p6
+    st = p6.settings(False, p6.DESIGNS["full"])
+    peaks = {}
+    for name in ("p6_queue_small.json", "p6_queue_full.json"):
+        for j in json.loads((ROOT / name).read_text()):
+            if j["gpu"] > 0:
+                a = j["args"]
+                size = a[a.index("--sizes") + 1] if "--sizes" in a else a[a.index("--size") + 1]
+                if size not in peaks:
+                    r = p6.prior_peak_gib(size, st)
+                    peaks[size] = max(r["train"], r["measure"])
+                assert peaks[size] <= j["gpu"], (j["name"], peaks[size])     # the queue's figure covers the job
+    assert set(peaks) == {"14m", "31m"}
+    # the Hessian-vector products on all 64 sequences at once (P1's way) would need about 16 GiB at 14M
+    assert p6.measure_peaks("14m", st, hb=64)["measure"] > 15
+    # the laptop timing flags fit a 4 GB card with room for the CUDA context
+    lap = p6.prior_peak_gib("14m", st, mb=2, chunk=1024, eb=1, jb=8, hb=4)
+    assert max(lap["train"], lap["measure"]) < 2.5
+
+
 def test_plans_and_designs():
     import p6_noah_joseph as p6
     small, full = p6.plan(p6.DESIGNS["small"]), p6.plan(p6.DESIGNS["full"])
