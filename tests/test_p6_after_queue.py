@@ -225,3 +225,172 @@ def test_the_real_queue_files_are_accepted(name):
     r = subprocess.run([PY, str(ROOT / "run_queue.py"), "--jobs-file", str(ROOT / name), "--dry-run"],
                        capture_output=True, text=True, timeout=120, cwd=ROOT)
     assert r.returncode == 0 and "p6_timing_14m" in r.stdout
+
+
+# ----------------------------------------------------------------------------- --take-over (2026-11-18)
+OLD_COMMIT = "6c5bf9a"      # the p6_after_queue.py that the server's waiter runs (unchanged until --take-over)
+
+
+def old_waiter_script(tmp_path):
+    """The waiter as started on the server: p6_after_queue.py at 6c5bf9a, next to links to this run_queue.py and
+    common/ (its HERE); None if git cannot give it (the Library zip has no history)."""
+    r = subprocess.run(["git", "show", f"{OLD_COMMIT}:p6_after_queue.py"], cwd=ROOT, capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    d = tmp_path / "old_code"
+    d.mkdir()
+    (d / "p6_after_queue.py").write_text(r.stdout)
+    for name in ("run_queue.py", "common", "config.py"):
+        (d / name).symlink_to(ROOT / name)
+    return d / "p6_after_queue.py"
+
+
+def two_queues(tmp_path, old_seconds=1.0, new_seconds=1.0):
+    """The design's queue file (a stand-in job) and the raised one (another), each writing its end time."""
+    logs, jf, end = setup(tmp_path, job_seconds=old_seconds, name="p6_standin")
+    end_new = tmp_path / "job_end_raised"
+    jobs = [{"name": "p6r_standin", "args": ["-c", f"import time; time.sleep({new_seconds}); "
+                                                   f"open({str(end_new)!r}, 'w').write(repr(time.time()))"],
+             "out": "results/p6r_standin", "gpu": 0.0}]
+    jf_new = tmp_path / "p6_queue_raised_test.json"
+    jf_new.write_text(json.dumps(jobs))
+    return logs, jf, end, jf_new, end_new
+
+
+def take_over(tmp_path, jf_new, *extra):
+    return subprocess.Popen([PY, SCRIPT, "--root", str(tmp_path), "--jobs-file", str(jf_new), "--poll", "0.2",
+                             "--take-over", *extra], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+
+def started_waiter(tmp_path, jf, old: bool):
+    script = old_waiter_script(tmp_path) if old else Path(SCRIPT)
+    if script is None:
+        pytest.skip(f"git cannot show {OLD_COMMIT}")
+    return subprocess.Popen([PY, str(script), "--root", str(tmp_path), "--jobs-file", str(jf), "--poll", "0.2"],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+
+def kill_left(tmp_path):
+    """Kill any process of this test still running (its arguments name tmp_path), so a failure leaves no queue
+    behind for the next test's refusal checks."""
+    for d in Path("/proc").iterdir():
+        if d.name.isdigit() and int(d.name) != os.getpid():
+            try:
+                if str(tmp_path).encode() in (d / "cmdline").read_bytes():
+                    os.kill(int(d.name), signal.SIGKILL)
+            except OSError:
+                pass
+
+
+@pytest.mark.parametrize("old", [True, False])
+def test_take_over_while_the_waiter_waits(tmp_path, old):
+    """The verdict comes while the old queue still runs: the waiter (the server's code, 6c5bf9a) is replaced, the
+    design's queue never starts, the raised one starts when the old queue ends, and olmo7b waits through it all."""
+    try:
+        logs, jf, end, jf_new, end_new = two_queues(tmp_path)
+        old_q = hold(logs / ".run_lane.queue.lock")
+        passed = tmp_path / "olmo7b_passed"
+        olmo = olmo7b_standin(logs, passed)
+        w = started_waiter(tmp_path, jf, old)
+        read_until(w, "waiting for the running run_queue.py to end")
+        t = take_over(tmp_path, jf_new)
+        read_until(t, "released (the queue lock keeps p1_olmo7b waiting)")
+        w.wait(10)                                                   # the old waiter is gone, having started nothing
+        time.sleep(0.5)
+        assert not end.exists() and not end_new.exists() and not passed.exists() and old_q.poll() is None
+        t_release = time.time()
+        (logs / ".run_lane.queue.lock.release").write_text("")      # the old queue ends
+        old_q.wait(10)
+        out, _ = t.communicate(timeout=60)
+        assert t.returncode == 0, out
+        olmo.wait(30)
+        assert t_release < float(end_new.read_text()) < float(passed.read_text())
+        assert not end.exists()                                      # the design's 2^28 queue never ran
+        prog = (logs / "progress.txt").read_text()
+        assert "START  p6r_standin" in prog and "p6_standin" not in prog
+    finally:
+        kill_left(tmp_path)
+
+
+def test_take_over_after_the_design_queue_started(tmp_path):
+    """The verdict comes after P6 started: its queue and job are stopped (exit 130), the raised queue starts, and
+    olmo7b never sees the lanes free in between."""
+    try:
+        logs, jf, end, jf_new, end_new = two_queues(tmp_path, old_seconds=60)
+        old_q = hold(logs / ".run_lane.queue.lock")
+        passed = tmp_path / "olmo7b_passed"
+        olmo = olmo7b_standin(logs, passed)
+        w = started_waiter(tmp_path, jf, old=True)
+        read_until(w, "waiting for the running run_queue.py to end")
+        (logs / ".run_lane.queue.lock.release").write_text("")
+        old_q.wait(10)
+        read_until(w, "logs/.run_lane.p6.lock released")
+        prog_f = logs / "progress.txt"
+        wait_for(lambda: prog_f.exists() and "START  p6_standin" in prog_f.read_text())
+        t = take_over(tmp_path, jf_new)
+        out, _ = t.communicate(timeout=120)
+        assert t.returncode == 0, out
+        w.wait(30)
+        olmo.wait(30)
+        prog = (logs / "progress.txt").read_text()
+        assert "END    p6_standin  exit 130 (interrupted)" in prog and not end.exists()
+        assert "START  p6r_standin" in prog and "END    p6r_standin  exit 0" in prog
+        assert float(end_new.read_text()) < float(passed.read_text())
+        assert "stopping the P6 queue" in out or "stopping p6_after_queue.py" in out
+    finally:
+        kill_left(tmp_path)
+
+
+def test_take_over_with_nothing_running_starts_the_queue(tmp_path):
+    try:
+        logs, jf, end, jf_new, end_new = two_queues(tmp_path)
+        passed = tmp_path / "olmo7b_passed"
+        t = take_over(tmp_path, jf_new)
+        out, _ = t.communicate(timeout=60)
+        assert t.returncode == 0 and "no queue runs" in out, out
+        assert end_new.exists() and not end.exists() and not passed.exists()
+    finally:
+        kill_left(tmp_path)
+
+
+def test_take_over_refusals_and_check(tmp_path):
+    logs, jf, end, jf_new, end_new = two_queues(tmp_path)
+    r = subprocess.run([PY, SCRIPT, "--root", str(tmp_path), "--jobs-file", str(tmp_path / "none.json"),
+                        "--take-over"], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 2 and "is missing" in r.stdout
+    sw = hold(logs / ".run_lane.p6switch.lock")
+    r = subprocess.run([PY, SCRIPT, "--root", str(tmp_path), "--jobs-file", str(jf_new), "--take-over"],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 2 and "another --take-over runs" in r.stdout
+    sw.kill()
+    old_q = hold(logs / ".run_lane.queue.lock")
+    w = waiter(tmp_path, jf)
+    try:
+        read_until(w, "waiting for the running run_queue.py to end")
+        before = sorted(p.name for p in logs.iterdir())
+        r = subprocess.run([PY, SCRIPT, "--root", str(tmp_path), "--jobs-file", str(jf_new), "--take-over",
+                            "--check"], capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0 and f"would stop p6_after_queue.py pid {w.pid}" in r.stdout, r.stdout
+        assert "wait for the running queue" in r.stdout and sorted(p.name for p in logs.iterdir()) == before
+        assert w.poll() is None                                  # --check stopped nothing
+    finally:
+        w.kill()
+        old_q.kill()
+    # the raised queue already runs
+    fake = tmp_path / "fake"
+    fake.mkdir()
+    (fake / "run_queue.py").write_text("import time; time.sleep(60)\n")
+    q = subprocess.Popen([PY, str(fake / "run_queue.py"), "--jobs-file", jf_new.name])
+    try:
+        time.sleep(0.3)
+        r = subprocess.run([PY, SCRIPT, "--root", str(tmp_path), "--jobs-file", str(jf_new), "--take-over"],
+                           capture_output=True, text=True, timeout=60)
+        assert r.returncode == 2 and "runs already" in r.stdout
+    finally:
+        q.kill()
+
+
+def test_the_raised_queue_file_is_accepted():
+    r = subprocess.run([PY, str(ROOT / "run_queue.py"), "--jobs-file", str(ROOT / "p6_queue_small_raised.json"),
+                        "--dry-run"], capture_output=True, text=True, timeout=120, cwd=ROOT)
+    assert r.returncode == 0 and "p6r_timing_14m" in r.stdout, r.stdout + r.stderr

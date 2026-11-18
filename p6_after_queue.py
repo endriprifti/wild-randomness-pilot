@@ -23,6 +23,17 @@ What it does, in order:
   5. Waits for the P6 queue (timing job, then the runs, whose seed count the budget guard sets from the measured L40S
      timing, then the analysis) and exits with its exit code. The queue lock is then free, and p1_olmo7b starts at
      its next check once the P1 and P3 lanes have ended.
+
+--take-over (added 2026-11-18 for option A of P6's feasibility rule; README, "Switching to the raised design"):
+  setsid nohup nice -n 10 taskset -c 0-10 python p6_after_queue.py --take-over \
+      --jobs-file p6_queue_small_raised.json > logs/p6_take_over.out 2>&1 < /dev/null &
+takes the place of a running p6_after_queue.py (the one started before this option existed included: it is stopped,
+not changed) and of the P6 queue it started, if any, with logs/.run_lane.p6switch.lock held from the start, so that
+p1_olmo7b keeps waiting throughout: it stops the waiter (while it waits: nothing had started) and any P6 queue
+(SIGTERM: its jobs stop, saved runs stay), waits until no p6_noah_joseph.py process is left, then goes on as above
+from step 2 with the new jobs file: it waits for a running non-P6 queue (the switch lock released once its request
+for the queue lock waits in the kernel), or, with none, holds the queue lock at once, and hands over to the new
+queue. It refuses if the new jobs file's queue already runs or another --take-over runs.
 """
 
 from __future__ import annotations
@@ -43,6 +54,7 @@ from common import gpu_locks  # noqa: E402
 QUEUE_LOCK = run_queue.QUEUE_LOCK                 # .run_lane.queue.lock
 HANDOVER_LOCK = ".run_lane.p6.lock"               # matches p1_olmo7b's .run_lane*.lock; held only during the hand-over
 OWN_LOCK = ".p6_after_queue.lock"                 # not a .run_lane* name: invisible to p1_olmo7b and the queues
+SWITCH_LOCK = ".run_lane.p6switch.lock"           # --take-over: a .run_lane* name, so p1_olmo7b waits throughout
 OLD_SCRIPTS = ("p2_w4a4.py", "p4_clipping.py", "p5_escape.py")
 OLD_MODULES = ("common.popqa",)
 
@@ -147,6 +159,121 @@ def olmo7b_processes(procs: dict[int, list[str]]) -> list[int]:
     return [p for p, a in procs.items() if runs_script(a, "p1_checkpoints.py") and "olmo7b" in " ".join(a)]
 
 
+def lock_waiting(path: Path, pid: int) -> bool | None:
+    """True if `pid` waits for an flock on `path` (a '->' line of /proc/locks); None if it cannot tell."""
+    try:
+        st = path.stat()
+        lines = Path("/proc/locks").read_text().splitlines()
+    except OSError:
+        return None
+    for ln in lines:
+        w = ln.split()
+        if len(w) < 7 or w[1] != "->" or w[2] != "FLOCK":
+            continue
+        try:
+            maj, mnr, ino = w[6].split(":")
+            if (int(w[5]) == pid and int(ino) == st.st_ino and int(maj, 16) == os.major(st.st_dev)
+                    and int(mnr, 16) == os.minor(st.st_dev)):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def take_over_targets(procs: dict[int, list[str]], me: set[int]) -> dict[str, list]:
+    """What --take-over stops and waits for: p6_after_queue.py waiters (not --check, not --take-over), P6 queues
+    (run_queue.py with a p6_ jobs file) and p6_noah_joseph.py processes."""
+    waiters = [p for p, a in procs.items() if p not in me and runs_script(a, "p6_after_queue.py")
+               and not {"--check", "--take-over"} & set(a)]
+    queues = [(p, queue_jobs_file(a)) for p, a in running_queues(procs, me)
+              if queue_jobs_file(a) and "p6_" in Path(queue_jobs_file(a)).name]
+    jobs = [p for p, a in procs.items() if p not in me and runs_script(a, "p6_noah_joseph.py")]
+    return {"waiters": waiters, "queues": queues, "jobs": jobs}
+
+
+def take_over_refusals(root: Path, jobs_file: Path, procs, me) -> list[str]:
+    logs = root / "logs"
+    out = []
+    if not jobs_file.exists():
+        out.append(f"{jobs_file} is missing (git pull first)")
+    for pid, jf in take_over_targets(procs, me)["queues"]:
+        if Path(jf).name == jobs_file.name:
+            out.append(f"the queue of {jobs_file.name} runs already (pid {pid}): nothing to take over")
+    if gpu_locks.is_held(logs / SWITCH_LOCK):
+        out.append(f"another --take-over runs (logs/{SWITCH_LOCK})")
+    return out
+
+
+def take_over(root: Path, jobs_file: Path, poll: float):
+    """Steps 0-2 of --take-over: (own lock, queue lock or None, switch lock or None), or an exit code."""
+    logs = root / "logs"
+    me = {os.getpid()}
+    procs = processes()
+    problems = take_over_refusals(root, jobs_file, procs, me)
+    sw = None if problems else flock(logs / SWITCH_LOCK, block=False)
+    if problems or sw is None:
+        say("--take-over not started: " + "; ".join(problems or [f"another --take-over runs (logs/{SWITCH_LOCK})"]))
+        return 2
+    say(f"--take-over, pid {os.getpid()}: holding logs/{SWITCH_LOCK} (p1_olmo7b keeps waiting); then {jobs_file.name}")
+    t = take_over_targets(procs, me)
+    for pid in t["waiters"]:
+        say(f"stopping p6_after_queue.py pid {pid} ({' '.join(procs.get(pid, ['?']))[:120]})")
+        _term(pid)
+    for pid, jf in t["queues"]:
+        say(f"stopping the P6 queue pid {pid} ({jf}); its jobs stop, saved runs stay")
+        _term(pid)
+    told = None
+    while True:
+        left = take_over_targets(processes(), me)
+        alive = [f"waiter {p}" for p in left["waiters"]] + [f"queue {p}" for p, _ in left["queues"]] + \
+                [f"p6_noah_joseph.py {p}" for p in left["jobs"]]
+        if not alive:
+            break
+        for p in left["waiters"] + [q for q, _ in left["queues"]]:
+            if p not in t["waiters"] + [q for q, _ in t["queues"]]:
+                _term(p)                       # one that appeared meanwhile
+        if alive != told:
+            say("waiting for " + ", ".join(alive) + " to end")
+            told = alive
+        time.sleep(min(poll, 2.0))
+    own = None
+    for _ in range(50):
+        own = flock(logs / OWN_LOCK, block=False)
+        if own is not None:
+            break
+        time.sleep(0.1)
+    if own is None:
+        say(f"--take-over stopped: logs/{OWN_LOCK} is still held with no waiter left")
+        return 2
+    (logs / "p6_after_queue.pid").write_text(f"{os.getpid()}\n")
+    qlock = flock(logs / QUEUE_LOCK, block=False)
+    if qlock is not None:
+        say(f"no queue runs; holding logs/{QUEUE_LOCK}")
+        return own, qlock, sw
+    # a non-P6 queue runs: wait for it as step 2 does, and release the switch lock once our request waits
+    import threading
+    got = {}
+    th = threading.Thread(target=lambda: got.setdefault("f", flock(logs / QUEUE_LOCK, block=True)), daemon=True)
+    th.start()
+    t0 = time.time()
+    while "f" not in got and not lock_waiting(logs / QUEUE_LOCK, os.getpid()) and time.time() - t0 < 5.0:
+        time.sleep(0.01)            # (if /proc/locks cannot tell, 5 s: the thread is in flock() by then)
+    queues = running_queues(processes(), me)
+    say("waiting for the running run_queue.py to end ("
+        + (", ".join(f"pid {p}, started {started_utc(p)}" for p, _ in queues) or "its process not found")
+        + f"; logs/{QUEUE_LOCK} held); logs/{SWITCH_LOCK} released (the queue lock keeps p1_olmo7b waiting)")
+    sw.close()
+    th.join()
+    return own, got["f"], None
+
+
+def _term(pid: int) -> None:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+
 OLMO7B_WAITS_FOR_LANES = "3463b1c"     # first commit whose p1_checkpoints.gpu_lock waits for every .run_lane*.lock
 
 
@@ -173,7 +300,7 @@ def log_header(log: Path) -> tuple[str, str]:
     return start, commit
 
 
-def check(root: Path, jobs_file: Path) -> int:
+def check(root: Path, jobs_file: Path, take: bool = False) -> int:
     """Print what this script would wait for now, the lock holders, the running jobs with the commit each loaded,
     and the old queue's jobs. Changes nothing."""
     logs = root / "logs"
@@ -227,6 +354,18 @@ def check(root: Path, jobs_file: Path) -> int:
     r = git(HERE, "log", "-1", "--format=%h %cI")
     print(f"git HEAD {r.stdout.strip() if r is not None else '?'}; {jobs_file.name} "
           f"{'present' if jobs_file.exists() else 'MISSING'}")
+    if take:
+        t = take_over_targets(procs, me)
+        problems = take_over_refusals(root, jobs_file, procs, me)
+        for w in warnings:
+            print(f"WARNING: {w}")
+        plan = (f"would stop {', '.join(f'p6_after_queue.py pid {p}' for p in t['waiters']) or 'no waiter'}"
+                f" and {', '.join(f'the P6 queue pid {p} ({jf})' for p, jf in t['queues']) or 'no P6 queue'}, "
+                f"wait for {len(t['jobs'])} p6_noah_joseph.py process(es), then "
+                + ("wait for the running queue" if gpu_locks.is_held(logs / QUEUE_LOCK) and not t["queues"]
+                   else "hold the queue lock") + f" and start {jobs_file.name}")
+        print("verdict (--take-over): " + (plan if not problems else "would refuse: " + "; ".join(problems)))
+        return 0
     problems = refusals(root, jobs_file, procs, me, st)
     for w in warnings:
         print(f"WARNING: {w}")
@@ -283,6 +422,8 @@ def main(argv=None) -> int:
     ap.add_argument("--jobs-file", default="p6_queue_small.json", help="P6 queue file (default the small design)")
     ap.add_argument("--poll", type=float, default=60.0, help="seconds between checks, here and in the P6 queue")
     ap.add_argument("--queue-args", default="", help="further arguments for the P6 run_queue.py (space-separated)")
+    ap.add_argument("--take-over", action="store_true", help="replace a running p6_after_queue.py and its P6 queue "
+                                                              "by this one with --jobs-file (docstring)")
     ap.add_argument("--root", default=str(HERE), help=argparse.SUPPRESS)          # tests
     args = ap.parse_args(argv)
     root = Path(args.root).resolve()
@@ -290,26 +431,34 @@ def main(argv=None) -> int:
     jobs_file = Path(args.jobs_file)
     jobs_file = jobs_file if jobs_file.is_absolute() else root / jobs_file
     if args.check:
-        return check(root, jobs_file)
+        return check(root, jobs_file, take=args.take_over)
     procs, me = processes(), {os.getpid()}
     st = run_queue.State(root, run_queue.GPU_TOTAL_GIB)
-    problems = refusals(root, jobs_file, procs, me, st)
-    if problems:
-        say("not started: " + "; ".join(problems))
-        return 2
-    own = flock(logs / OWN_LOCK, block=False)
-    if own is None:
-        say(f"not started: another p6_after_queue.py runs (logs/{OWN_LOCK})")
-        return 2
-    (logs / "p6_after_queue.pid").write_text(f"{os.getpid()}\n")
-    queues = running_queues(procs, me)
-    say(f"pid {os.getpid()}; waiting for the running run_queue.py to end ("
-        + (", ".join(f"pid {p}, started {started_utc(p)}" for p, _ in queues) or "its process not found")
-        + f"; logs/{QUEUE_LOCK} held). Then: {jobs_file.name}")
+    sw = None
+    if args.take_over:
+        r = take_over(root, jobs_file, args.poll)
+        if isinstance(r, int):
+            return r
+        own, qlock, sw = r
+        say(f"holding logs/{QUEUE_LOCK} (p1_olmo7b keeps waiting)")
+    else:
+        problems = refusals(root, jobs_file, procs, me, st)
+        if problems:
+            say("not started: " + "; ".join(problems))
+            return 2
+        own = flock(logs / OWN_LOCK, block=False)
+        if own is None:
+            say(f"not started: another p6_after_queue.py runs (logs/{OWN_LOCK})")
+            return 2
+        (logs / "p6_after_queue.pid").write_text(f"{os.getpid()}\n")
+        queues = running_queues(procs, me)
+        say(f"pid {os.getpid()}; waiting for the running run_queue.py to end ("
+            + (", ".join(f"pid {p}, started {started_utc(p)}" for p, _ in queues) or "its process not found")
+            + f"; logs/{QUEUE_LOCK} held). Then: {jobs_file.name}")
 
-    # 2. the queue lock, handed over by the kernel when the queue's process ends
-    qlock = flock(logs / QUEUE_LOCK, block=True)
-    say(f"the queue has ended; holding logs/{QUEUE_LOCK} (p1_olmo7b keeps waiting)")
+        # 2. the queue lock, handed over by the kernel when the queue's process ends
+        qlock = flock(logs / QUEUE_LOCK, block=True)
+        say(f"the queue has ended; holding logs/{QUEUE_LOCK} (p1_olmo7b keeps waiting)")
     # 3. no job of the old queue may still run
     told = None
     while True:
@@ -368,6 +517,8 @@ def main(argv=None) -> int:
         break
     if hand is not None:
         hand.close()
+    if sw is not None:
+        sw.close()
     if child.poll() is None:
         say(f"the P6 queue holds logs/{QUEUE_LOCK}; logs/{HANDOVER_LOCK} released. p1_olmo7b waits for this queue")
     rc = child.wait()

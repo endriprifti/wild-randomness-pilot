@@ -46,6 +46,11 @@ Commands (in the pilot folder inside the venv):
   setsid nohup nice -n 10 taskset -c 0-10 python p6_after_queue.py > logs/p6_after_queue.out 2>&1 < /dev/null &
                                     # the L40S: the small design through run_queue.py once the running queue ends
   python p6_noah_joseph.py --smoke --out results/p6_smoke   # tiny model and streams on the CPU (minutes)
+  python p6_noah_joseph.py --feasibility --micro-batch 2 --loss-chunk 1024 --eval-batch 1 \
+      --out results/p6_feasibility       # the feasibility check before P6 (one run of one cell; the rule's verdict)
+  setsid nohup nice -n 10 taskset -c 0-10 python p6_after_queue.py --take-over \
+      --jobs-file p6_queue_small_raised.json > logs/p6_take_over.out 2>&1 < /dev/null &
+                                    # only on a "raise" verdict: option A (--raised: 2^33 tokens, budget 90 h)
 """
 
 from __future__ import annotations
@@ -102,6 +107,12 @@ DESIGNS = {
              "seeds": [1, 2, 3, 4, 5], "h71_stages": list(config.TRAINING_STAGES)},
 }
 BUDGET_HOURS = {"small": 12.0, "full": 80.0}      # --budget-hours in the queue files
+# Option A of the feasibility rule (Endri, 2026-11-18, fixed before the feasibility check ran; README, "Feasibility
+# check before P6"): if its verdict is "raise", the small design runs with 2^33 tokens per run, 512 x 2,048 tokens per
+# step at the same 8,192 steps, stages, warm-up and learning rate, and a budget of 90 L40S hours (the guard picks
+# 3-5 seeds from the timing, as designed). --raised selects it (p6_queue_small_raised.json); it is not the default.
+RAISED_TRAIN = {"tokens": 2 ** 33, "batch_seqs": 512}
+BUDGET_HOURS_RAISED = {"small": 90.0}
 
 SMOKE_STREAM = dict(copy.deepcopy(p6_streams.P6), vocab=512, K=4, R=128, block=16, p_bar=1 / 32, seq_len=128,
                     heldout_windows=400)
@@ -110,6 +121,7 @@ SMOKE_TRAIN = dict(TRAIN, tokens=24 * 4 * 128, batch_seqs=4, micro_batch=2, loss
 SMOKE_MEASURE = dict(MEASURE, surprisal_docs=4, hvp_batch=4)      # smoke hessian_batch 8: two micro-batches
 SMOKE_DESIGN = {"sizes": ["tiny"], "noah": ["light", "zipf1.0"], "joseph": ["H0.5", "H0.9"], "seeds": [1, 2],
                 "h71_stages": [1.0]}
+SMOKE_RAISED_TRAIN = {"tokens": 4 * SMOKE_TRAIN["tokens"], "batch_seqs": 4 * SMOKE_TRAIN["batch_seqs"]}  # same steps
 
 # GPU -> L40S speed ratio range for these small models (training and JVP passes are memory-bound: logits of 50,304
 # per token). RTX 2050: 112 GB/s, about 12 bf16 TFLOPS with float32 accumulation, 6 float32 TFLOPS; L40S: 864 GB/s,
@@ -122,10 +134,12 @@ PRICE_PER_HOUR = 0.69
 
 
 # ----------------------------------------------------------------------------- settings
-def settings(smoke: bool, design: dict | None = None) -> dict:
+def settings(smoke: bool, design: dict | None = None, raised: bool = False) -> dict:
     p1 = config.get("p1_checkpoints", smoke)
     P = SMOKE_STREAM if smoke else p6_streams.P6
     tr = SMOKE_TRAIN if smoke else TRAIN
+    if raised:                     # option A of the feasibility rule: more tokens per step, the same steps
+        tr = dict(tr, **(SMOKE_RAISED_TRAIN if smoke else RAISED_TRAIN))
     me = SMOKE_MEASURE if smoke else MEASURE
     m = {k: p1[k] for k in ("example_len", "n_random_dirs", "n_hessian_dirs", "hessian_batch", "coupling_B",
                             "coupling_blocks", "probe_seqs", "probe_len", "dh_points", "eval_seqs", "eval_len",
@@ -432,13 +446,57 @@ class StreamCheckFailed(SystemExit):
     pass
 
 
-def stream_checks(run_dir: Path, streams: dict, enforce: bool, prog) -> dict:
+def lean_stream(st: dict) -> bool:
+    """True if the train stream is built lean (more than p6_streams.LEAN_FROM_BLOCKS hazard blocks: the raised
+    design; never the design's 2^28 tokens)."""
+    n_tok = steps_of(st) * int(st["train"]["batch_seqs"]) * int(st["stream"]["seq_len"])
+    return -(-n_tok // int(st["stream"]["block"])) > p6_streams.LEAN_FROM_BLOCKS
+
+
+@contextlib.contextmanager
+def file_lock(path: Path, prog, what: str):
+    import fcntl
+    path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(path, "a")
+    try:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            prog.say(f"waiting for {path} ({what} of another job)")
+            fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+    finally:
+        f.close()
+
+
+def build_lean_train(c: dict, st: dict, rd: Path, shared: Path, prog) -> tuple:
+    """The raised design's train stream (2^33 tokens, 2^27 hazard blocks): built lean, one job at a time (a lock in
+    the design's folder: about 4.5 GiB of RAM while building and checking, 0.6 GiB after), its latent checks run
+    while the fGn path is there, then the path released. The rank and variant checks (one pass over the 4.2
+    million windows, about 20 CPU min) run afterwards in stream_checks, outside the lock."""
+    P = st["stream"]
+    n_win = steps_of(st) * int(st["train"]["batch_seqs"])
+    f = rd / "stream_check_train.json"
+    done = p6_stats.json_load(f) if f.exists() else None
+    with file_lock(shared / ".p6_stream_build.lock", prog, "the lean stream build"):
+        t = time.perf_counter()
+        train = p6_streams.Stream(c["noah"], c["joseph"], c["seed"], "train", n_win, P)
+        latent = {}
+        if done is None or done.get("n_tokens") != train.n_tokens:
+            latent["train"] = p6_streams.latent_checks(train)
+        train.release_latent()
+        prog.say(f"{c['key']}: lean train stream built and its latent process checked in "
+                 f"{time.perf_counter() - t:.0f} s")
+    return train, latent
+
+
+def stream_checks(run_dir: Path, streams: dict, enforce: bool, prog, latent: dict | None = None) -> dict:
     out = {}
     for role, s in streams.items():
         f = run_dir / f"stream_check_{role}.json"
         rec = p6_stats.json_load(f) if f.exists() else None
         if rec is None or rec.get("n_tokens") != s.n_tokens:
-            rec = p6_streams.check_stream(s)
+            rec = p6_streams.check_stream(s, latent=(latent or {}).get(role))
             p1_tasks.atomic_json(f, rec)
             prog.say(f"{run_dir.name}: {role} stream checked in {rec['seconds']:.0f} s: "
                      + ("ok" if rec["ok"] else f"FAILED {rec['failed']}"))
@@ -460,10 +518,14 @@ def train_run(c: dict, st: dict, args, run, pool: P6Pool | None, prog: Progress,
     n_steps = steps_of(st)
     B, L = int(tr["batch_seqs"]), int(P["seq_len"])
     t0 = time.perf_counter()
-    train = p6_streams.Stream(c["noah"], c["joseph"], c["seed"], "train", n_steps * B, P)
+    latent = {}
+    if lean_stream(st):
+        train, latent = build_lean_train(c, st, rd, run.out_dir.parent, prog)
+    else:
+        train = p6_streams.Stream(c["noah"], c["joseph"], c["seed"], "train", n_steps * B, P)
     held = p6_streams.Stream(c["noah"], c["joseph"], c["seed"], "heldout", int(P["heldout_windows"]), P)
     prog.say(f"{c['key']}: streams built in {time.perf_counter() - t0:.0f} s")
-    checks = stream_checks(rd, {"train": train, "heldout": held}, enforce=not st["smoke"], prog=prog)
+    checks = stream_checks(rd, {"train": train, "heldout": held}, enforce=not st["smoke"], prog=prog, latent=latent)
     sets = heldout_sets(held, st["measure"])
     model = build_model(c["size"], c["seed"], P["vocab"]).to(dev)
     set_attention(model, "sdpa")
@@ -674,6 +736,17 @@ def timing(args, run, st: dict, prog: Progress) -> dict:
     every = 64 if not st["smoke"] else 1
     p6_streams.token_counts(train, every)
     t_check = (time.perf_counter() - t0) * every + 10.0        # + the latent checks (about 10 s, CPU)
+    lean_check = None
+    if train.lean:                 # the raised design: its lean train stream is built and its latent process checked
+        t1 = time.perf_counter()   # here once, on this machine, before any run (the runs repeat it per stream)
+        lean_check = p6_streams.latent_checks(train)
+        lean_check["seconds"] = round(time.perf_counter() - t1, 1)
+        t_check += lean_check["seconds"] - 10.0
+        train.release_latent()
+        prog.say(f"timing: lean train stream ({train.n_blocks:,} blocks) built in {t_build:.0f} s, latent checks "
+                 f"{lean_check['seconds']:.0f} s: g_ok {lean_check['g_ok']}, rate_ok {lean_check['rate_ok']}, "
+                 f"count_ok {lean_check['count_ok']} (H_count {lean_check['H_count']:.4f}, band "
+                 f"{lean_check['count_band']})")
     sets = heldout_sets(held, st["measure"])
     model = build_model(size, 1, P["vocab"]).to(dev)
     set_attention(model, "sdpa")
@@ -744,6 +817,7 @@ def timing(args, run, st: dict, prog: Progress) -> dict:
            "stages": n_stages, "train_steps_per_run": n_steps, "train_seconds_per_run": n_steps * step_s,
            "run_hours_this_gpu_all_h71": (n_steps * step_s + n_stages * (stage_s + h71_full)) / 3600,
            "cpu_seconds_stream_build": t_build, "cpu_seconds_stream_check_estimate": t_check,
+           "lean_stream_latent_check": lean_check,
            "l40s_ratio": [lo, hi], "l40s_measured": measured, "price_per_hour": PRICE_PER_HOUR}
     out["l40s_component_hours"] = component_hours(out)
     out["designs"] = cost_table(out["l40s_component_hours"], n_stages)
@@ -903,8 +977,8 @@ FEASIBILITY = {
     "cell": ("zipf1.0", "H0.9"),     # both factors on: the cell most likely to grow outliers (Zipf 1.0 the heavier)
     "seed": 6,                       # outside the design's seeds 1-5: no run of the P6 sets is seen before P6
     "k_tol": 1.0,                    # K and K_max "at their initial level": at most 1 (excess kurtosis) above step 0
-    "raise": {"tokens": 2 ** 33, "batch_seqs": 512},   # if they stay: x32 tokens (Pythia's step-4,000 count) by the
-                                                       # batch, at the same 8,192 steps, stages and learning rate
+    "raise": dict(RAISED_TRAIN),   # if they stay: x32 tokens (Pythia's step-4,000 count) by the batch, at the
+                                   # same 8,192 steps, stages and learning rate (option A: --raised, budget 90 h)
 }
 
 
@@ -1000,7 +1074,7 @@ def feasibility(args, run, st: dict, prog) -> dict:
 MIN_SEEDS = 3
 
 
-def budget_seeds(args, design: dict) -> list[int] | None:
+def budget_seeds(args, design: dict, st: dict | None = None) -> list[int] | None:
     """--budget-hours with --timing-json (the queue's L40S timing jobs): the seeds the design may run, the first k of
     its seeds with k the largest number whose runs fit the budget at the measured hours, at least MIN_SEEDS (else
     the job stops and nothing starts). Fixed before any run: the number of seeds depends on the timing only.
@@ -1013,6 +1087,11 @@ def budget_seeds(args, design: dict) -> list[int] | None:
         t = p6_stats.json_load(f) if f.exists() else None
         if not t:
             raise SystemExit(f"--budget-hours {args.budget_hours} needs the timing file {f} (missing)")
+        if st is not None and "batch_seqs" in t and (int(t["batch_seqs"]) != int(st["train"]["batch_seqs"])
+                                                     or int(t["train_steps_per_run"]) != steps_of(st)):
+            raise SystemExit(f"P6 budget: {f} timed {t['train_steps_per_run']} steps of {t['batch_seqs']} "
+                             f"sequences, this job runs {steps_of(st)} of {st['train']['batch_seqs']} (--raised "
+                             "needs the raised timing job's file); nothing started")
         comp.update({k: v for k, v in component_hours(t).items() if k == t["size"] or k not in comp})
     n_stages = len(TRAIN["stages"])
     per_seed = design_hours({**design, "seeds": [design["seeds"][0]]}, comp, n_stages)
@@ -1088,6 +1167,9 @@ def main(argv=None) -> int:
                                                                 "K_max and outlier channels; prints the rule's verdict")
     ap.add_argument("--memory", action="store_true", help="GPU memory of each step on the meta device (no GPU); "
                                                            "with the batch flags given")
+    ap.add_argument("--raised", action="store_true", help="option A of the feasibility rule (2026-11-18): 2^33 "
+                                                           "tokens per run, 512 x 2,048 per step, the same 8,192 "
+                                                           "steps (p6_queue_small_raised.json); not the default")
     ap.add_argument("--workers", type=int, default=2, help="CPU pool processes")
     ap.add_argument("--budget-hours", type=float, default=None)
     ap.add_argument("--timing-json", default=None, help="timing.json of the queue's L40S timing job")
@@ -1097,12 +1179,15 @@ def main(argv=None) -> int:
     ap.add_argument("--from", dest="from_dir", default=None, help="analyse: folder with the job folders")
     args = ap.parse_args(argv)
     design = SMOKE_DESIGN if args.smoke else DESIGNS[args.design]
-    st = settings(args.smoke, design)
+    if args.raised and args.feasibility:
+        raise SystemExit("--raised and --feasibility: the check runs the design as it stands")
+    st = settings(args.smoke, design, raised=args.raised)
     if args.plan:
         comp = {s: {k: [v, v] for k, v in prior_component_hours(s, st).items()} for s in SIZES}
         for name, d in DESIGNS.items():
             h = design_hours(d, comp, len(st["train"]["stages"]))
-            print(f"{name}: {len(plan(d))} runs = sizes {d['sizes']} x Noah {d['noah']} x Joseph {d['joseph']} x "
+            tag = " (raised, option A)" if args.raised else ""
+            print(f"{name}{tag}: {len(plan(d))} runs = sizes {d['sizes']} x Noah {d['noah']} x Joseph {d['joseph']} x "
                   f"seeds {d['seeds']}; {steps_of(st)} steps of {st['train']['batch_seqs']} x "
                   f"{st['stream']['seq_len']} tokens per run; stages {st['train']['stages']}, H7.1 at "
                   f"{d['h71_stages']}; prior {h[0]:.1f} L40S h, ${h[0] * PRICE_PER_HOUR:.0f}")
@@ -1116,7 +1201,8 @@ def main(argv=None) -> int:
     if args.memory:
         print_memory(args, st)
         return 0
-    run = runtime.start_run(TEST, {**st, "design": args.design if not args.smoke else "smoke"}, args)
+    run = runtime.start_run(TEST, {**st, "design": (args.design if not args.smoke else "smoke")
+                                   + ("_raised" if args.raised else "")}, args)
     prog = Progress(run.out_dir)
     if args.timing:
         timing(args, run, st, prog)
@@ -1134,7 +1220,7 @@ def main(argv=None) -> int:
         return 0
     sizes = args.sizes.split(",") if args.sizes else None
     seeds = [int(s) for s in args.seeds.split(",")] if args.seeds else None
-    allowed = budget_seeds(args, design)
+    allowed = budget_seeds(args, design, st)
     todo = plan(design, sizes, seeds)
     if allowed is not None:
         skipped = [c["key"] for c in todo if c["seed"] not in allowed]

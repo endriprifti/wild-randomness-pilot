@@ -635,6 +635,9 @@ python p6_noah_joseph.py --feasibility --micro-batch 2 --loss-chunk 1024 --eval-
 python p6_after_queue.py --check                 # read-only: locks, running jobs and the commit each loaded
 setsid nohup nice -n 10 taskset -c 0-10 python p6_after_queue.py > logs/p6_after_queue.out 2>&1 < /dev/null &
 python run_queue.py --jobs-file p6_queue_small.json --status    # once it runs: jobs, runs done, hours per run
+# only if the feasibility check says raise (option A, see "Switching to the raised design" below):
+setsid nohup nice -n 10 taskset -c 0-10 python p6_after_queue.py --take-over --jobs-file p6_queue_small_raised.json \
+    > logs/p6_take_over.out 2>&1 < /dev/null &
 # the full design instead: p6_queue_full.json (timing jobs for 14M and 31M, 10 jobs, analysis)
 # a job by hand, and the analysis:
 python p6_noah_joseph.py --design small --seeds 1 --out results/p6_small/14m_s1
@@ -715,13 +718,65 @@ the measurements do not):
 | 2^30 (×4) | 54 min | 13.1 h | 21.8 h | nothing |
 | 2^33 (×32, the raise) | 7.0 h | 85.9 h ($59) | 143.1 h ($99) | nothing |
 
-The raise costs 7-12 times the 12-h budget: with it the small design's budget becomes 90 h (3 seeds) or 145 h (5
-seeds), set before P6 starts and acted on through the timing only, as now. It is a code change made and tested
-before P6 starts: TRAIN's tokens and batch_seqs, the switch-count band calibrated at the new length (`python
-p6_streams.py --calibrate`; the bands are per length) and the stream construction checked at 2^33 tokens, and the
-queue files' `--budget-hours`. Pushed without a new budget, the raise makes every queued P6 job start nothing (the
-guard), and p1_olmo7b follows the old queue. If P6 has already started when the check says raise, the P6 queue is
+The raise costs 7-12 times the 12-h budget. If P6 has already started when the check says raise, the P6 queue is
 stopped and its runs are not analysed.
+
+**Decision on a raise (Endri, 2026-11-18, fixed before the feasibility check ran: option A).** If the verdict is
+raise, the small design runs with 2^33 tokens per run and a budget of 90 L40S hours; the budget guard then picks 3
+to 5 seeds from the measured timing, as designed (3 at the prior's 28.6 h per seed; 4 below 22.5 h, 5 below 18 h).
+If the verdict is keep, nothing changes: `p6_queue_small.json` runs as it stands. At 90 L40S hours the raised design
+holds the GPU for about four days before p1_olmo7b.
+
+**The raised design, prepared and tested before the check ran (not the default).** `p6_noah_joseph.py --raised`
+sets 512 × 2,048 tokens per step (`RAISED_TRAIN`, also the rule's `FEASIBILITY["raise"]`); steps, stages, warm-up,
+learning rate, model, streams, measurements and tests are the design's. `p6_queue_small_raised.json` is
+`p6_queue_small.json` with `--raised`, `--budget-hours 90` (`BUDGET_HOURS_RAISED`), the jobs renamed `p6r_*`, the
+timing job at 100 steps (each step is 32 micro-batches) into `results/p6_timing_l40s_14m_raised`, the runs into
+`results/p6_small_raised/`. A run refuses a timing file that timed another batch or step count. GPU memory per job is
+the design's (micro-batches of 16 sequences, the gradient accumulated over 32 of them).
+
+- Streams at 2^33 tokens (2^27 hazard blocks): `fgn` and the latent checks would need about 26 GiB of RAM there (200
+  bytes per block). Streams above `LEAN_FROM_BLOCKS` (2^25 blocks; the design's are at most 4.2 million) are built
+  lean (`fgn_lean`: the same autocovariance, eigenvalues and random draws in the same order, the circulant DFTs by the
+  four-step method in blocks; `dfa_lean`: hurst_dfa with the profile and segment fits in blocks), with the same
+  numbers: on test streams the fGn agrees to 1e-14, the switch positions, topics and windows are identical, and
+  `dfa_lean` returns hurst_dfa's value to the last bit on the same series. Measured here (one full 2^33-token stream,
+  Zipf 1.0 × H 0.9, seed 1, 4-core CPU): built in 181 s at a peak of 4.3 GiB RAM, latent checks 213 s (fGn H 0.9006 by
+  DFA, 0.9048 by wavelet; switch rate within 0.002%; switch-count H 0.873), the rank and variant checks pass on one
+  window in 64 (s_hat 1.00003, and 1.00007 from rank 100; variant share 0.78120), 0.7 GiB kept for training. Each
+  raised run builds its train stream inside a lock in `results/p6_small_raised/` (one build at a time across the five
+  jobs), checks its latent process there, drops the fGn path, then reads all 4.2 million windows for the rank and
+  variant checks (about 21 CPU min): about 28 CPU min per run before training, outside the GPU hours the guard counts.
+  The raised timing job builds the same stream once on the server and reports its time and checks in `timing.json`.
+- The switch-count band at the new length: being calibrated (50 streams per level at H 0.5 and 0.9, the small design's
+  levels, at 4,194,304 windows; `python p6_streams.py --calibrate --lengths 4194304 --levels H0.5,H0.9 --append`), to
+  be added to `reference/p6_stream_checks.csv` in the next commit. A lean stream is checked only against a band
+  calibrated at its own length (`count_band(exact=True)`); without one its switch-count check fails instead of
+  borrowing the nearest length's band.
+
+**Switching to the raised design** (one step on the server, if the verdict is raise; it works with the waiter
+started before this existed, pid 90128, and in every later state):
+
+```bash
+git pull --ff-only     # the default path is unchanged by this pull; it may also be done before
+python p6_after_queue.py --take-over --jobs-file p6_queue_small_raised.json --check      # read-only: what it would do
+setsid nohup nice -n 10 taskset -c 0-10 python p6_after_queue.py --take-over --jobs-file p6_queue_small_raised.json \
+    > logs/p6_take_over.out 2>&1 < /dev/null &
+```
+
+`--take-over` takes `logs/.run_lane.p6switch.lock` first (a `.run_lane*` name, so p1_olmo7b keeps waiting from that
+moment), stops the running p6_after_queue.py (pid 90128 or a later one; while it waits it has started nothing) and
+any P6 queue it started (SIGTERM: run_queue.py stops its jobs, saved runs stay and are not analysed), waits until no
+p6_noah_joseph.py process is left, and then goes on as p6_after_queue.py does from step 2 with the raised jobs file:
+if the old queue still runs, it waits for its lock (the switch lock released once that request waits in the kernel;
+the queue lock keeps olmo7b waiting), otherwise it holds the queue lock at once; then the hand-over to
+`run_queue.py --jobs-file p6_queue_small_raised.json`. If P6 has already ended and olmo7b holds the GPU, the raised
+queue starts and waits for olmo7b (run_queue.py's rule). It refuses if the raised queue already runs or another
+`--take-over` runs. `kill -TERM $(cat logs/p6_after_queue.pid)` stops it, as before. Tested with stand-in processes
+against the waiter's own code (p6_after_queue.py at 6c5bf9a, taken from git) and p1_olmo7b's real lane wait.
+Restarting the waiter by hand instead (`kill -TERM $(cat logs/p6_after_queue.pid)`, then the start command with
+`--jobs-file p6_queue_small_raised.json`) also works while the old queue runs, but only `--take-over` covers a P6
+queue that has already started.
 
 **Caveats.** Synthetic streams: a link here shows that the mechanism can work in these models, not that it does in
 natural text. 14M and 31M models at 2^28 tokens may not develop the outlier features of larger, longer-trained
@@ -1395,7 +1450,7 @@ before the run.
 
 ## Unit tests
 
-`python -m pytest -q` (255 tests, about 9 min on a 4-core CPU; `-m "not slow"` skips the slowest). Synthetic data with
+`python -m pytest -q` (270 tests, 9-14 min on a 4-core CPU; `-m "not slow"` skips the slowest). Synthetic data with
 known parameters:
 
 - stable density against the Gaussian and Cauchy closed forms and against SciPy; ML fit recovers α ∈ {1.2, 1.5, 1.8},
@@ -1515,14 +1570,24 @@ known parameters:
   raise within 1 and with no new outlier channel, keep otherwise, a diverged or unfinished run undecided; seed 6
   outside both designs; the raise at the same 8,192 steps), and a smoke feasibility run that writes K, K_max and
   the outlier channels at step 0 and every stage, equal to P1's aggregation of its per-layer moments, and computes
-  nothing else;
+  nothing else; option A: `fgn_lean` against `fgn` (to 1e-12, at odd lengths too, the generator left in the same
+  state) and `dfa_lean` against `hurst_dfa` (equal), a lean stream against the same stream built as before (switch
+  positions, topics, windows and latent checks), a lean stream's switch-count check failing without a band at its
+  own length, the raised settings (only tokens and batch differ; the default untouched), the raised queue file, the
+  budget guard refusing a timing of another batch, the lean build under its lock with resume, and a raised smoke run
+  (the design's steps);
 - `p6_after_queue.py` (`tests/test_p6_after_queue.py`, stand-in processes): the P6 queue starts only after the
   running queue has released its lock, and p1_olmo7b's own lane wait (`gpu_locks.wait_for_lanes`, checking every 10
   ms) gets through only after the P6 queue has ended, while a plain wait-then-start lets it through the gap; a job
   the old queue left running (its pid file) holds both back until it ends; it refuses to start with no queue running,
   without the jobs file, next to another waiter or a P6 queue; stopped while waiting it starts nothing; `--check`
   changes no file and flags an olmo7b started from code older than 3463b1c; SIGTERM after the start stops the P6
-  queue's jobs; both queue files pass run_queue.py's `--dry-run`.
+  queue's jobs; both queue files pass run_queue.py's `--dry-run`. `--take-over`, against the waiter's own code
+  (6c5bf9a, from git) and the current one: while the waiter waits, it is replaced, the design's queue never starts
+  and the raised queue starts when the old queue ends; after the design's queue has started, its job is stopped
+  (exit 130) and the raised one runs; with nothing running it starts at once; p1_olmo7b's lane wait passes only
+  after the raised queue's job has ended in each case; it refuses without the jobs file, next to another
+  `--take-over` or the raised queue, and its `--check` changes nothing; the raised queue file passes `--dry-run`.
 
 ## Deviations, choices of ours, and items to verify
 

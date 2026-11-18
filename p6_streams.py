@@ -38,6 +38,10 @@ Calibration (2026-11-18, 50 latent processes per H and length, seeds 1000+): fGn
 0.53% of p_bar; switch-count H (biased towards 0.5 by the Poisson noise of the counts) 0.499 +- 0.008, 0.659 +-
 0.009, 0.861 +- 0.011 at H = 0.5, 0.7, 0.9 (train; held-out 0.498, 0.645, 0.845, sd 0.011-0.013): the bands of the
 three levels do not overlap
+
+Streams of more than LEAN_FROM_BLOCKS hazard blocks (the raised design of the feasibility rule, 2^33 tokens: 2^27
+blocks; added 2026-11-18) are built and checked lean (fgn_lean, dfa_lean): the same numbers in a sixth of the memory,
+and their switch-count band must be calibrated at their own length.
 """
 
 from __future__ import annotations
@@ -152,12 +156,136 @@ def fgn(n: int, H: float, rng: np.random.Generator) -> np.ndarray:
     return y[:n].real
 
 
+# ----------------------------------------------------------------------------- the same, in less memory
+# Added 2026-11-18 for the raised design of the feasibility rule (2^33 tokens per run: 2^27 hazard blocks), before
+# any P6 run. fgn and the checks above need about 200 bytes per block (26 GiB at 2^27 blocks); the functions below
+# give the same numbers (to float rounding, tests/test_p6.py) in about 32 bytes per block during the fGn and 24 during
+# the checks. Streams of more than LEAN_FROM_BLOCKS blocks use them; the design's streams (at most 4.2 million
+# blocks) never do, so nothing changes for them.
+LEAN_FROM_BLOCKS = 1 << 25
+LEAN_BLOCK = 1 << 21          # elements per block of work (32 MiB complex)
+
+
+def _split(n: int) -> tuple[int, int]:
+    """n = n1 * n2, n1 the largest divisor of n not above sqrt(n)."""
+    n1 = math.isqrt(n)
+    while n % n1:
+        n1 -= 1
+    return n1, n // n1
+
+
+def _fft_inplace(z: np.ndarray) -> tuple[int, int]:
+    """Complex DFT of z (length n) in place by the four-step method (Bailey 1990): DFTs of the columns of z as an
+    n2 x n1 matrix, twiddles, DFTs of the rows, in blocks of LEAN_BLOCK elements. Z[k] is left at
+    z[(k % n2) * n1 + k // n2]; returns (n1, n2)."""
+    n = len(z)
+    n1, n2 = _split(n)
+    M = z.reshape(n2, n1)
+    k2 = np.arange(n2, dtype=np.int64)[:, None]
+    b = max(1, LEAN_BLOCK // n2)
+    for c0 in range(0, n1, b):
+        c1 = min(n1, c0 + b)
+        blk = np.fft.fft(M[:, c0:c1], axis=0)
+        ang = ((k2 * np.arange(c0, c1, dtype=np.int64)[None, :]) % n).astype(float) * (-2.0 * math.pi / n)
+        blk *= np.cos(ang) + 1j * np.sin(ang)
+        M[:, c0:c1] = blk
+    r = max(1, LEAN_BLOCK // n1)
+    for r0 in range(0, n2, r):
+        M[r0:r0 + r] = np.fft.fft(M[r0:r0 + r], axis=1)
+    return n1, n2
+
+
+def real_dft_lean(buf: np.ndarray, upto: int, emit) -> None:
+    """DFT X of the real array buf (length m = 2n; overwritten) at k = 0 .. upto - 1 (upto <= n + 1), handed to
+    emit(k0, k1, X[k0:k1]) block by block: the complex DFT of z[j] = buf[2j] + i buf[2j+1] in place, then
+    X[k] = E[k] + exp(-2 pi i k / m) O[k] with E, O the DFTs of the even and odd entries."""
+    n = len(buf) // 2
+    z = buf.view(np.complex128)
+    n1, n2 = _fft_inplace(z)
+    for k0 in range(0, upto, LEAN_BLOCK):
+        k = np.arange(k0, min(upto, k0 + LEAN_BLOCK), dtype=np.int64)
+        a, c = k % n, (n - k) % n
+        Z1 = z[(a % n2) * n1 + a // n2]
+        Z2 = np.conj(z[(c % n2) * n1 + c // n2])
+        ang = k.astype(float) * (-math.pi / n)
+        emit(int(k[0]), int(k[-1]) + 1, 0.5 * (Z1 + Z2) - 0.5j * (np.cos(ang) + 1j * np.sin(ang)) * (Z1 - Z2))
+
+
+def fgn_lean(n: int, H: float, rng: np.random.Generator) -> np.ndarray:
+    """fgn(n, H, rng) in about 32 bytes per point: the same autocovariance, eigenvalues and random draws (in the
+    same order, so rng ends in the same state), the two real DFTs of sqrt(lam/m) a and sqrt(lam/m) b
+    (Re y = Re DFT(s a) - Im DFT(s b)) in one buffer of 2n floats."""
+    m = 2 * n
+    a = 2.0 * H
+    buf = np.empty(m)
+    buf[0] = 1.0
+    for s0 in range(1, n + 1, LEAN_BLOCK):
+        kk = np.arange(s0, min(n + 1, s0 + LEAN_BLOCK), dtype=float)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            buf[s0:s0 + len(kk)] = 0.5 * kk ** a * (np.expm1(a * np.log1p(1.0 / kk))
+                                                    + np.expm1(a * np.log1p(-1.0 / kk)))
+    buf[1] = 0.5 * (2.0 ** a - 2.0)
+    buf[n + 1:] = buf[n - 1:0:-1]
+    lam = np.empty(n + 1)                     # the circulant's eigenvalues 0 .. n (the others mirror them)
+    real_dft_lean(buf, n + 1, lambda k0, k1, X: lam.__setitem__(slice(k0, k1), X.real))
+    if lam.min() < -1e-8 * max(1.0, lam.max()):
+        raise ValueError(f"circulant embedding is not nonnegative definite (min eigenvalue {lam.min():.3g})")
+    np.clip(lam, 0, None, out=lam)
+    lam /= m
+    np.sqrt(lam, out=lam)
+    out = np.empty(n)
+    for part in (0, 1):                       # w = a + i b, a drawn first (fgn: rng.normal(size=m) twice)
+        for s0 in range(0, m, LEAN_BLOCK):
+            rng.standard_normal(out=buf[s0:min(m, s0 + LEAN_BLOCK)])
+        buf[:n + 1] *= lam
+        buf[n + 1:] *= lam[n - 1:0:-1]
+        if part == 0:
+            real_dft_lean(buf, n, lambda k0, k1, X: out.__setitem__(slice(k0, k1), X.real))
+        else:
+            real_dft_lean(buf, n, lambda k0, k1, X: out.__setitem__(slice(k0, k1), out[k0:k1] - X.imag))
+    return out
+
+
+def dfa_lean(x: np.ndarray, scales: np.ndarray, order: int = 1) -> float:
+    """hurst.hurst_dfa(x, scales, order)["H"] (DFA = MFDFA at q = 2) with the profile and the segment fits in
+    blocks: the same profile (the same sequential sums), segments, least-squares fits and means, in 16 bytes per
+    point instead of about 70."""
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    mu = x.mean()
+    prof = np.empty(n)
+    carry = 0.0
+    for s0 in range(0, n, LEAN_BLOCK):
+        t = x[s0:s0 + LEAN_BLOCK] - mu
+        t[0] += carry
+        np.cumsum(t, out=prof[s0:s0 + len(t)])
+        carry = prof[s0 + len(t) - 1]
+    scales = np.asarray(scales)
+    logF = np.empty(len(scales))
+    for j, s in enumerate(scales):
+        s = int(s)
+        ns = n // s
+        V = np.vander(np.arange(s, dtype=float), order + 1)
+        rows = max(1, LEAN_BLOCK // s)
+        F2 = []
+        for part in (prof[: ns * s].reshape(ns, s), prof[n - ns * s:].reshape(ns, s)):
+            for r0 in range(0, ns, rows):
+                seg = part[r0:r0 + rows]
+                coef, *_ = np.linalg.lstsq(V, seg.T, rcond=None)
+                F2.append(np.mean((seg.T - V @ coef) ** 2, axis=0))
+        F2 = np.concatenate(F2)
+        F2 = F2[F2 > 0]
+        logF[j] = np.log(np.mean(F2 ** (2.0 / 2))) / 2.0
+    return float(np.polyfit(np.log(scales), logF, 1)[0])
+
+
 # ----------------------------------------------------------------------------- streams
 class Stream:
     """One stream: the latent switching process is built at construction (a few seconds for 2^28 tokens); windows
     of seq_len tokens are drawn on demand, each from its own generator, so any window can be read alone."""
 
-    def __init__(self, noah: str, joseph: str, seed: int, role: str, n_windows: int, P: dict = P6):
+    def __init__(self, noah: str, joseph: str, seed: int, role: str, n_windows: int, P: dict = P6,
+                 lean: bool | None = None):
         self.noah, self.joseph, self.seed, self.role, self.P = noah, joseph, int(seed), role, P
         self.H = float(P["joseph"][joseph]["H"])
         self.L = int(P["seq_len"])
@@ -170,6 +298,11 @@ class Stream:
         blk = int(P["block"])
         self.n_blocks = -(-self.n_tokens // blk)
         rng = rng_for(seed_for(config.SEED, "p6 latent", self.seed, role))      # not the cell: common numbers
+        # lean: the same process in less memory (above LEAN_FROM_BLOCKS blocks; the raised design's train streams)
+        self.lean = self.n_blocks > LEAN_FROM_BLOCKS if lean is None else bool(lean)
+        if self.lean:
+            self._build_lean(rng, P, blk)
+            return
         self.g = fgn(self.n_blocks, self.H, rng)       # H = 0.5: i.i.d. normals, from the same draws
         e = np.exp(P["b"] * self.g)
         haz = np.minimum(P["p_max"], P["p_bar"] * e / e.mean())
@@ -185,6 +318,44 @@ class Stream:
         t0 = int(rng.integers(self.K))
         steps = rng.integers(1, self.K, size=len(self.switch_pos))
         self.seg_topic = ((t0 + np.concatenate([[0], np.cumsum(steps)])) % self.K).astype(np.int8)
+
+    def _build_lean(self, rng: np.random.Generator, P: dict, blk: int) -> None:
+        """The construction above with the same draws and arithmetic, in place where it can be: fgn_lean, the hazard
+        computed in its own array, the topic walk summed in place. The hazard path is not kept (its capped count
+        is), and release_latent() drops g once the checks have read it."""
+        self.g = fgn_lean(self.n_blocks, self.H, rng)
+        haz = np.multiply(self.g, P["b"])
+        np.exp(haz, out=haz)
+        me = haz.mean()
+        haz *= P["p_bar"]
+        haz /= me
+        np.minimum(haz, P["p_max"], out=haz)
+        self.hazard = None
+        self.hazard_capped = int((haz >= P["p_max"]).sum())
+        pos, chunk = [], 1 << 24
+        for s0 in range(0, self.n_tokens, chunk):
+            n = min(chunk, self.n_tokens - s0)
+            u = rng.random(n)
+            pt = np.repeat(haz[s0 // blk: -(-(s0 + n) // blk)], blk)[(s0 % blk):(s0 % blk) + n]
+            hit = np.flatnonzero(u < pt)
+            pos.append(hit[hit + s0 > 0] + s0)
+            del u, pt, hit
+        del haz
+        self.switch_pos = np.concatenate(pos).astype(np.int64, copy=False)
+        del pos
+        t0 = int(rng.integers(self.K))
+        steps = rng.integers(1, self.K, size=len(self.switch_pos))
+        np.cumsum(steps, out=steps)
+        steps += t0
+        steps %= self.K
+        self.seg_topic = np.empty(len(steps) + 1, dtype=np.int8)
+        self.seg_topic[0] = t0 % self.K
+        self.seg_topic[1:] = steps
+
+    def release_latent(self) -> None:
+        """Drop the fGn path (1 GiB at 2^27 blocks) once the latent checks have read it; windows need only the
+        switch positions and the topics."""
+        self.g = None
 
     # -- latent labels
     def topics(self, start: int, n: int) -> np.ndarray:
@@ -308,13 +479,17 @@ def rank_checks(counts: np.ndarray, noah: str, P: dict = P6) -> dict:
     return out
 
 
-def count_band(H: float, n_blocks: int, ref: Path = CHECK_REF, P: dict = P6) -> tuple[float, float] | None:
-    """Pass band of the switch-count H at this H and length from the calibration (nearest length, log scale)."""
+def count_band(H: float, n_blocks: int, ref: Path = CHECK_REF, P: dict = P6,
+               exact: bool = False) -> tuple[float, float] | None:
+    """Pass band of the switch-count H at this H and length from the calibration (nearest length, log scale; with
+    exact, only a calibration at this very length, else None)."""
     if not Path(ref).exists():
         return None
     import pandas as pd
     df = pd.read_csv(ref)
     df = df[np.isclose(df["H"], H)]
+    if exact:
+        df = df[df["n_blocks"] == int(n_blocks)]
     if df.empty:
         return None
     lens = df["n_blocks"].unique()
@@ -326,6 +501,8 @@ def count_band(H: float, n_blocks: int, ref: Path = CHECK_REF, P: dict = P6) -> 
 
 
 def latent_checks(stream: Stream, ref: Path = CHECK_REF) -> dict:
+    if getattr(stream, "lean", False):
+        return latent_checks_lean(stream, ref)
     ck, P = stream.P["check"], stream.P
     g = stream.g
     nb = len(g)
@@ -351,6 +528,42 @@ def latent_checks(stream: Stream, ref: Path = CHECK_REF) -> dict:
     return out
 
 
+def latent_checks_lean(stream: Stream, ref: Path = CHECK_REF) -> dict:
+    """latent_checks for a lean stream (added 2026-11-18): the same estimators and rules (dfa_lean is
+    hurst.hurst_dfa in less memory), with one difference: the switch-count band must have been calibrated at this
+    very length (count_band(exact=True)); a calibration file without that length fails the check instead of
+    borrowing the nearest length's band."""
+    ck, P = stream.P["check"], stream.P
+    if stream.g is None:
+        raise ValueError("the fGn path was released before the latent checks")
+    g = stream.g
+    nb = len(g)
+    H_g_dfa = dfa_lean(g, hurst.log_scales(nb, 10))
+    H_g_wav = hurst.hurst_wavelet(g)["H"]
+    counts = stream.switch_counts()
+    sc = hurst.log_scales(nb, int(ck["count_s_min"]))
+    H_c = dfa_lean(counts, sc)
+    del counts
+    rate = len(stream.switch_pos) / stream.n_tokens
+    band = count_band(stream.H, nb, ref, P, exact=True)
+    out = {"H_set": stream.H, "n_blocks": nb, "H_g_dfa": H_g_dfa, "H_g_wav": H_g_wav, "H_count": H_c,
+           "count_scales": f"{int(sc[0])}..{int(sc[-1])}", "switch_rate": rate,
+           "switch_rate_rel": rate / P["p_bar"], "n_switches": int(len(stream.switch_pos)),
+           "hazard_capped": int(stream.hazard_capped), "lean": True}
+    out["g_ok"] = bool(abs(H_g_dfa - stream.H) <= ck["g_tol"] and abs(H_g_wav - stream.H) <= ck["g_tol"])
+    out["rate_ok"] = bool(abs(rate / P["p_bar"] - 1) <= ck["rate_rel_tol"])
+    if band is None and not Path(ref).exists():
+        out["count_band"] = None
+        out["count_ok"] = None          # no calibration file: reported, not checked (smoke, tests)
+    elif band is None:
+        out["count_band"] = None
+        out["count_ok"] = False         # no calibration at this length
+    else:
+        out["count_band"] = [round(band[0], 4), round(band[1], 4)]
+        out["count_ok"] = bool(band[0] <= H_c <= band[1])
+    return out
+
+
 def variant_check(hit: int, n: int, P: dict = P6) -> dict:
     want = P["q"] + (1 - P["q"]) / P["K"]
     share = hit / n
@@ -358,16 +571,17 @@ def variant_check(hit: int, n: int, P: dict = P6) -> dict:
             "variant_ok": bool(abs(share - want) <= P["check"]["variant_tol"])}
 
 
-def check_stream(stream: Stream, ref: Path = CHECK_REF, every: int = 1) -> dict:
+def check_stream(stream: Stream, ref: Path = CHECK_REF, every: int = 1, latent: dict | None = None) -> dict:
     """Every check of one stream (module docstring); "ok" is False if any check that ran failed. every > 1 reads
-    one window in `every` for the rank and variant checks (tests only)."""
+    one window in `every` for the rank and variant checks (tests only). latent: latent_checks(stream, ref) run
+    earlier (a lean stream's, before its fGn path was released)."""
     t0 = time.perf_counter()
     out = {"noah": stream.noah, "joseph": stream.joseph, "seed": stream.seed, "role": stream.role,
            "n_tokens": stream.n_tokens}
     counts, hit, n = token_counts(stream, every)
     out.update(rank_checks(counts, stream.noah, stream.P))
     out.update(variant_check(hit, n, stream.P))
-    out.update(latent_checks(stream, ref))
+    out.update(latent_checks(stream, ref) if latent is None else latent)
     flags = [out["rank_ok"], out["variant_ok"], out["g_ok"], out["rate_ok"], out["count_ok"]]
     out["ok"] = bool(all(f for f in flags if f is not None))
     out["failed"] = [k for k, f in zip(("rank", "variant", "fGn H", "switch rate", "switch-count H"), flags)
@@ -385,13 +599,16 @@ def _calibration_row(job: tuple) -> dict:
             **{k: c[k] for k in ("H_g_dfa", "H_g_wav", "H_count", "switch_rate_rel")}}
 
 
-def calibrate(reps: int, lengths: list[int], out: Path, workers: int = 1, P: dict = P6, log=print):
+def calibrate(reps: int, lengths: list[int], out: Path, workers: int = 1, P: dict = P6, log=print,
+              levels: list[str] | None = None, append: bool = False):
     """The switch-count H (and the fGn H) of `reps` latent processes per H level and length (windows), at seeds
-    other than the runs' (1000 + i, role "calibration<windows>"). Writes `out` (csv) and returns it."""
+    other than the runs' (1000 + i, role "calibration<windows>"). Writes `out` (csv) and returns it. levels: the
+    Joseph levels (default all); append: keep the rows of `out` for other lengths or levels."""
     import concurrent.futures as cf
 
     import pandas as pd
-    jobs = [(nw, jl, i) for nw in lengths for jl in P["joseph"] for i in range(reps)]
+    levels = list(P["joseph"]) if levels is None else list(levels)
+    jobs = [(nw, jl, i) for nw in lengths for jl in levels for i in range(reps)]
     t0 = time.perf_counter()
     if workers > 1:
         with cf.ProcessPoolExecutor(workers) as ex:
@@ -405,6 +622,10 @@ def calibrate(reps: int, lengths: list[int], out: Path, workers: int = 1, P: dic
             f"{d.H_g_wav.std(ddof=1):.4f}, rate {d.switch_rate_rel.mean():.4f} +- {d.switch_rate_rel.std(ddof=1):.4f}")
     log(f"{len(jobs)} streams in {time.perf_counter() - t0:.0f} s")
     out.parent.mkdir(parents=True, exist_ok=True)
+    if append and out.exists():
+        old = pd.read_csv(out)
+        keep = ~old.set_index(["n_windows", "joseph"]).index.isin(df.set_index(["n_windows", "joseph"]).index)
+        df = pd.concat([old[keep], df], ignore_index=True)
     df.to_csv(out, index=False)
     return df
 
@@ -415,10 +636,13 @@ def main(argv=None) -> int:
     ap.add_argument("--reps", type=int, default=50)
     ap.add_argument("--lengths", default="131072,16384", help="stream lengths in windows (train, heldout)")
     ap.add_argument("--workers", type=int, default=1)
+    ap.add_argument("--levels", default=None, help="Joseph levels to calibrate (default all), e.g. H0.5,H0.9")
+    ap.add_argument("--append", action="store_true", help="keep the rows of --out for other lengths and levels")
     ap.add_argument("--out", default=str(CHECK_REF))
     args = ap.parse_args(argv)
     if args.calibrate:
-        calibrate(args.reps, [int(x) for x in args.lengths.split(",")], Path(args.out), args.workers)
+        calibrate(args.reps, [int(x) for x in args.lengths.split(",")], Path(args.out), args.workers,
+                  levels=args.levels.split(",") if args.levels else None, append=args.append)
     return 0
 
 
