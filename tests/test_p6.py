@@ -340,3 +340,52 @@ def test_budget_picks_the_seeds_from_the_timing(tmp_path):
     # the full design needs the 31M timing too (or scales it from 14M)
     a.budget_hours = 1000.0
     assert p6.budget_seeds(a, p6.DESIGNS["full"]) == [1, 2, 3, 4, 5]
+
+
+# ----------------------------------------------------------------------------- feasibility check (2026-11-18)
+def test_feasibility_rule():
+    import p6_noah_joseph as p6
+    v = p6.feasibility_verdict
+
+    def rows(k0, km0, n0, k1, km1, n1):
+        return [{"stage": 0.0, "K": k0, "K_max": km0, "n_outlier_channels": n0},
+                {"stage": 0.5, "K": 50.0, "K_max": 90.0, "n_outlier_channels": 9},     # only the final stage counts
+                {"stage": 1.0, "K": k1, "K_max": km1, "n_outlier_channels": n1}]
+    assert v(rows(0.1, 0.3, 0, 0.6, 1.2, 0))["verdict"] == "raise"           # within 1 of step 0, no channel
+    assert v(rows(0.1, 0.3, 0, -0.9, -0.1, 0))["verdict"] == "raise"         # a drop is not a rise
+    assert v(rows(0.1, 0.3, 0, 0.1, 0.3, 1))["verdict"] == "keep"            # one outlier channel
+    assert v(rows(0.1, 0.3, 0, 1.2, 0.3, 0))["verdict"] == "keep"            # K up by more than 1
+    r = v(rows(0.1, 0.3, 0, 0.5, 1.4, 0))
+    assert r["verdict"] == "keep" and "K_max" in r["reason"]
+    assert v(rows(0.1, 0.3, 2, 0.1, 0.3, 2))["verdict"] == "raise"           # no more channels than at step 0
+    assert v(rows(0, 0, 0, 0, 0, 0), diverged=True)["verdict"] == "diverged"
+    assert v(rows(0, 0, 0, 0, 0, 0)[:2])["verdict"] == "incomplete"
+    assert p6.FEASIBILITY["seed"] not in p6.DESIGNS["small"]["seeds"] + p6.DESIGNS["full"]["seeds"]
+    assert p6.FEASIBILITY["cell"] == ("zipf1.0", "H0.9")
+    r = p6.FEASIBILITY["raise"]
+    st = p6.settings(False, p6.DESIGNS["small"])
+    assert r["tokens"] // (r["batch_seqs"] * st["stream"]["seq_len"]) == p6.steps_of(st) == 8192
+
+
+def test_feasibility_run_measures_only_k_and_outliers(tmp_path):
+    import subprocess
+    import sys
+    out = tmp_path / "feas"
+    r = subprocess.run([sys.executable, str(ROOT / "p6_noah_joseph.py"), "--smoke", "--feasibility", "--device", "cpu",
+                        "--micro-batch", "2", "--eval-batch", "1", "--hvp-batch", "4", "--out", str(out)],
+                       capture_output=True, text=True, timeout=600, cwd=ROOT)
+    assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
+    df = pd.read_csv(out / "feasibility.csv")
+    assert list(df.columns) == ["stage", "step", "tokens", "K", "K_max", "n_outlier_channels"]
+    assert list(df["stage"]) == [0.0, 0.5, 1.0] and df["step"].iloc[0] == 0
+    lay = pd.read_csv(out / "feasibility_layers.csv")
+    assert set(lay.columns) == {"stage", "step", "layer", "K", "n_outlier_channels"}
+    j = json.loads((out / "feasibility.json").read_text())
+    assert j["verdict"] in ("keep", "raise") and j["cell"] == "tiny_zipf1.0_H0.9_s6"
+    run = out / "runs" / "tiny_zipf1.0_H0.9_s6"
+    # no other measurement: no samples, no CPU statistics, no H_link
+    assert not list(run.rglob("samples")) and not list(run.rglob("stats")) and not (run / "hlink").exists()
+    # K and the outlier count agree with P1's aggregation of the same moments (median, max, sum over layers)
+    fin = lay[lay["stage"] == 1.0]
+    assert df["K"].iloc[-1] == pytest.approx(np.median(fin["K"])) and df["K_max"].iloc[-1] == pytest.approx(fin["K"].max())
+    assert df["n_outlier_channels"].iloc[-1] == fin["n_outlier_channels"].sum()

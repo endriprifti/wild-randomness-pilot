@@ -621,6 +621,13 @@ python p6_noah_joseph.py --timing --size 14m --steps 300 --micro-batch 2 --loss-
     --jvp-batch 8 --hvp-batch 4 --out results/p6_timing_laptop
 python p6_noah_joseph.py --memory --sizes 14m --micro-batch 2 --loss-chunk 1024 --eval-batch 1 --jvp-batch 8 \
     --hvp-batch 4                                  # GPU memory of each step with these flags (meta device, seconds)
+# laptop, before P6 starts: the feasibility check (fixed 2026-11-18, see "Feasibility check before P6" below): one
+# full-length run (8,192 steps, 2^28 tokens) of Zipf 1.0 x H 0.9 at 14M, seed 6, measured only by K, K_max and the
+# outlier channels at step 0 and the four stages; prints the table and the rule's verdict. About 2-4 h (the L40S
+# prior is 15 min of training; the laptop is 6-15x slower); progress every 500 steps; run it again to go on from
+# the last stage reached. --hvp-batch is accepted and unused here (no Hessian direction is computed)
+python p6_noah_joseph.py --feasibility --micro-batch 2 --loss-chunk 1024 --eval-batch 1 --hvp-batch 4 \
+    --out results/p6_feasibility
 # the L40S: p6_after_queue.py waits until the running run_queue.py has ended (with every job it started), then
 # runs the small design through run_queue.py (timing job first, then the runs with the budget guard, then the
 # analysis) before run_all.sh's p1_olmo7b, which keeps waiting until P6 has ended (see "Starting P6 before
@@ -674,9 +681,52 @@ the P6 queue (saved runs stay; starting `run_queue.py --jobs-file p6_queue_small
 the old queue while this waits, stop this first: it takes the queue lock the moment the old queue stops, and the
 restarted queue would refuse to start.
 
+**Feasibility check before P6** (`p6_noah_joseph.py --feasibility`; fixed 2026-11-18 before any P6 run, a
+feasibility check and not a test). In P1, Pythia's outlier channels are absent at step 1,000 (about 2B tokens) and
+present at step 4,000 (about 8B) at every size; a P6 run sees 2^28 tokens (0.27B) in 8,192 steps. If outlier
+features need tokens seen rather than steps, the Joseph → Noah tests may have nothing to act on. The check trains
+one full-length P6 run of one cell, Zipf 1.0 × H 0.9 (both factors at their high level, the cell most likely to
+grow outliers), at 14M with seed 6, outside the design's seeds 1-5, so no run of the design is seen. It measures
+only P1's activation statistics on P1's probe set (`spectra.activation_moments` on each layer's output), at step 0
+and at the four stages (1, 10, 50, 100%): K (median over layers of the excess kurtosis), K_max (its largest value
+over layers) and the outlier channels (channels with |activation| > 6 anywhere on the probe set, summed over
+layers). Nothing else is computed: one cell gives no contrast of P6's family, and no alpha, H7.1, H_tok or H_link
+is measured. Outputs: `feasibility.csv` (stage, step, tokens, K, K_max, n_outlier_channels),
+`feasibility_layers.csv`, `feasibility.json` (with the verdict).
+
+Rule (`feasibility_verdict`, fixed now). If at 100% of training there are no more outlier channels than at step 0
+and neither K nor K_max is more than 1 above its step-0 value, K and the outlier channels have stayed at their
+initial level: **raise** the token budget before P6 starts. Otherwise **keep** the design as it stands. A diverged
+or unfinished run decides nothing: the check is repeated before P6 starts.
+
+The raise: 2^33 tokens per run (×32, 8.6B, Pythia's token count at step 4,000, where every size had outlier
+channels), by the batch: 512 × 2,048 tokens per step at the same 8,192 steps, stages, warm-up and learning rate.
+P6 already takes twice Pythia's 4,000 steps, so this adds tokens and not steps, which is what the check asks about;
+1e-3 is Pythia's rate for its small models at a batch of 2M tokens. No smaller raise is offered: Pythia had no
+outlier channels at 2B tokens (×8), and every raise that fits 12 h (×3 at most, 0.8B tokens) stays below that.
+Cost of the small design (L40S prior from FLOPs and bytes, as in the table above; training grows with the tokens,
+the measurements do not):
+
+| tokens per run | training per run | 3 seeds (12 runs) | 5 seeds (20 runs) | the 12-h guard runs |
+|---|---|---|---|---|
+| 2^28, as designed | 15 min | 5.3 h | 8.8 h ($6) | 5 seeds |
+| 2^29 (×2) | 28 min | 7.9 h | 13.1 h | 4 seeds |
+| 3 × 2^28 (×3) | 41 min | 10.5 h | 17.5 h | 3 seeds |
+| 2^30 (×4) | 54 min | 13.1 h | 21.8 h | nothing |
+| 2^33 (×32, the raise) | 7.0 h | 85.9 h ($59) | 143.1 h ($99) | nothing |
+
+The raise costs 7-12 times the 12-h budget: with it the small design's budget becomes 90 h (3 seeds) or 145 h (5
+seeds), set before P6 starts and acted on through the timing only, as now. It is a code change made and tested
+before P6 starts: TRAIN's tokens and batch_seqs, the switch-count band calibrated at the new length (`python
+p6_streams.py --calibrate`; the bands are per length) and the stream construction checked at 2^33 tokens, and the
+queue files' `--budget-hours`. Pushed without a new budget, the raise makes every queued P6 job start nothing (the
+guard), and p1_olmo7b follows the old queue. If P6 has already started when the check says raise, the P6 queue is
+stopped and its runs are not analysed.
+
 **Caveats.** Synthetic streams: a link here shows that the mechanism can work in these models, not that it does in
 natural text. 14M and 31M models at 2^28 tokens may not develop the outlier features of larger, longer-trained
-models (then the Joseph → Noah tests have little to act on; the K and alpha ranges are reported). Five seeds per
+models (then the Joseph → Noah tests have little to act on: the feasibility check above decides, before P6 starts,
+whether the tokens are raised; the K and alpha ranges are reported). Five seeds per
 cell detect only effects of about 3-4 residual standard deviations after Holm (the MDE column says how large).
 The L40S hours are a prior until the timing job has run.
 
@@ -1345,7 +1395,7 @@ before the run.
 
 ## Unit tests
 
-`python -m pytest -q` (253 tests, about 8 min on a 4-core CPU; `-m "not slow"` skips the slowest). Synthetic data with
+`python -m pytest -q` (255 tests, about 9 min on a 4-core CPU; `-m "not slow"` skips the slowest). Synthetic data with
 known parameters:
 
 - stable density against the Gaussian and Cauchy closed forms and against SciPy; ML fit recovers α ∈ {1.2, 1.5, 1.8},
@@ -1461,7 +1511,11 @@ known parameters:
   permutation test on a planted effect and on none, the family's readings (as predicted, opposite to the prediction,
   dilution, no link), a missing outcome kept in the Holm family, both queue files and the budget guard's seed choice;
   the Hessian direction from micro-batches against P1's function, and each queue job's GPU figure against the job's
-  peak (`--memory`), the laptop flags under 2.5 GiB;
+  peak (`--memory`), the laptop flags under 2.5 GiB; the feasibility rule (only the final stage against step 0;
+  raise within 1 and with no new outlier channel, keep otherwise, a diverged or unfinished run undecided; seed 6
+  outside both designs; the raise at the same 8,192 steps), and a smoke feasibility run that writes K, K_max and
+  the outlier channels at step 0 and every stage, equal to P1's aggregation of its per-layer moments, and computes
+  nothing else;
 - `p6_after_queue.py` (`tests/test_p6_after_queue.py`, stand-in processes): the P6 queue starts only after the
   running queue has released its lock, and p1_olmo7b's own lane wait (`gpu_locks.wait_for_lanes`, checking every 10
   ms) gets through only after the P6 queue has ended, while a plain wait-then-start lets it through the gap; a job

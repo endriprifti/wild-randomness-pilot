@@ -449,8 +449,10 @@ def stream_checks(run_dir: Path, streams: dict, enforce: bool, prog) -> dict:
     return out
 
 
-def train_run(c: dict, st: dict, args, run, pool: P6Pool, prog: Progress) -> dict:
-    """Train one run with its measurements at every stage; resumable from the last stage reached."""
+def train_run(c: dict, st: dict, args, run, pool: P6Pool | None, prog: Progress, measure=None) -> dict:
+    """Train one run with its measurements at every stage; resumable from the last stage reached. measure: None for
+    P6's measurements (gpu_pass, its CPU tasks in `pool`); the feasibility check passes outlier_pass instead, which
+    also measures step 0 (the training is the same)."""
     tr, P = st["train"], st["stream"]
     rd = Path(c["dir"])
     rd.mkdir(parents=True, exist_ok=True)
@@ -490,6 +492,10 @@ def train_run(c: dict, st: dict, args, run, pool: P6Pool, prog: Progress) -> dic
     loader = cf.ThreadPoolExecutor(1)
     fetch = lambda i: torch.as_tensor(train.windows(order[i * B:(i + 1) * B]), dtype=torch.long)   # noqa: E731
     nxt = loader.submit(fetch, start) if start < n_steps else None
+    if measure is not None and start == 0:
+        ck0 = {**c, "key": f"{c['key']}/stage0", "stage": 0.0, "step": 0, "dir": rd / "checkpoints" / "stage0"}
+        if not (ck0["dir"] / "row.json").exists():
+            measure(model, ck0, sets, dev)
     diverged = False
     loss0 = losses[0] if losses else None
     proj_gpu: list = []
@@ -527,8 +533,11 @@ def train_run(c: dict, st: dict, args, run, pool: P6Pool, prog: Progress) -> dic
                       "dir": rd / "checkpoints" / f"stage{stage:g}"}
                 if (ck["dir"] / "row.json").exists():
                     continue
-                rec = gpu_pass(model, ck, sets, st, dev, prog, eb=args.eval_batch, jb=args.jvp_batch,
-                               hb=args.hvp_batch)
+                if measure is None:
+                    rec = gpu_pass(model, ck, sets, st, dev, prog, eb=args.eval_batch, jb=args.jvp_batch,
+                                   hb=args.hvp_batch)
+                else:
+                    rec = measure(model, ck, sets, dev)
                 for t in rec["tasks"]:
                     pool.submit(t)
                 torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(),
@@ -542,7 +551,7 @@ def train_run(c: dict, st: dict, args, run, pool: P6Pool, prog: Progress) -> dic
     hg = np.asarray(proj, dtype=np.float64)
     p1_tasks.atomic_npy(rd / "hgrad.npy", hg)
     pd.DataFrame({"step": np.arange(1, len(losses) + 1), "loss": losses}).to_csv(rd / "train_log.csv", index=False)
-    if not diverged and len(hg) > warm + 50:
+    if pool is not None and not diverged and len(hg) > warm + 50:
         unit = {"source": "p4", "folder": c["run"], "key": f"{c['run']}/hgrad", "path": str(rd / "hgrad.npy"),
                 "stamp": "", "warm": warm, "tag": c["key"], "group": c["size"]}
         pool.submit({"name": "hlink_grad", "kind": "hlink", "key": c["key"], "dir": str(rd / "hlink"),
@@ -885,6 +894,109 @@ def print_memory(args, st: dict) -> None:
         print(f"  measuring, largest step + state: {r['measure']:.2f}; job peak {max(r['train'], r['measure']):.2f}")
 
 
+# ----------------------------------------------------------------------------- feasibility check (2026-11-18)
+# Fixed 2026-11-18 before any P6 run; a feasibility check, not a test (one cell: no contrast between cells exists).
+# In P1, Pythia's outlier channels are absent at step 1,000 (~2B tokens) and present at step 4,000 (~8B) at every
+# size; P6 trains on 2^28 tokens (0.27B) in 8,192 steps. One full-length P6 run of one cell, measured only by P1's
+# activation moments on the probe set at step 0 and the four stages, decides whether the token budget is raised.
+FEASIBILITY = {
+    "cell": ("zipf1.0", "H0.9"),     # both factors on: the cell most likely to grow outliers (Zipf 1.0 the heavier)
+    "seed": 6,                       # outside the design's seeds 1-5: no run of the P6 sets is seen before P6
+    "k_tol": 1.0,                    # K and K_max "at their initial level": at most 1 (excess kurtosis) above step 0
+    "raise": {"tokens": 2 ** 33, "batch_seqs": 512},   # if they stay: x32 tokens (Pythia's step-4,000 count) by the
+                                                       # batch, at the same 8,192 steps, stages and learning rate
+}
+
+
+def outlier_pass(model, ck: dict, sets: dict, dev: str, eb: int = 4) -> dict:
+    """The feasibility check's measurement, and nothing else: gpu_pass's activation moments on the probe set
+    (spectra.activation_moments on each layer's output, P1's definitions): K = median over layers of the excess
+    kurtosis, K_max = its largest value, outlier channels = channels with |activation| > 6 anywhere on the probe set,
+    summed over layers (p1_tasks.assemble)."""
+    d = Path(ck["dir"])
+    d.mkdir(parents=True, exist_ok=True)
+    t = time.perf_counter()
+    was_training = model.training
+    model.eval()
+    set_attention(model, "eager")
+    hs = lm.hidden_states(model, sets["probe"], dev, batch=eb)
+    moments = []
+    for H in hs:
+        Hd = H.to(dev)
+        moments.append(spectra.activation_moments(Hd))
+        del Hd
+    del hs
+    set_attention(model, "sdpa")
+    model.train(was_training)
+    layers = [{"layer": i, "K": m["K"], "n_outlier_channels": int(m["n_outlier_channels"])}
+              for i, m in enumerate(moments)]
+    row = {"stage": float(ck["stage"]), "step": int(ck["step"]),
+           "K": float(np.median([m["K"] for m in moments])), "K_max": float(np.max([m["K"] for m in moments])),
+           "n_outlier_channels": int(np.sum([m["n_outlier_channels"] for m in moments])),
+           "gpu_pass_seconds": round(time.perf_counter() - t, 1)}
+    rec = {"row": row, "layers": layers, "tasks": []}
+    p1_tasks.atomic_json(d / "row.json", rec)
+    return rec
+
+
+def feasibility_verdict(rows: list[dict], diverged: bool = False, k_tol: float = FEASIBILITY["k_tol"]) -> dict:
+    """The rule fixed on 2026-11-18. rows: step 0 and the stages. 'raise' if at the final stage there are no more
+    outlier channels than at step 0 and neither K nor K_max is more than k_tol above its step-0 value (they stay at
+    their initial level); otherwise 'keep'."""
+    by = {float(r["stage"]): r for r in rows}
+    if diverged:
+        return {"verdict": "diverged", "reason": "the run diverged: the check gives no answer"}
+    if 0.0 not in by or 1.0 not in by:
+        return {"verdict": "incomplete", "reason": f"stages measured: {sorted(by)}"}
+    a, b = by[0.0], by[1.0]
+    up = {"outlier channels": b["n_outlier_channels"] > a["n_outlier_channels"],
+          "K": b["K"] > a["K"] + k_tol, "K_max": b["K_max"] > a["K_max"] + k_tol}
+    if any(up.values()):
+        return {"verdict": "keep", "reason": "above the initial level at the final stage: "
+                + ", ".join(k for k, v in up.items() if v)}
+    return {"verdict": "raise", "reason": f"K, K_max and outlier channels at their initial level at the final stage "
+            f"(within {k_tol:g} of step 0, no new outlier channel)"}
+
+
+def feasibility(args, run, st: dict, prog) -> dict:
+    noah, joseph = args.noah, args.joseph          # the defaults are FEASIBILITY["cell"]
+    size = args.size or ("tiny" if st["smoke"] else "14m")
+    seed = int(FEASIBILITY["seed"])
+    key = run_key(size, noah, joseph, seed)
+    c = {"key": key, "run": key, "size": size, "noah": noah, "joseph": joseph, "seed": seed,
+         "dir": run.out_dir / "runs" / key}
+    prog.say(f"feasibility check: one full-length run of {key} ({steps_of(st)} steps of "
+             f"{st['train']['batch_seqs']} x {st['stream']['seq_len']} tokens), measured only by K, K_max and "
+             f"outlier channels at step 0 and the stages {st['train']['stages']}")
+    res = train_run(c, st, args, run, None, prog,
+                    measure=lambda model, ck, sets, dev: outlier_pass(model, ck, sets, dev, eb=args.eval_batch))
+    B, L = int(st["train"]["batch_seqs"]), int(st["stream"]["seq_len"])
+    rows, layer_rows = [], []
+    for f in sorted((Path(c["dir"]) / "checkpoints").glob("stage*/row.json")):
+        rec = p6_stats.json_load(f)
+        r = {**rec["row"], "tokens": rec["row"]["step"] * B * L}
+        rows.append(r)
+        layer_rows += [{"stage": r["stage"], "step": r["step"], **x} for x in rec["layers"]]
+    rows.sort(key=lambda r: r["stage"])
+    cols = ["stage", "step", "tokens", "K", "K_max", "n_outlier_channels"]
+    df = pd.DataFrame(rows)[cols]
+    df.to_csv(run.out_dir / "feasibility.csv", index=False)
+    pd.DataFrame(layer_rows).sort_values(["stage", "layer"]).to_csv(run.out_dir / "feasibility_layers.csv",
+                                                                     index=False)
+    v = feasibility_verdict(rows, res["diverged"])
+    out = {"cell": key, "rule": {k: FEASIBILITY[k] for k in ("k_tol", "raise")}, **v,
+           "stages": df.to_dict(orient="records"), "train_hours": res["train_hours"]}
+    p1_tasks.atomic_json(run.out_dir / "feasibility.json", out)
+    print(f"\nP6 feasibility check, {key} ({res['train_hours']:.2f} h on {gpu_name(run.device)}):")
+    print(df.to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+    print(f"rule (fixed 2026-11-18): {v['verdict'].upper()}: {v['reason']}")
+    if v["verdict"] == "raise":
+        r = FEASIBILITY["raise"]
+        print(f"  -> before P6 starts: {r['tokens']:,} tokens ({r['tokens'] / st['train']['tokens']:.0f}x), batch "
+              f"{r['batch_seqs']} sequences at the same {steps_of(st)} steps (README, 'Feasibility check')")
+    return out
+
+
 MIN_SEEDS = 3
 
 
@@ -971,6 +1083,9 @@ def main(argv=None) -> int:
     ap.add_argument("--hvp-batch", type=int, default=None, help="sequences per micro-batch of the Hessian-vector "
                                                                  "products of H7.1's Hessian direction (default 16; "
                                                                  "the same H v)")
+    ap.add_argument("--feasibility", action="store_true", help="the feasibility check (2026-11-18): one full-length "
+                                                                "run of Zipf 1.0 x H 0.9, seed 6, measured only by K, "
+                                                                "K_max and outlier channels; prints the rule's verdict")
     ap.add_argument("--memory", action="store_true", help="GPU memory of each step on the meta device (no GPU); "
                                                            "with the batch flags given")
     ap.add_argument("--workers", type=int, default=2, help="CPU pool processes")
@@ -1006,6 +1121,10 @@ def main(argv=None) -> int:
     if args.timing:
         timing(args, run, st, prog)
         runtime.finish_run(run)
+        return 0
+    if args.feasibility:
+        out = feasibility(args, run, st, prog)
+        runtime.finish_run(run, extra={"verdict": out["verdict"]})
         return 0
     if args.analyse:
         if not args.from_dir:
