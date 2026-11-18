@@ -746,13 +746,23 @@ the design's (micro-batches of 16 sequences, the gradient accumulated over 32 of
   window in 64 (s_hat 1.00003, and 1.00007 from rank 100; variant share 0.78120), 0.7 GiB kept for training. Each
   raised run builds its train stream inside a lock in `results/p6_small_raised/` (one build at a time across the five
   jobs), checks its latent process there, drops the fGn path, then reads all 4.2 million windows for the rank and
-  variant checks (about 21 CPU min): about 28 CPU min per run before training, outside the GPU hours the guard counts.
+  variant checks (about 20 CPU min): about 26 CPU min per run before training, outside the GPU hours the guard counts.
   The raised timing job builds the same stream once on the server and reports its time and checks in `timing.json`.
-- The switch-count band at the new length: being calibrated (50 streams per level at H 0.5 and 0.9, the small design's
-  levels, at 4,194,304 windows; `python p6_streams.py --calibrate --lengths 4194304 --levels H0.5,H0.9 --append`), to
-  be added to `reference/p6_stream_checks.csv` in the next commit. A lean stream is checked only against a band
-  calibrated at its own length (`count_band(exact=True)`); without one its switch-count check fails instead of
-  borrowing the nearest length's band.
+- The switch-count band at the new length (calibrated 2026-11-18, before the feasibility check ran): 50 streams per
+  level at H 0.5 and 0.9, the small design's levels, at 4,194,304 windows (2^27 blocks), seeds 1000+ (`python
+  p6_streams.py --calibrate --lengths 4194304 --levels H0.5,H0.9 --append`; run here through the same
+  `_calibration_row` in a resumable driver, 100 streams in 5.9 h on two cores). Switch-count H 0.4993 ± 0.0045 at H
+  0.5 and 0.8749 ± 0.0062 at H 0.9: bands [0.469, 0.529] and [0.844, 0.906] (the 0.03 floor; 5 sd at H 0.9), far
+  apart. fGn H by DFA 0.5005 ± 0.0033 and 0.9004 ± 0.0045, by wavelet 0.5000 and 0.9046 (every stream within 0.011 of
+  H; the check allows 0.04); switch rate within 0.031% of p_bar. Added to `reference/p6_stream_checks.csv` (100 rows;
+  the design's 300 rows and its bands are unchanged). H 0.7 is not calibrated at this length: only the full design
+  uses it, and the full design is not raised. A lean stream is checked only against a band calibrated at its own
+  length (`count_band(exact=True)`); without one its switch-count check fails instead of borrowing the nearest
+  length's band. End to end, as a raised run checks them (every window; `check_stream`): the design's train streams
+  Zipf 1.0 × H 0.9 and light × H 0.5 of seed 1 at 2^33 tokens pass every check (s_hat 1.000001, and 0.999997 from rank
+  100; tau within 0.0004%; variant share 0.78125 and 0.78126; switch-count H 0.873 and 0.503 inside their bands;
+  switch rate within 0.02%), in 26 CPU min each (build 186 s, latent checks about 210 s, the window pass 20 min) at
+  4.3 GiB peak.
 
 **Switching to the raised design** (one step on the server, if the verdict is raise; it works with the waiter
 started before this existed, pid 90128, and in every later state):

@@ -115,8 +115,12 @@ def test_count_band_reads_the_calibration(tmp_path):
 def test_shipped_calibration_covers_both_lengths_and_levels():
     df = pd.read_csv(ps.CHECK_REF)
     assert set(np.round(df["H"], 2)) == {0.5, 0.7, 0.9}
-    assert set(df["n_windows"]) == {131072, ps.P6["heldout_windows"]}
+    assert set(df["n_windows"]) == {131072, ps.P6["heldout_windows"], 4194304}       # 2^33 tokens: option A
+    assert set(np.round(df[df["n_windows"] == 4194304]["H"], 2)) == {0.5, 0.9}          # the small design's levels
     assert (df.groupby(["H", "n_windows"]).size() >= 50).all()
+    nb = 2 ** 33 // ps.P6["block"]
+    b5, b9 = ps.count_band(0.5, nb, exact=True), ps.count_band(0.9, nb, exact=True)
+    assert b5[1] < b9[0] and ps.count_band(0.7, nb, exact=True) is None
     # the fGn H check holds with room in every calibrated stream
     assert (np.abs(df["H_g_dfa"] - df["H"]) <= ps.P6["check"]["g_tol"]).mean() > 0.99
     assert (np.abs(df["H_g_wav"] - df["H"]) <= ps.P6["check"]["g_tol"]).mean() > 0.99

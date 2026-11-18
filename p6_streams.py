@@ -41,7 +41,9 @@ three levels do not overlap
 
 Streams of more than LEAN_FROM_BLOCKS hazard blocks (the raised design of the feasibility rule, 2^33 tokens: 2^27
 blocks; added 2026-11-18) are built and checked lean (fgn_lean, dfa_lean): the same numbers in a sixth of the memory,
-and their switch-count band must be calibrated at their own length.
+and their switch-count band must be calibrated at their own length. Calibration at 2^27 blocks (2026-11-18, 50 latent
+processes per level at H = 0.5 and 0.9, the small design's levels): switch-count H 0.4993 +- 0.0045 and 0.8749 +-
+0.0062, fGn H by DFA within 0.011 and by wavelet within 0.005 of H, switch rate within 0.031% of p_bar.
 """
 
 from __future__ import annotations
