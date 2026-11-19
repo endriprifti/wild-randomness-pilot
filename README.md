@@ -727,6 +727,23 @@ to 5 seeds from the measured timing, as designed (3 at the prior's 28.6 h per se
 If the verdict is keep, nothing changes: `p6_queue_small.json` runs as it stands. At 90 L40S hours the raised design
 holds the GPU for about four days before p1_olmo7b.
 
+**Verdict (2026-11-19): keep.** The check ran on the laptop (RTX 2050, 3.41 h, status ok):
+
+| stage | step | tokens | K | K_max | outlier channels |
+|---|---|---|---|---|---|
+| 0 | 0 | 0 | 0.011 | 0.025 | 0 |
+| 0.01 | 82 | 2,686,976 | -0.252 | 0.537 | 0 |
+| 0.1 | 819 | 26,836,992 | 4.464 | 5.240 | 213 |
+| 0.5 | 4,096 | 134,217,728 | 15.928 | 17.982 | 144 |
+| 1 | 8,192 | 268,435,456 | 9.128 | 11.915 | 150 |
+
+At 100% of training there are 150 outlier channels against none at step 0, and K and K_max are 9.1 and 11.9 above
+their step-0 values (the rule allows 1), so the rule says keep. The design is kept at 2^28 tokens per run; the raised
+version (option A: `--raised`, `p6_queue_small_raised.json` and the `--take-over` switch below) is not used. P6
+starts on `p6_queue_small.json` through the waiter already running on the server (pid 90128), as it stands. As a
+description only, not a test: the outlier channels appeared by step 819 (about 2.7 × 10^7 tokens; there were none at
+step 82), far fewer tokens than in Pythia (absent at about 2 × 10^9 tokens and present at about 8 × 10^9, above).
+
 **The raised design, prepared and tested before the check ran (not the default).** `p6_noah_joseph.py --raised`
 sets 512 × 2,048 tokens per step (`RAISED_TRAIN`, also the rule's `FEASIBILITY["raise"]`); steps, stages, warm-up,
 learning rate, model, streams, measurements and tests are the design's. `p6_queue_small_raised.json` is
