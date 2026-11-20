@@ -51,6 +51,15 @@ common/h71_verdict.py (verdict, verdict_reason; it replaces the slope-only readi
 again from its saved samples (the old ones move to stats/consecutive/), the rest is kept. p1_recompute.py does the
 same into another folder, without the GPU, for a job that is still running with the earlier code.
 
+Checkpoints missing on the Hub (2026-11-20): a checkpoint whose pinned commit has no config.json or no weights file
+(EleutherAI/pythia-410m-seed9 at step40000, commit db4323e5, holds only .gitattributes, special_tokens_map.json and
+tokenizer_config.json) cannot be measured. When its load fails, the commit's file list (Hub API, no download) is read:
+without config.json or without a weights file the checkpoint is skipped with a run note "missing on the Hub", adds no
+row, and is listed in run.json under results.missing_on_hub ([{repo, rev, commit, files}]). Its folder keeps
+missing_on_hub.json, so a resume skips it again without a Hub call (a commit's files never change) and goes on with
+the next checkpoint. Any other load failure stops the job, as before. In the loss-spike check a missing seed simply
+leaves its two adjoining intervals with one seed fewer (others_n).
+
 Outputs (results/p1_checkpoints/[smoke/]): checkpoints.csv, esd_layers.csv, activations_layers.csv,
 h71_per_B.csv, h71_summary.csv, scaling.csv, seed_variance.csv, spike_check.csv, coupling_pairs.csv,
 coupling.json, timings.csv, checkpoints/ (per checkpoint: samples/, stats/, row.json, result.json), run.json;
@@ -299,6 +308,80 @@ def directions(model, ids_hess, device, n_random, n_hessian, seed):
 
 
 noise_quantities = p1_tasks.noise_quantities   # moved to common/p1_tasks.py (runs in the pool)
+
+
+# ----------------------------------------------------------------------------- checkpoints missing on the Hub
+MISSING_FILE = "missing_on_hub.json"
+
+
+class MissingOnHub(Exception):
+    """The pinned commit of a checkpoint has no config.json or no weights file, so it cannot be loaded (2026-11-20:
+    EleutherAI/pythia-410m-seed9@step40000, commit db4323e5, holds tokenizer files only). P1 skips such a checkpoint."""
+
+    def __init__(self, info: dict):
+        super().__init__(f"{info['repo']}@{info['rev']} ({info['commit']}) has no {' and no '.join(info['lacks'])}")
+        self.info = info
+
+
+def is_weights_file(name: str) -> bool:
+    """A top-level file from_pretrained reads weights from: *.safetensors or pytorch_model*.bin (shards included)."""
+    return "/" not in name and (name.endswith(".safetensors")
+                                or (name.startswith("pytorch_model") and name.endswith(".bin")))
+
+
+def lacking(files) -> list[str]:
+    """What a commit's file list lacks for loading a model: 'config.json' and/or 'weights file' ([] if neither)."""
+    files = list(files)
+    out = [] if "config.json" in files else ["config.json"]
+    if not any(is_weights_file(f) for f in files):
+        out.append("weights file")
+    return out
+
+
+def hub_files(repo: str, commit: str, run=None) -> list[str]:
+    """Every file at one commit of a model repository (Hub API; nothing is downloaded)."""
+    from huggingface_hub import HfApi
+    return sorted(hf.hub_retry(lambda: HfApi().list_repo_files(repo, revision=commit), run,
+                               f"file list of {repo}@{commit[:10]}"))
+
+
+def load_checkpoint(repo: str, rev: str, run, load, list_files, **kw):
+    """load(repo, rev, run, **kw) (hf.load_causal_lm). If the load fails, the file list of the pinned commit decides:
+    without config.json or without a weights file it raises MissingOnHub (the checkpoint is skipped). In every other
+    case (both files there, no pinned commit, or no file list from the Hub) the load's own error is raised and stops
+    the job, as before 2026-11-20."""
+    try:
+        return load(repo, rev, run, **kw)
+    except Exception as e:
+        commit = (hf.PINS.entry(repo, rev) or {}).get("commit")
+        if not commit:
+            raise
+        try:
+            files = list(list_files(repo, commit, run))
+        except Exception as e2:  # noqa: BLE001  no file list: the load's error stands
+            run.note(f"{repo}@{rev}: load failed and the file list of {commit} could not be read "
+                     f"({type(e2).__name__}: {str(e2)[:120]})")
+            files = None
+        lacks = lacking(files) if files is not None else []
+        if not lacks:
+            raise                                # the load's error, unchanged
+        raise MissingOnHub({"repo": repo, "rev": rev, "commit": commit, "files": files, "lacks": lacks,
+                            "load_error": f"{type(e).__name__}: {str(e)[:300]}"}) from e
+
+
+def missing_marker(d: Path, commit: str | None) -> dict | None:
+    """The missing_on_hub.json of a checkpoint folder if it was written for this commit, else None. A commit's files
+    never change, so a resume skips the checkpoint again without asking the Hub."""
+    p = Path(d) / MISSING_FILE
+    if not commit or not p.exists():
+        return None
+    info = json.loads(p.read_text())
+    return info if info.get("commit") == commit else None
+
+
+def missing_entry(info: dict) -> dict:
+    """The run.json record of a checkpoint missing on the Hub."""
+    return {k: info[k] for k in ("repo", "rev", "commit", "files")}
 
 
 # suites that run only when no lane runs and never next to P3: olmo7b needs 31.5 GiB (memory_check.py), and with
@@ -619,6 +702,12 @@ class Store:
             self.order.append(c["key"])
         self.cks[c["key"]] = c
 
+    def drop(self, key: str) -> None:
+        """Forget a registered checkpoint that will have no row (missing on the Hub), so the counts stay right."""
+        if key in self.cks:
+            self.order.remove(key)
+            del self.cks[key]
+
     def load_result(self, c: dict) -> dict:
         res = json.loads((c["dir"] / "result.json").read_text())
         self.results[c["key"]] = res
@@ -898,8 +987,8 @@ def main():
 
         suite, size, seed, repo, variant, step, rev, final, tag = (c[k] for k in (
             "suite", "size", "seed", "repo", "variant", "step", "rev", "final", "tag"))
-        with timed("load"):
-            model, tok, src = hf.load_causal_lm(repo, rev, run, dtype=dtype, device=dev)
+        with timed("load"):   # MissingOnHub if the pinned commit has no config.json or no weights; else as before
+            model, tok, src = load_checkpoint(repo, rev, run, hf.load_causal_lm, hub_files, dtype=dtype, device=dev)
         # micro-batches: sequences per no-grad forward (losses, hidden states) and per JVP; olmo7b sets smaller
         # ones so that 27 GiB of float32 weights plus activations stay well under the L40S's 44 GiB
         eb = int(cfg["suites"][suite].get("eval_batch", 4))
@@ -1049,8 +1138,29 @@ def main():
             left = sum(not p1_tasks.stats_path(c["dir"], t["name"]).exists() for t in record["tasks"])
             prog.say(f"{c['label']}: GPU pass done in an earlier run; {left} of {len(record['tasks'])} CPU tasks to run")
         else:
-            record = gpu_pass(c)
+            miss = missing_marker(c["dir"], (hf.PINS.entry(c["repo"], c["rev"]) or {}).get("commit"))
+            again = miss is not None
+            if miss is None:
+                try:
+                    record = gpu_pass(c)
+                except MissingOnHub as m:
+                    miss = {**m.info, "pass": c["tag"], "checked_utc": utc()}
+                    p1_tasks.atomic_json(c["dir"] / MISSING_FILE, miss)
+            if miss is not None:
+                skip_missing(c, miss, again)
+                return
         store.pending(c, record, pool)
+
+    missing: list = []          # run.json: results.missing_on_hub
+
+    def skip_missing(c, info, again) -> None:
+        store.drop(c["key"])
+        entry = missing_entry(info)
+        if entry not in missing:                 # the same commit can come up in more than one pass
+            missing.append(entry)
+        run.note(f"{c['label']}: missing on the Hub: pinned commit {info['commit']} has no "
+                 f"{' and no '.join(info['lacks'])} (files: {', '.join(info['files']) or 'none'}); skipped, no row"
+                 + (" (recorded in an earlier run)" if again else f" (load error: {info['load_error'][:160]})"))
 
     spike_rows, windows = [], []
     try:
@@ -1097,7 +1207,8 @@ def main():
     rows = store.rows()
 
     extra = {"stable_density": density, "cpu_tasks_run": pool.n_done,
-             "cpu_task_hours": round(pool.cpu_seconds / 3600, 3), **{k: v for k, v in counts.items()}}
+             "cpu_task_hours": round(pool.cpu_seconds / 3600, 3), **{k: v for k, v in counts.items()},
+             "missing_on_hub": missing}
     if do_spike:
         spike_rows += spike_b_rows(rows, windows, sc)
     analyse(cfg, run, rows, skip, do_spike, sc, spike_rows, windows, extra)
