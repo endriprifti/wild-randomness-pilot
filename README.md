@@ -650,6 +650,10 @@ setsid nohup nice -n 10 taskset -c 0-10 python p6_after_queue.py --take-over --j
 python p6_noah_joseph.py --design small --seeds 1 --out results/p6_small/14m_s1
 python p6_noah_joseph.py --design small --analyse --from results/p6_small --out results/p6_small/analysis
 python p6_noah_joseph.py --plan                  # runs and the prior
+# P6b (2026-11-21; see "P6b" below): ten new seeds of the small design, seed by seed, after P4 and OLMo-7B
+python p6b_after_olmo.py --check
+setsid nohup nice -n 10 taskset -c 0-10 python p6b_after_olmo.py > logs/p6b_after_olmo.out 2>&1 < /dev/null &
+python p6_noah_joseph.py --design p6b_small --analyse --from results/p6b_small --out results/p6b_small/analysis
 python p6_noah_joseph.py --smoke --device cpu --out results/p6_smoke      # tiny model and streams, about 12 min
 ```
 
@@ -818,6 +822,76 @@ models (then the Joseph → Noah tests have little to act on: the feasibility ch
 whether the tokens are raised; the K and alpha ranges are reported). Five seeds per
 cell detect only effects of about 3-4 residual standard deviations after Holm (the MDE column says how large).
 The L40S hours are a prior until the timing job has run.
+
+## P6b: a replication of P6's small design with more seeds (fixed 2026-11-21, before any P6b run)
+
+Declared after P6's small design was analysed and fixed in this commit before any P6b run (Endri's proposal of
+2026-11-21, with seed 6 left out). P6's small design ran 3 seeds (the budget rule, from the measured timing: 3.96 L40S
+hours per seed), 12 runs, and detected no link; it could detect only effects of about 5.5 standard errors, and its
+positive control (Joseph on the memory of the variant part) missed at the final stage. P6's result stays as reported
+("no link detected", 3 seeds). P6b is reported beside it and never pooled with it.
+
+- **Design** (`--design p6b_small`): P6's small design unchanged, the four 14M corners (light / Zipf 1.0 × H 0.5 /
+  0.9), 2^28 tokens in 8,192 steps, stages at steps 82, 819, 4,096 and 8,192, H7.1 at 50 and 100%, the same streams,
+  training, measurements and code; only the seeds differ. The 14-test family (Holm at 0.05, Freedman–Lane permutations
+  within seed blocks), the dilution rule and the manipulation checks are P6's.
+- **Seeds 4, 5 and 7 to 14** (10 seeds, 40 runs; `P6B_SEEDS`), fixed here. P6's budget rule skipped seeds 4 and 5
+  before any of their runs started (`skipped_by_budget.json`). Seed 6 is left out: the feasibility check trained its
+  14M Zipf 1.0 × H 0.9 run, whose K and outlier channels were seen. The seed count is not set by a timing, and the
+  budget rule does not apply (`--budget-hours` and `--raised` are refused with `p6b_small`).
+- **Seed by seed, and the stop.** `p6b_queue_small.json` has one job per seed (its four corners, one after another),
+  each after the one before, into `results/p6b_small/14m_s<k>`, then the analysis into `results/p6b_small/analysis`.
+  The only allowed early stop is a lack of credit, never the results: if the balance would fall below $40, `touch
+  results/p6b_small/STOP`. The seed that is running finishes, every later seed job starts no run (it writes
+  `stopped.json` and exits 0), and the analysis runs on the seeds done. Stopping the queue instead (`kill -TERM`)
+  leaves the running seed incomplete, and the analysis leaves it out.
+- **Analysis** (`--design p6b_small --analyse --from results/p6b_small`): P6's, on the complete seeds only. A run
+  counts once its unit is saved and all its CPU statistics are there; a seed counts once all four corners count
+  (`p6b_seeds.json` lists the complete, incomplete and not-run seeds; `summary.md` is titled P6b and states the seeds
+  used and the positive control).
+- **Positive-control rule** (fixed here; P6 had none): if Joseph's effect on the memory of the variant part at the
+  final stage (the manipulation check "Joseph -> memory of the variant part (positive control)", its permutation p)
+  does not reach p < 0.05, the Noah → Joseph tests that would read "no link detected" read "uninformative" instead. A
+  Noah → Joseph test that passes Holm keeps its reading, marked "positive control missed". The Joseph → Noah tests are
+  read as usual; every p and the Holm correction are unchanged. `family.csv` gets a `positive_control_passed` column.
+- **H7.1 is kept** (outside the family): the runs are P6's, and no measurement code changes.
+- **P6's analysis is unchanged.** `--design small` takes none of these steps; on the same smoke runs P6's and P6b's
+  `checkpoints.csv`, `manipulation_checks.csv` and `secondary.csv` are byte-identical (tests). One fix on the way,
+  which leaves the files of P6's small design as they are: when one family test carried a note ("not measured", "not
+  testable"), the other tests' readings came out blank (a NaN note is truthy); a family without notes, as P6's, reads
+  byte for byte as before.
+
+Power: the effect detectable with power 0.8 at the first Holm threshold (0.05/14), scaled from P6's small design with
+its seed-to-seed spread (residual df = 3 × seeds − 3), and the L40S hours at P6's 3.96 hours per seed:
+
+| seeds | df | Noah → Joseph, H_tok excess | Joseph → Noah, K | L40S hours |
+|---|---|---|---|---|
+| 3 (P6) | 6 | 0.029 | 2.85 | 12 |
+| 8 | 21 | 0.013 | 1.30 | 32 |
+| 10 (P6b) | 27 | 0.012 | 1.14 | 40 (about $28) |
+
+With 10 seeds a Noah → Joseph effect as large as Joseph's own effect on the same measure (0.014 in P6) becomes
+detectable, and so does a Joseph → Noah effect on K of about a third of Noah's own (3.24 in P6).
+
+**Starting P6b after P4 and OLMo-7B** (`p6b_after_olmo.py`, new). The queue that runs the P4 transformer holds
+`logs/.run_lane.queue.lock`; run_all.sh's p1_olmo7b waits until no `logs/.run_lane*.lock` is held, so it starts when
+that queue ends. A P6b queue started at that moment would take the queue lock first and make OLMo-7B wait. The waiter
+takes no lock the others look at; it reads `/proc`, `logs/progress.txt` and `/proc/locks` every 60 s and starts
+`run_queue.py --jobs-file p6b_queue_small.json` (output in `logs/run_queue_p6b.out`) only when no p4_clipping.py
+transformer process and no p1_checkpoints.py olmo7b process runs, the last progress lines of p4_transformer and
+p1_olmo7b are END or SKIP (any exit code: an interrupted OLMo-7B has ended too), and the queue lock is free. It
+refuses to start if P4 or OLMo-7B is neither running (or waiting) nor ended, if a P6b queue or another waiter runs, or
+if every P6b job is done. A p1_olmo7b START line with no process (run_all.sh killed with -9) is reported every hour
+and waited out. `kill -TERM $(cat logs/p6b_after_olmo.pid)` stops the wait (nothing started) or, after the start, P6b
+(saved runs stay; `run_queue.py --jobs-file p6b_queue_small.json` goes on). If OLMo-7B is to be run again before P6b,
+stop the waiter first.
+
+```bash
+python p6b_after_olmo.py --check            # read-only: P4, p1_olmo7b, the queue lock, what it would do
+setsid nohup nice -n 10 taskset -c 0-10 python p6b_after_olmo.py > logs/p6b_after_olmo.out 2>&1 < /dev/null &
+python run_queue.py --jobs-file p6b_queue_small.json --status   # once it runs: seeds done, hours per run
+touch results/p6b_small/STOP                # lack of credit: stop after the seed that is running
+```
 
 ## Full run on one L40S: `run_all.sh`
 
@@ -1484,7 +1558,7 @@ before the run.
 
 ## Unit tests
 
-`python -m pytest -q` (278 tests, 9-14 min on a 4-core CPU; `-m "not slow"` skips the slowest). Synthetic data with
+`python -m pytest -q` (292 tests, 10-15 min on a 4-core CPU; `-m "not slow"` skips the slowest). Synthetic data with
 known parameters:
 
 - stable density against the Gaussian and Cauchy closed forms and against SciPy; ML fit recovers α ∈ {1.2, 1.5, 1.8},
@@ -1612,6 +1686,16 @@ known parameters:
   own length, the raised settings (only tokens and batch differ; the default untouched), the raised queue file, the
   budget guard refusing a timing of another batch, the lean build under its lock with resume, and a raised smoke run
   (the design's steps);
+- P6b (`tests/test_p6b.py`): the design is the small design with seeds 4, 5, 7-14 (seed 6 and P6's seeds out, the same
+  settings, 40 runs seed by seed); the queue file runs the seeds one after another with the stop file and no budget
+  rule, and passes `--dry-run`; `--budget-hours` and `--raised` are refused; a job that finds the stop file starts no
+  run; complete seeds; the positive control is the manipulation check, and its rule turns only the Noah → Joseph nulls
+  into "uninformative" (p-values and Holm unchanged, a passing test kept and marked, P6's summary as before); a note
+  in one family test leaves the others' readings; on smoke runs P6b's analysis gives P6's checkpoints, manipulation
+  checks and secondary files byte for byte and leaves out a seed with a corner missing or with a run whose statistics
+  are missing; the waiter starts the P6b queue only after P4 has ended, its queue lock is free, OLMo-7B's process has
+  gone and its END line is written (also after a failed P4 and an interrupted OLMo-7B), refuses when it would wait for
+  ever, next to another waiter or with everything done, and its `--check` changes nothing.
 - `p6_after_queue.py` (`tests/test_p6_after_queue.py`, stand-in processes): the P6 queue starts only after the
   running queue has released its lock, and p1_olmo7b's own lane wait (`gpu_locks.wait_for_lanes`, checking every 10
   ms) gets through only after the P6 queue has ended, while a plain wait-then-start lets it through the gap; a job

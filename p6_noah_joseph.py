@@ -43,6 +43,10 @@ Commands (in the pilot folder inside the venv):
   python p6_noah_joseph.py --memory [--sizes 14m] [batch flags]         # GPU memory of each step (meta device)
   python p6_noah_joseph.py --design small --seeds 1 --out results/p6_small/14m_s1    # one job of the small design
   python p6_noah_joseph.py --analyse --from results/p6_small --out results/p6_small/analysis
+  python p6b_after_olmo.py --check     # P6b (2026-11-21): ten new seeds of the small design after P4 and OLMo-7B
+  python p6_noah_joseph.py --design p6b_small --seeds 4 --stop-file results/p6b_small/STOP \
+      --out results/p6b_small/14m_s4    # one P6b job (p6b_queue_small.json runs them seed by seed)
+  python p6_noah_joseph.py --design p6b_small --analyse --from results/p6b_small --out results/p6b_small/analysis
   setsid nohup nice -n 10 taskset -c 0-10 python p6_after_queue.py > logs/p6_after_queue.out 2>&1 < /dev/null &
                                     # the L40S: the small design through run_queue.py once the running queue ends
   python p6_noah_joseph.py --smoke --out results/p6_smoke   # tiny model and streams on the CPU (minutes)
@@ -113,6 +117,16 @@ BUDGET_HOURS = {"small": 12.0, "full": 80.0}      # --budget-hours in the queue 
 # 3-5 seeds from the timing, as designed). --raised selects it (p6_queue_small_raised.json); it is not the default.
 RAISED_TRAIN = {"tokens": 2 ** 33, "batch_seqs": 512}
 BUDGET_HOURS_RAISED = {"small": 90.0}
+# P6b (Endri, 2026-11-21, after P6's small design was analysed and before any P6b run; README "P6b, a replication with
+# more seeds"): the small design again, with new seeds only, reported beside P6 and never pooled with it. Its seed
+# count is fixed (no budget rule; --budget-hours is refused); one queue job per seed, each after the one before
+# (p6b_queue_small.json), into results/p6b_small/, so that a stop leaves complete seeds only. The only early stop is
+# a lack of credit: a seed job that finds its --stop-file starts no run. The analysis (--design p6b_small) uses the
+# complete seeds only and applies p6_stats' positive-control rule. Seed 6 is left out: the feasibility check trained
+# its 14M Zipf 1.0 x H 0.9 run (FEASIBILITY), whose K and outlier channels were seen.
+P6B_DESIGN = "p6b_small"
+P6B_SEEDS = [4, 5, 7, 8, 9, 10, 11, 12, 13, 14]
+DESIGNS[P6B_DESIGN] = {**copy.deepcopy(DESIGNS["small"]), "seeds": list(P6B_SEEDS)}
 
 SMOKE_STREAM = dict(copy.deepcopy(p6_streams.P6), vocab=512, K=4, R=128, block=16, p_bar=1 / 32, seq_len=128,
                     heldout_windows=400)
@@ -1108,9 +1122,38 @@ def budget_seeds(args, design: dict, st: dict | None = None) -> list[int] | None
 
 
 # ----------------------------------------------------------------------------- analysis
+def missing_stats(run_dir: Path, unit: dict) -> int:
+    """CPU statistics a finished run still lacks (its job stopped before the pool had finished): the tasks of its
+    row.json records (resubmit_missing's rule) and the hgrad H_link unit where train_run submits one (a run that did
+    not diverge, with more than warm-up + 50 steps)."""
+    n = 0
+    for rj in sorted(run_dir.glob("checkpoints/*/row.json")):
+        n += sum(not p1_tasks.stats_path(t["dir"], t["name"]).exists() for t in json.loads(rj.read_text())["tasks"])
+    hg = run_dir / "hgrad.npy"
+    if (not unit.get("diverged") and hg.exists()
+            and len(np.load(hg, mmap_mode="r")) > int(unit.get("warmup_steps", 0)) + 50
+            and not p1_tasks.stats_path(run_dir / "hlink", "hlink_grad").exists()):
+        n += 1
+    return n
+
+
+def p6b_seeds(found: list[tuple[dict, Path]], design: dict) -> dict:
+    """P6b: which seeds the analysis uses. A run counts once its unit is saved and its CPU statistics are all there;
+    a seed counts once all four corners of it count (p6_stats.complete_seeds), and only the design's seeds count."""
+    finished = [u for u, rd in found if not missing_stats(rd, u)]
+    complete, partial = p6_stats.complete_seeds(finished, design)
+    outside = [x for x in complete if x not in design["seeds"]]
+    complete = [x for x in complete if x in design["seeds"]]
+    started = set(complete) | set(partial) | set(outside)
+    return {"design_seeds": list(design["seeds"]), "complete": complete, "incomplete": partial,
+            "outside_the_design": outside, "not_run": [x for x in design["seeds"] if x not in started]}
+
+
 def analyse(args, run, st: dict) -> None:
     src = Path(args.from_dir)
+    p6b = args.design == P6B_DESIGN
     rows = []
+    found = []
     for uj in sorted(src.glob("**/units/*.json")):
         if uj.name == "settings.json":
             continue
@@ -1118,8 +1161,16 @@ def analyse(args, run, st: dict) -> None:
         rd = uj.parent.parent / "runs" / u["key"]
         if rd.exists():
             rows += assemble_run(rd, u)
+            found.append((u, rd))
     if not rows:
         raise SystemExit(f"no finished P6 runs below {src}")
+    seeds_used = None
+    if p6b:            # P6b: the complete seeds only (README "P6b"); P6's analysis never comes here
+        seeds_used = p6b_seeds(found, SMOKE_DESIGN if st["smoke"] else DESIGNS[P6B_DESIGN])
+        p1_tasks.atomic_json(run.out_dir / "p6b_seeds.json", seeds_used)
+        rows = [r for r in rows if int(r["seed"]) in seeds_used["complete"]]
+        if not rows:
+            raise SystemExit(f"P6b: no complete seed below {src} ({seeds_used})")
     df = pd.DataFrame(rows)
     df.to_csv(run.out_dir / "checkpoints.csv", index=False)
     rng = np.random.default_rng(np.random.SeedSequence(units_mod.seed_for(config.SEED, "p6 analysis")))
@@ -1136,8 +1187,26 @@ def analyse(args, run, st: dict) -> None:
     sec.to_csv(run.out_dir / "secondary.csv", index=False)
     header = (f"{len(prim)} runs in the confirmatory set ({size0}, corners, final stage); "
               f"{len(df)} checkpoint rows in all; diverged runs: {int(df.groupby('key')['diverged'].first().sum())}")
-    (run.out_dir / "summary.md").write_text(p6_stats.to_markdown(fam, man, header))
-    run.note(p6_stats.verdict(fam))
+    if not p6b:
+        (run.out_dir / "summary.md").write_text(p6_stats.to_markdown(fam, man, header))
+        run.note(p6_stats.verdict(fam))
+        return
+    # P6b: the positive-control rule, fixed 2026-11-21 before any P6b run (p6_stats.positive_control_rule)
+    pc = p6_stats.positive_control(man)
+    fam = p6_stats.positive_control_rule(fam, pc)
+    fam.to_csv(run.out_dir / "family.csv", index=False)
+    text = p6_stats.verdict_p6b(fam, pc)
+    header = (f"P6b, a replication of P6's small design with more seeds (fixed 2026-11-21, before any P6b run; never "
+              f"pooled with P6). Complete seeds used: {seeds_used['complete']} of {seeds_used['design_seeds']}"
+              + (f"; incomplete, left out: {seeds_used['incomplete']}" if seeds_used["incomplete"] else "")
+              + (f"; not run: {seeds_used['not_run']}" if seeds_used["not_run"] else "")
+              + (f"; outside the design, left out: {seeds_used['outside_the_design']}"
+                 if seeds_used["outside_the_design"] else "")
+              + f". Positive control (Joseph -> memory of the variant part, final stage): "
+              + ("passed" if pc["passed"] else "missed") + (f" ({pc['detail']})" if pc["detail"] else "")
+              + ".\n\n" + header)
+    (run.out_dir / "summary.md").write_text(p6_stats.to_markdown(fam, man, header, title="P6b", verdict_text=text))
+    run.note(text)
 
 
 # ----------------------------------------------------------------------------- main
@@ -1175,12 +1244,17 @@ def main(argv=None) -> int:
     ap.add_argument("--timing-json", default=None, help="timing.json of the queue's L40S timing job")
     ap.add_argument("--timing-json-extra", default=None, help="comma-separated further timing.json (other sizes)")
     ap.add_argument("--keep-state", action="store_true", help="keep train_state.pt after a run")
+    ap.add_argument("--stop-file", default=None, help="P6b's stop for lack of credit: if this file exists when the "
+                                                       "job starts, no run starts (stopped.json; exit 0)")
     ap.add_argument("--analyse", action="store_true")
     ap.add_argument("--from", dest="from_dir", default=None, help="analyse: folder with the job folders")
     args = ap.parse_args(argv)
     design = SMOKE_DESIGN if args.smoke else DESIGNS[args.design]
     if args.raised and args.feasibility:
         raise SystemExit("--raised and --feasibility: the check runs the design as it stands")
+    if args.design == P6B_DESIGN and (args.budget_hours is not None or args.raised):
+        raise SystemExit("P6b: the seed count is fixed and the runs are the small design's; --budget-hours and "
+                         "--raised do not apply")
     st = settings(args.smoke, design, raised=args.raised)
     if args.plan:
         comp = {s: {k: [v, v] for k, v in prior_component_hours(s, st).items()} for s in SIZES}
@@ -1220,6 +1294,15 @@ def main(argv=None) -> int:
         return 0
     sizes = args.sizes.split(",") if args.sizes else None
     seeds = [int(s) for s in args.seeds.split(",")] if args.seeds else None
+    if args.stop_file and Path(args.stop_file).exists():
+        msg = (f"stop file {args.stop_file} present: no run of this job started (seeds "
+               f"{seeds or design['seeds']}); the complete seeds before it stand")
+        p1_tasks.atomic_json(run.out_dir / "stopped.json", {"stop_file": str(args.stop_file), "seeds": seeds,
+                                                            "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+        prog.say(msg)
+        run.note(msg)
+        runtime.finish_run(run, extra={"runs": 0, "stopped_by": str(args.stop_file)})
+        return 0
     allowed = budget_seeds(args, design, st)
     todo = plan(design, sizes, seeds)
     if allowed is not None:

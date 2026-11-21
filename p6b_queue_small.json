@@ -1,0 +1,234 @@
+[
+ {
+  "name": "p6b_small_14m_s4",
+  "args": [
+   "p6_noah_joseph.py",
+   "--design",
+   "p6b_small",
+   "--sizes",
+   "14m",
+   "--seeds",
+   "4",
+   "--workers",
+   "1",
+   "--stop-file",
+   "results/p6b_small/STOP"
+  ],
+  "out": "results/p6b_small/14m_s4",
+  "gpu": 7.0
+ },
+ {
+  "name": "p6b_small_14m_s5",
+  "args": [
+   "p6_noah_joseph.py",
+   "--design",
+   "p6b_small",
+   "--sizes",
+   "14m",
+   "--seeds",
+   "5",
+   "--workers",
+   "1",
+   "--stop-file",
+   "results/p6b_small/STOP"
+  ],
+  "out": "results/p6b_small/14m_s5",
+  "gpu": 7.0,
+  "after": [
+   "p6b_small_14m_s4"
+  ]
+ },
+ {
+  "name": "p6b_small_14m_s7",
+  "args": [
+   "p6_noah_joseph.py",
+   "--design",
+   "p6b_small",
+   "--sizes",
+   "14m",
+   "--seeds",
+   "7",
+   "--workers",
+   "1",
+   "--stop-file",
+   "results/p6b_small/STOP"
+  ],
+  "out": "results/p6b_small/14m_s7",
+  "gpu": 7.0,
+  "after": [
+   "p6b_small_14m_s5"
+  ]
+ },
+ {
+  "name": "p6b_small_14m_s8",
+  "args": [
+   "p6_noah_joseph.py",
+   "--design",
+   "p6b_small",
+   "--sizes",
+   "14m",
+   "--seeds",
+   "8",
+   "--workers",
+   "1",
+   "--stop-file",
+   "results/p6b_small/STOP"
+  ],
+  "out": "results/p6b_small/14m_s8",
+  "gpu": 7.0,
+  "after": [
+   "p6b_small_14m_s7"
+  ]
+ },
+ {
+  "name": "p6b_small_14m_s9",
+  "args": [
+   "p6_noah_joseph.py",
+   "--design",
+   "p6b_small",
+   "--sizes",
+   "14m",
+   "--seeds",
+   "9",
+   "--workers",
+   "1",
+   "--stop-file",
+   "results/p6b_small/STOP"
+  ],
+  "out": "results/p6b_small/14m_s9",
+  "gpu": 7.0,
+  "after": [
+   "p6b_small_14m_s8"
+  ]
+ },
+ {
+  "name": "p6b_small_14m_s10",
+  "args": [
+   "p6_noah_joseph.py",
+   "--design",
+   "p6b_small",
+   "--sizes",
+   "14m",
+   "--seeds",
+   "10",
+   "--workers",
+   "1",
+   "--stop-file",
+   "results/p6b_small/STOP"
+  ],
+  "out": "results/p6b_small/14m_s10",
+  "gpu": 7.0,
+  "after": [
+   "p6b_small_14m_s9"
+  ]
+ },
+ {
+  "name": "p6b_small_14m_s11",
+  "args": [
+   "p6_noah_joseph.py",
+   "--design",
+   "p6b_small",
+   "--sizes",
+   "14m",
+   "--seeds",
+   "11",
+   "--workers",
+   "1",
+   "--stop-file",
+   "results/p6b_small/STOP"
+  ],
+  "out": "results/p6b_small/14m_s11",
+  "gpu": 7.0,
+  "after": [
+   "p6b_small_14m_s10"
+  ]
+ },
+ {
+  "name": "p6b_small_14m_s12",
+  "args": [
+   "p6_noah_joseph.py",
+   "--design",
+   "p6b_small",
+   "--sizes",
+   "14m",
+   "--seeds",
+   "12",
+   "--workers",
+   "1",
+   "--stop-file",
+   "results/p6b_small/STOP"
+  ],
+  "out": "results/p6b_small/14m_s12",
+  "gpu": 7.0,
+  "after": [
+   "p6b_small_14m_s11"
+  ]
+ },
+ {
+  "name": "p6b_small_14m_s13",
+  "args": [
+   "p6_noah_joseph.py",
+   "--design",
+   "p6b_small",
+   "--sizes",
+   "14m",
+   "--seeds",
+   "13",
+   "--workers",
+   "1",
+   "--stop-file",
+   "results/p6b_small/STOP"
+  ],
+  "out": "results/p6b_small/14m_s13",
+  "gpu": 7.0,
+  "after": [
+   "p6b_small_14m_s12"
+  ]
+ },
+ {
+  "name": "p6b_small_14m_s14",
+  "args": [
+   "p6_noah_joseph.py",
+   "--design",
+   "p6b_small",
+   "--sizes",
+   "14m",
+   "--seeds",
+   "14",
+   "--workers",
+   "1",
+   "--stop-file",
+   "results/p6b_small/STOP"
+  ],
+  "out": "results/p6b_small/14m_s14",
+  "gpu": 7.0,
+  "after": [
+   "p6b_small_14m_s13"
+  ]
+ },
+ {
+  "name": "p6b_small_analysis",
+  "args": [
+   "p6_noah_joseph.py",
+   "--design",
+   "p6b_small",
+   "--analyse",
+   "--from",
+   "results/p6b_small"
+  ],
+  "out": "results/p6b_small/analysis",
+  "gpu": 0.0,
+  "after": [
+   "p6b_small_14m_s4",
+   "p6b_small_14m_s5",
+   "p6b_small_14m_s7",
+   "p6b_small_14m_s8",
+   "p6b_small_14m_s9",
+   "p6b_small_14m_s10",
+   "p6b_small_14m_s11",
+   "p6b_small_14m_s12",
+   "p6b_small_14m_s13",
+   "p6b_small_14m_s14"
+  ]
+ }
+]

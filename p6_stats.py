@@ -274,8 +274,11 @@ def family_tests(df: pd.DataFrame, rng: np.random.Generator, n_perm: int = N_PER
 
 
 def reading(r: dict) -> str:
-    if r.get("note"):
-        return r["note"]
+    note = r.get("note")
+    if isinstance(note, str) and note:
+        # (2026-11-21) a string only: in a table where some test has a note, the others carry NaN in that column,
+        # which is truthy, and their readings came out blank (NaN). A family without notes reads as before
+        return note
     if not (r.get("p_holm", 1.0) < LEVEL):
         return (f"no link detected (estimate {r['estimate']:+.3g}, 95% CI {r['ci_lo']:+.3g} .. {r['ci_hi']:+.3g}; "
                 f"detectable with 80% power: |effect| >= {r['mde_80']:.3g})")
@@ -333,8 +336,9 @@ def manipulation_checks(df: pd.DataFrame, rng: np.random.Generator, n_perm: int 
     return pd.DataFrame(out)
 
 
-def to_markdown(tests: pd.DataFrame, checks: pd.DataFrame, header: str) -> str:
-    lines = [f"# P6 factorial Noah-Joseph test\n", header, "", f"**{verdict(tests)}**", "",
+def to_markdown(tests: pd.DataFrame, checks: pd.DataFrame, header: str, title: str = "P6",
+                verdict_text: str | None = None) -> str:
+    lines = [f"# {title} factorial Noah-Joseph test\n", header, "", f"**{verdict_text or verdict(tests)}**", "",
              "| direction | outcome | term | estimate | 95% CI | p (perm) | p (t) | Holm p | MDE 80% | reading |",
              "|---|---|---|---|---|---|---|---|---|---|"]
     for r in tests.to_dict("records"):
@@ -348,6 +352,82 @@ def to_markdown(tests: pd.DataFrame, checks: pd.DataFrame, header: str) -> str:
     for r in checks.to_dict("records"):
         lines.append(f"| {r['check']} | {r['value']} | {r.get('detail', '')} |")
     return "\n".join(lines) + "\n"
+
+
+# ----------------------------------------------------------------------------- P6b (2026-11-21)
+# P6b, a replication of the small design with new seeds (Endri, 2026-11-21, after P6's small design was analysed and
+# before any P6b run; README "P6b"). Its analysis is P6's, on the complete seeds only, plus one rule fixed in advance:
+# if the positive control (Joseph's effect on the memory of the variant part, at the final checkpoint, the
+# manipulation check below) does not reach p < 0.05, the Noah -> Joseph tests that would read "no link detected" read
+# "uninformative" instead (the memory measures did not show the effect that is known to be there). A test that
+# passes Holm keeps its reading, marked "positive control missed". The Joseph -> Noah tests are read as usual. P6's
+# own analysis does not use any of this.
+POSITIVE_CONTROL = "Joseph -> memory of the variant part (positive control)"     # a check of manipulation_checks
+NOAH_TO_JOSEPH = "Noah->Joseph"
+
+
+def positive_control(checks: pd.DataFrame) -> dict:
+    """{"passed": bool, "detail": str} of the positive control in manipulation_checks' output; missing or not testable
+    counts as not passed."""
+    if checks.empty or "check" not in checks:
+        return {"passed": False, "detail": "not in the manipulation checks"}
+    r = checks[checks["check"] == POSITIVE_CONTROL]
+    if r.empty:
+        return {"passed": False, "detail": "not measured"}
+    r = r.iloc[0]
+    detail = r.get("detail")
+    return {"passed": bool(r["value"]), "detail": str(detail) if isinstance(detail, str) and detail else ""}
+
+
+def positive_control_rule(tests: pd.DataFrame, pc: dict) -> pd.DataFrame:
+    """P6b's readings: family_tests' output with the rule applied (a copy; p-values and Holm unchanged)."""
+    out = tests.copy()
+    out["positive_control_passed"] = bool(pc["passed"])
+    if pc["passed"]:
+        return out
+    why = f"the positive control missed: {pc['detail']}" if pc["detail"] else "the positive control missed"
+    new = []
+    for r in out.to_dict("records"):
+        reading = str(r["reading"])
+        if r.get("direction") == NOAH_TO_JOSEPH:
+            if reading.startswith("no link detected"):
+                reading = f"uninformative ({why}) " + reading[len("no link detected "):]
+            elif reading.startswith(("link", "dilution")):
+                reading = f"{reading}; positive control missed"
+        new.append(reading)
+    out["reading"] = new
+    return out
+
+
+def verdict_p6b(tests: pd.DataFrame, pc: dict) -> str:
+    """P6b's verdict line: P6's when the positive control passed; otherwise the Joseph -> Noah tests as usual and the
+    Noah -> Joseph tests uninformative unless one of them passed."""
+    if pc["passed"]:
+        return verdict(tests) + " The positive control passed."
+    links = tests[tests["reading"].str.startswith("link")]
+    jn = len(tests[tests["direction"] != NOAH_TO_JOSEPH])
+    nj = len(tests) - jn
+    why = f"the positive control missed ({pc['detail']})" if pc["detail"] else "the positive control missed"
+    parts = [f"{r['direction']}: {r['name']} {r['term']} ({r['reading']}, Holm p {r['p_holm']:.3g})"
+             for r in links.to_dict("records")]
+    head = ("Link(s): " + "; ".join(parts) + ". ") if parts else ""
+    jn_links = links[links["direction"] != NOAH_TO_JOSEPH]
+    jn_text = "" if len(jn_links) else f"No Joseph -> Noah link detected ({jn} tests). "
+    return (f"{head}{jn_text}The Noah -> Joseph tests ({nj}) that detected no link are uninformative: {why}. "
+            f"({len(tests)} tests, Holm at 0.05.)")
+
+
+def complete_seeds(units: list[dict], design: dict) -> tuple[list[int], list[int]]:
+    """Seeds of `design` with a finished run in every cell of the confirmatory set (sizes x Noah x Joseph of the
+    design; P6b: the four 14M corners), and the seeds with some but not all of them. units: finished runs, each
+    with key, size, noah, joseph, seed."""
+    cells = {(s, n, j) for s in design["sizes"] for n in design["noah"] for j in design["joseph"]}
+    have: dict[int, set] = {}
+    for u in units:
+        have.setdefault(int(u["seed"]), set()).add((u["size"], u["noah"], u["joseph"]))
+    complete = sorted(s for s, c in have.items() if cells <= c)
+    partial = sorted(s for s, c in have.items() if not cells <= c)
+    return complete, partial
 
 
 def secondary_tests(df: pd.DataFrame, rng: np.random.Generator, n_perm: int = 999) -> pd.DataFrame:
