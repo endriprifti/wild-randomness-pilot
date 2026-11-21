@@ -576,7 +576,14 @@ corrected: every stream passed; eval loss within 0.15 nats of the oracle floor a
 least half the topic information; the own effects as positive controls (Joseph on the variant part's memory, on
 H_tok and on the magnitude memory; Noah on alpha_ESD, K and alpha). Everything else (other stages, the middle levels
 with ordinal scores, 31M, act_zeta, alpha_ESD, outlier channels, the CSN tails, H7.1, the rank part) is exploratory,
-uncorrected (`secondary.csv`).
+uncorrected (`secondary.csv`). An outcome with the same value in every run, or one the model fits exactly, reads "not
+testable" with no estimate or p in every file (2026-11-21, after the small design ran; before, `secondary.csv` gave
+such outcomes p_perm 0.001 and p_t 0 with estimate 0; the permutations are still drawn, so every other number stays as
+it was; per Endri's check, the small design's family and manipulation checks had none). The H7.1 columns of the
+analysis rows (`h71_mean_alpha_hat`, `h71_slope`, `h71_verdicts` in `checkpoints.csv`, and so in `secondary.csv`) use
+the two random directions only, as intended (a mean over exchangeable directions; in the code since the design,
+written here 2026-11-21); the Hessian direction's fit and verdict are in each checkpoint's `result.json` (`h71_summ`,
+direction `hessian0`).
 
 **Designs and cost.** Full: 3 Noah × 3 Joseph × 5 seeds × {14M, 31M} = 90 runs, H7.1 at all four stages. Small: the
 full design's 14M corners, 2 × 2 × 5 seeds = 20 runs, H7.1 at 50 and 100%; the confirmatory family is the same in
@@ -1477,7 +1484,7 @@ before the run.
 
 ## Unit tests
 
-`python -m pytest -q` (270 tests, 9-14 min on a 4-core CPU; `-m "not slow"` skips the slowest). Synthetic data with
+`python -m pytest -q` (278 tests, 9-14 min on a 4-core CPU; `-m "not slow"` skips the slowest). Synthetic data with
 known parameters:
 
 - stable density against the Gaussian and Cauchy closed forms and against SciPy; ML fit recovers α ∈ {1.2, 1.5, 1.8},
@@ -1591,7 +1598,9 @@ known parameters:
   chunked loss and its gradient against the plain loss, sdpa against eager attention, the rank and variant parts of
   the surprisal, the flat gradient directions; the plans (20 and 90 runs, stage steps), Holm, the within-block
   permutation test on a planted effect and on none, the family's readings (as predicted, opposite to the prediction,
-  dilution, no link), a missing outcome kept in the Holm family, both queue files and the budget guard's seed choice;
+  dilution, no link), a missing outcome kept in the Holm family, outcomes the same in every run (or fitted exactly)
+  read "not testable" and leave every other row's numbers as they are, both queue files and the budget guard's seed
+  choice;
   the Hessian direction from micro-batches against P1's function, and each queue job's GPU figure against the job's
   peak (`--memory`), the laptop flags under 2.5 GiB; the feasibility rule (only the final stage against step 0;
   raise within 1 and with no new outlier channel, keep otherwise, a diverged or unfinished run undecided; seed 6

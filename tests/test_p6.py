@@ -299,6 +299,33 @@ def test_family_readings(rng):
     assert "| Joseph->Noah | K | J |" in md
 
 
+def test_constant_outcomes_are_not_testable_and_leave_the_others_unchanged(rng):
+    # 2026-11-21: outcomes with the same value in all runs (n_outlier_channels at stage 0.01, the H_link pass flags)
+    # gave p_perm 0.001 and p_t 0 with estimate 0 in secondary.csv
+    df = _df({"K_max": (0.0, 0.05, 0.0), "eval_loss": (0.02, 0.0, 0.0), "n_outlier_channels": (0, 0, 0),
+              "tok_main_pass": (0, 0, 0)}, rng)
+    const = df.copy()
+    const["n_outlier_channels"] = 0
+    const["tok_main_pass"] = False
+    sec = p6_stats.secondary_tests(const, np.random.default_rng(7), 199)
+    ref = p6_stats.secondary_tests(df, np.random.default_rng(7), 199)
+    flat = sec["outcome"].isin(["n_outlier_channels", "tok_main_pass"])
+    assert flat.sum() == 6
+    assert (sec.loc[flat, "note"] == "not testable (the same value in every run)").all()
+    assert sec.loc[flat, ["p_perm", "p_t", "estimate"]].isna().all().all()
+    # the same permutations are drawn, so every other row has the numbers it has without the constant outcomes
+    cols = ["outcome", "term", "estimate", "t", "p_perm", "p_t", "mde_80"]
+    pd.testing.assert_frame_equal(sec.loc[~flat, cols].reset_index(drop=True),
+                                  ref.loc[~flat, cols].reset_index(drop=True))
+    # an outcome the seed blocks fit exactly (the same in every cell of a seed) has no residual variance either
+    df["by_seed"] = df["seed"] * 0.1
+    r = p6_stats.term_test(df, "by_seed", "N", rng, 99)
+    assert r["note"].startswith("not testable (no residual variance") and "p_perm" not in r
+    fam = p6_stats.family_tests(const.assign(K=0.0, alpha=const["K_max"]), rng, 99)
+    k = fam[fam["name"] == "K"]
+    assert (k["reading"] == "not testable (the same value in every run)").all() and (k["p_holm"] == 1.0).all()
+
+
 def test_missing_outcome_keeps_its_place_in_the_family(rng):
     df = _df({"K": (0, 0.08, 0)}, rng)
     fam = p6_stats.family_tests(df, rng, 199)

@@ -170,6 +170,20 @@ def _t(X, y, k):
     return beta[k] / se[k] if se[k] > 0 else (np.inf if beta[k] != 0 else 0.0)
 
 
+REL_TOL = 1e-10      # residuals this small against the outcome's magnitude are rounding, not variance
+
+
+def no_variation(y: np.ndarray, resid: np.ndarray) -> str | None:
+    """The note of an outcome that cannot be tested because nothing varies: the same value in every run, or a fit
+    with no residual variance left; None otherwise."""
+    tol = REL_TOL * float(np.max(np.abs(y)))
+    if float(np.ptp(y)) <= tol:
+        return "not testable (the same value in every run)"
+    if float(np.sqrt(np.mean(resid ** 2))) <= tol:
+        return "not testable (no residual variance: the model fits every run exactly)"
+    return None
+
+
 def within_block_perm(blocks: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     idx = np.arange(len(blocks))
     out = idx.copy()
@@ -190,9 +204,17 @@ def term_test(df: pd.DataFrame, col: str, term: str, rng: np.random.Generator, n
         return {**out, "note": "not testable (too few runs or levels)"}
     X, names, blocks = design(d)
     k = names.index(term)
-    beta, se, dof, _ = _ols(X, y)
+    beta, se, dof, resid = _ols(X, y)
     if dof <= 0 or not np.isfinite(se[k]):
         return {**out, "note": "not testable (no residual degrees of freedom)"}
+    note = no_variation(y, resid)
+    if note:
+        # (2026-11-21) an outcome with the same value in every run (or fitted exactly by the model) has no residual
+        # variance: t is 0/0, and the permutation p and t-test p it gave (0.001, 0) meant nothing. The permutations
+        # are still drawn, so every later test in the same random stream keeps the numbers it had before
+        for _ in range(n_perm):
+            within_block_perm(blocks, rng)
+        return {**out, "note": note}
     t_obs = beta[k] / se[k] if se[k] > 0 else np.inf
     Xr = np.delete(X, k, axis=1)
     br, *_ = np.linalg.lstsq(Xr, y, rcond=None)
@@ -340,7 +362,11 @@ def secondary_tests(df: pd.DataFrame, rng: np.random.Generator, n_perm: int = 99
             for term in ("N", "J", "NJ"):
                 r = term_test(d, col, term, rng, n_perm)
                 rows.append({"size": size, "stage": stage, **r})
-    return pd.DataFrame(rows)
+    out = pd.DataFrame(rows)
+    for c in ("df", "n_perm"):         # whole numbers in the csv beside the rows that are not testable
+        if c in out:
+            out[c] = out[c].astype("Int64")
+    return out
 
 
 def json_load(p: Path):
