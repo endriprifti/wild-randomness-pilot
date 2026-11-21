@@ -832,9 +832,10 @@ positive control (Joseph on the memory of the variant part) missed at the final 
 ("no link detected", 3 seeds). P6b is reported beside it and never pooled with it.
 
 - **Design** (`--design p6b_small`): P6's small design unchanged, the four 14M corners (light / Zipf 1.0 × H 0.5 /
-  0.9), 2^28 tokens in 8,192 steps, stages at steps 82, 819, 4,096 and 8,192, H7.1 at 50 and 100%, the same streams,
-  training, measurements and code; only the seeds differ. The 14-test family (Holm at 0.05, Freedman–Lane permutations
-  within seed blocks), the dilution rule and the manipulation checks are P6's.
+  0.9), 2^28 tokens in 8,192 steps, stages at steps 82, 819, 4,096 and 8,192, H7.1 at 50 and 100%, streams built the
+  same way (each seed builds its own), the same training, measurements and code; only the seeds differ. The 14-test
+  family (Holm at 0.05, Freedman–Lane permutations within seed blocks), the dilution rule and the manipulation checks
+  are P6's.
 - **Seeds 4, 5 and 7 to 14** (10 seeds, 40 runs; `P6B_SEEDS`), fixed here. P6's budget rule skipped seeds 4 and 5
   before any of their runs started (`skipped_by_budget.json`). Seed 6 is left out: the feasibility check trained its
   14M Zipf 1.0 × H 0.9 run, whose K and outlier channels were seen. The seed count is not set by a timing, and the
@@ -852,8 +853,10 @@ positive control (Joseph on the memory of the variant part) missed at the final 
 - **Positive-control rule** (fixed here; P6 had none): if Joseph's effect on the memory of the variant part at the
   final stage (the manipulation check "Joseph -> memory of the variant part (positive control)", its permutation p)
   does not reach p < 0.05, the Noah → Joseph tests that would read "no link detected" read "uninformative" instead. A
-  Noah → Joseph test that passes Holm keeps its reading, marked "positive control missed". The Joseph → Noah tests are
-  read as usual; every p and the Holm correction are unchanged. `family.csv` gets a `positive_control_passed` column.
+  Noah → Joseph test that passes Holm is still reported as a link, marked "positive control missed": the control
+  decides whether a null can be read, and Holm controls false positives whether it passes or not. The Joseph → Noah
+  tests are read as usual; every p and the Holm correction are unchanged. `family.csv` gets a
+  `positive_control_passed` column.
 - **H7.1 is kept** (outside the family): the runs are P6's, and no measurement code changes.
 - **P6's analysis is unchanged.** `--design small` takes none of these steps; on the same smoke runs P6's and P6b's
   `checkpoints.csv`, `manipulation_checks.csv` and `secondary.csv` are byte-identical (tests). One fix on the way,
