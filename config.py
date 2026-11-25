@@ -124,9 +124,14 @@ CONFIG = {
                 "olmo": {"repo": "allenai/OLMo-2-0425-1B", "sizes": ["1b"], "seeds": [0], "variant": "base",
                          "branch_regex": r"^stage1-step(\d+)-tokens",
                          "step_fracs": [0.0005, 0.002, 0.01, 0.03, 0.1, 0.25, 0.5, 0.75, 1.0]},
-                # OPTIONAL, last job, only if credits remain: needs the L40S (48 GB)
+                # OPTIONAL, last job, only if credits remain: needs the L40S (48 GB). Its pretraining branches are
+                # named like OLMo 2 1B's, "stage1-step{N}-tokens{T}B" (final stage-1 step 928646); a few early ones
+                # lacked the "stage1-" prefix (Hugging Face discussion #6 on OLMo-2-1124-7B), so the prefix is
+                # optional. Stage-2 ("stage2-ingredient...") and soup branches do not match. Until 2026-11-25 the
+                # regex was r"^step(\d+)-tokens", which matched no branch on 2026-11-24 (p1_olmo7b failed with "no
+                # step branches", so no unprefixed name was left then)
                 "olmo7b": {"repo": "allenai/OLMo-2-1124-7B", "sizes": ["7b"], "seeds": [0], "variant": "base",
-                           "branch_regex": r"^step(\d+)-tokens", "optional": True,
+                           "branch_regex": r"^(?:stage1-)?step(\d+)-tokens", "optional": True,
                            "step_fracs": [0.002, 0.01, 0.1, 0.5, 1.0],
                            # micro-batches (python memory_check.py, float32, eager attention): 27.2 GiB of weights;
                            # eval at 4 x 2,048 tokens would peak near 39.6 GiB and the JVP at 32 x 128 near
