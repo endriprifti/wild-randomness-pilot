@@ -1,0 +1,55 @@
+[
+ {
+  "name": "p7_transformer_sgd",
+  "args": [
+   "p7_transformer_sgd.py",
+   "--stop-file",
+   "results/p7_transformer_sgd/STOP"
+  ],
+  "out": "results/p7_transformer_sgd",
+  "gpu": 21.4
+ },
+ {
+  "name": "p7_h_link",
+  "args": [
+   "h_link.py",
+   "--p1",
+   "--p4",
+   "results/p7_transformer_sgd",
+   "--workers",
+   "2"
+  ],
+  "out": "results/h_link_p7_transformer_sgd",
+  "gpu": 0.0,
+  "after": [
+   "p7_transformer_sgd"
+  ]
+ },
+ {
+  "name": "p7_decomposition",
+  "args": [
+   "surrogate_decomposition.py",
+   "--designs",
+   "P7",
+   "--workers",
+   "2"
+  ],
+  "out": "results/surrogate_decomposition",
+  "gpu": 0.0,
+  "after": [
+   "p7_h_link"
+  ]
+ },
+ {
+  "name": "p7_analysis",
+  "args": [
+   "p7_stats.py"
+  ],
+  "out": "results/p7_transformer_sgd/analysis",
+  "gpu": 0.0,
+  "after": [
+   "p7_h_link",
+   "p7_decomposition"
+  ]
+ }
+]

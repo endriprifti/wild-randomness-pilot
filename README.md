@@ -1006,6 +1006,158 @@ python run_queue.py --jobs-file p6c_queue_small.json --status   # once it runs: 
 touch results/p6c_small/STOP                # lack of credit: stop after the seed that is running
 ```
 
+## P7: P4's transformer arm under SGD with momentum (fixed 2026-11-27, before any P7 run)
+
+Declared after P4's analysis (Endri's proposal of 2026-11-27, choice C, step 2) and fixed in this commit before any
+P7 run. In ResNet-18 under SGD, P4's fixed thresholds created bursts in the gradient noise (H_link's memory and width
+rose with clipping); in the 14M transformer under AdamW they changed neither (results brief 10). The two arms differ
+in optimizer, architecture, data and batch. P7 changes only the optimizer of the transformer arm, so it asks whether
+the optimizer alone brings back ResNet-18's pattern. P7 is reported beside P4 and never pooled with it.
+
+- **Design** (`p7_transformer_sgd.py`, `config.py` "p7_transformer_sgd"). P4's transformer arm as it is: the
+  Pythia-14M shape trained from scratch, FineWeb-Edu sample-10BT at P4's pinned revision with P4's cached token IDs,
+  9,155 steps of 64 × 512 tokens, warm-up over 1% of steps (91) and then a constant rate, the eight fixed random
+  directions, the unclipped projections recorded before clipping (`hgrad_series/`), P4's measurements at the end and
+  P4's divergence rule (factor 3). The one change: `torch.optim.SGD` with momentum 0.9, Nesterov off and weight
+  decay 5 × 10⁻⁴, the setting of P4's ResNet-18 arm. AdamW's 0.1 is not used: in torch's SGD the decay is added to
+  the gradient, and 0.1 at a rate near 1 would shrink the weights by about a tenth per step. λ_max, the Hessian trace
+  and adaptive sharpness are not measured, because P7 does not use them; α̂'s random direction is then the first draw
+  of the run's generator.
+- **Arms and seeds.** Unclipped; fixed thresholds at targets 1, 10 and 50%, each the (1 − p) quantile of the same
+  seed's unclipped post-warm-up gradient norms (P4's rule); and the 10% target at matched update length (P4's rule:
+  the rate times the unclipped run's mean update length over the plain 10% run's). Seeds 0 to 4 are P4's, so each
+  run shares its initial weights, data order and directions with its AdamW twin in P4 (the same tag,
+  `transformer_s<k>_fixed<p>[_matched]`). These are new runs, so reusing P4's seeds selects nothing. That makes 25
+  runs.
+- **Phase 0, the learning rate.** The rule is fixed here and applied by the job, which writes `phase0.json` before
+  Phase 1. Seed 99 (left out of every analysis), unclipped, at rates 0.03, 0.1, 0.3 and 1.0:
+  - A rate passes if its run does not diverge and its test loss is at most L0 − 0.7 (L0 − 4.460). L0 is the run's
+    first training loss, and 4.460 is the mean test loss of P4's five unclipped AdamW runs, so a passing run captures
+    at least 70% of AdamW's loss reduction.
+  - The passing rate with the lowest test loss is chosen.
+  - If none passes, two more rates are run half a decade beyond the better end: 0.01 and 0.003 if the 0.03 run's
+    test loss is at most the 1.0 run's (a diverged run counts as infinite), else 3.0 and 10. The same rule applies,
+    and the rate is chosen among these two only.
+  - If none passes again, P7 stops before Phase 1 (`phase0.json` status "stopped") and reads "SGD with momentum did
+    not train the transformer to the bound at P4's budget".
+  - Each Phase 0 run is saved, and a restart decides Phase 0 again from the saved runs, so it never changes the rate.
+- **The confirmatory family** (`p7_stats.py`). The four plain arms of each seed (unclipped, 1, 10, 50%) are scored
+  −1.5, −0.5, +0.5 and +1.5. For each outcome: least squares with seed blocks and the score (the trend), a two-sided
+  permutation of the four arm labels within each seed (9,999 draws; the statistic is the slope), and Holm over the
+  two tests at 0.05. The outcomes come from `h_link.py`'s main rows (P4's H_link code, scales 8 to n/10), and both
+  are predicted to rise with clipping:
+  - T1, H(|x|) by DFA (`H_abs_dfa`): ResNet-18's median went from 0.528 to 0.613;
+  - T2, the width beyond the IAAFT surrogates (`delta_h − delta_h_iaaft_mean`): ResNet-18's Δh went from 0.022 to
+    about 0.042, with IAAFT means of 0.026 to 0.030.
+- **Gates.**
+  - Phase 0 passed. A Phase 1 run that diverged is reported (`gates.csv`) and left out.
+  - Clipping manipulation: the realized clipped fractions must be ordered (unclipped < 1% < 10% < 50%, means over
+    seeds), with the 10% arm clipping at least 3% of steps and the 50% arm 25 to 75%. Otherwise the tests that do
+    not pass read "uninformative (clipping manipulation missed)".
+  - Width beyond the surrogates (T2): a T2 that passes with a rise counts as width beyond the surrogates only if the
+    observed Δh also rises (same model, trend positive, 95% interval above 0). Otherwise it reads "the surrogates'
+    baseline moved, not the width".
+- **Readings.**
+  - T1 or T2 passes with a rise (T2 with its gate): "ResNet-18's clipping pattern appears in the transformer under
+    SGD", or "... in memory and width" when both pass.
+  - A test that passes with a fall: "clipping effect opposite to ResNet-18's".
+  - Neither passes: "no clipping effect detected under SGD", with the intervals and the detectable rises. The
+    optimizer swap alone does not bring back ResNet-18's pattern at this power. It does not mean "architecture or
+    data explain it", because P7 does not vary them.
+  - Pass counts of the full H_link rule are reported by arm but not tested. The arms of one seed share their initial
+    weights, data order and directions, and in P4's transformer the passes clustered by seed.
+- **Choices of ours**, fixed here:
+  - Only seeds with all four plain arms saved enter the tests, so a STOP or a crash leaves out whole seeds, not
+    single arms. A diverged run, or a run whose outcome is not finite, is left out of its seed.
+  - The rises and their intervals are also given over the whole range of scores (3 × the slope).
+  - The rise detectable with power 0.8 is given at two-sided 0.05, the convention of the proposal's power numbers
+    (with the spread of P4's AdamW series: 0.008 in H(|x|), 0.003 in the width excess). It is also given at Holm's
+    first threshold, 0.025.
+- **Exploratory**, uncorrected and listed here (`exploratory.csv`, `twins.csv`, `arms.csv`):
+  - each arm minus the unclipped arm, paired by seed;
+  - the matched 10% arm against the plain 10% arm;
+  - the trend on the detrended, rescaled and sensitivity rows;
+  - the decomposition of the width into the observed Δh and the shuffled, phase-randomized and IAAFT surrogate means
+    (`surrogate_decomposition.py --designs P7`, below; brief 9, decision 6);
+  - the gradient noise's α̂ and ζ̂ at the end, and the losses;
+  - each SGD run against its AdamW twin in P4 (`results/p4_transformer/runs.csv` and the `p4_transformer` rows of
+    `results/h_link/p4_grad.csv`).
+- **P4's code paths are unchanged.** `p4_clipping.train()` takes `opt_cfg`, whose default None is P4's AdamW, and
+  `measure()` takes a skip set. P4's own command line passes neither, and its rows get no new columns. A slow test
+  runs P4's smoke with this file and with the file before P7 (b1e4472) and compares the rows (wall time aside), the
+  gradient series and the unit files, byte for byte. Another test checks that P4's config section, and every other
+  section, is unchanged, so P4's saved units still resume. `common/` is not changed.
+
+Hours: about 1 L40S hour per run, as in P4 (somewhat less without the Hessian measurements). That gives 25 runs plus
+4 to 6 Phase 0 runs, about 30 hours (about $20). Then h_link on the CPU takes about 4 min per run per worker (2
+workers), and the decomposition about 10 s per run.
+
+**Queue and start after P6c.** `p7_queue.json` runs four jobs:
+- `p7_transformer_sgd` (GPU, 21.4 GiB as P4's transformer): Phase 0, then Phase 1 seed by seed, into
+  `results/p7_transformer_sgd/`. Each run is saved as it ends, and the same command goes on from the saved runs.
+- `p7_h_link`: `h_link.py --p1 --p4 results/p7_transformer_sgd` into its own `results/h_link_p7_transformer_sgd/`, so
+  `results/h_link/` keeps P4's CSVs. h_link's default discovery takes only `results/p4_*`, so P7's series never enter
+  P4's tables.
+- `p7_decomposition`: `surrogate_decomposition.py --designs P7` into `results/surrogate_decomposition/` (CPU).
+- `p7_analysis`: `p7_stats.py` into `results/p7_transformer_sgd/analysis/` (CPU): `summary.md` and `summary.json`
+  (the reading), `tests.csv`, `gates.csv`, `arms.csv`, `exploratory.csv`, `twins.csv`.
+
+`p7_after_p6c.py` starts that queue after P6c. It takes no lock the others look at; it reads `/proc`,
+`logs/progress.txt` and `/proc/locks` every 60 s. It starts `run_queue.py --jobs-file p7_queue.json` (output in
+`logs/run_queue_p7.out`) only when all of these hold:
+- no `p6c_after_olmo.py` holds `logs/.p6c_after_olmo.lock`, and no `run_queue.py` runs `p6c_queue_small.json`;
+- every P6c job with a progress line has END or SKIP as its last line, and at least one has a line (any exit code,
+  since a failed or stopped P6c has ended too);
+- `logs/.run_lane.queue.lock` is free.
+
+It refuses to start if P6c is neither waiting, running nor ended, if a P7 queue or another waiter runs, or if every
+P7 job is done. A P6c START line with no process is reported every hour and waited out. If `results/p6c_small/STOP`
+exists when P6c ends (credit ran out), the waiter starts nothing and says so. `kill -TERM $(cat
+logs/p7_after_p6c.pid)` stops the wait (nothing started) or, after the start, P7 (saved runs stay).
+
+**Stop for lack of credit** (as P6b): if the balance would fall below $40, `touch results/p7_transformer_sgd/STOP`.
+The job checks it before each Phase 0 run and before each seed of Phase 1: the run or seed that is running finishes,
+nothing more starts, and the job writes `stopped.json` and exits 0. h_link, the decomposition and the analysis then run on the
+complete seeds.
+
+```bash
+python p7_after_p6c.py --check            # read-only: P6c, the queue lock, what it would do
+setsid nohup nice -n 10 taskset -c 0-10 python p7_after_p6c.py > logs/p7_after_p6c.out 2>&1 < /dev/null &
+python p7_transformer_sgd.py --plan --device cpu   # Phase 0's state and the Phase 1 runs saved
+python run_queue.py --jobs-file p7_queue.json --status
+touch results/p7_transformer_sgd/STOP     # lack of credit: stop after the seed that is running
+```
+
+## The surrogate decomposition of the gradient width (step 1, added 2026-11-27)
+
+`surrogate_decomposition.py` is the step-1 computation of results brief 11 (procedure fixed 2026-11-27 before any
+value was computed, `docs/surrogate_decomposition.md`), with its paths relative to `results/`. It splits the baseline
+of H_link's width part (IAAFT surrogates, which keep both the marginal and the spectrum) into its two parts. Per run
+it computes:
+- the observed MFDFA width Δh (q = 0.5 and 4, main scales 8 to n/10, mean over the 8 directions);
+- the mean, sd, 95% quantile and p of 99 shuffled surrogates (which keep the marginal only) and of 99
+  phase-randomized surrogates (which keep the spectrum only);
+- the excess kurtosis of the marginal.
+
+The IAAFT mean and quantile are taken from H_link's files. They are recomputed only on the check runs (brief 11's
+nine, plus the four corners of P6c's first seed and P7's seed 0 unclipped and fixed 10%), where they must agree
+within Monte Carlo error. The random numbers, the order of the draws and the warm-up cut are the brief's, so on the
+same series the script gives brief 11's numbers. `reference/surrogate_decomposition_brief11.csv` holds the brief's 242
+runs (P6, P6b, P4 transformer, P4 ResNet-18), and `--compare` checks a rerun against it. The analysis prints the
+brief's tables (Noah effects with seed blocks for P6, P6b and P6c; per-arm medians and counts of Δh above each
+surrogate kind's 95% quantile for P4 and P7). It then applies the procedure's reading rules. On brief 11's runs these
+give: P6 and P6b, the baseline effect sits in the marginal; P4 ResNet-18 and P4 transformer, width beyond the
+marginal and beyond the spectrum taken one at a time. It is exploratory and outside every family. CPU only, nice 19,
+one thread per worker; units are saved one per run in `results/surrogate_decomposition/units/`, and a rerun computes
+only the missing ones.
+
+```bash
+python surrogate_decomposition.py --list                         # runs found and saved per design
+python surrogate_decomposition.py --designs P6,P6b,P4T,P4R --compare reference/surrogate_decomposition_brief11.csv
+python surrogate_decomposition.py --designs P6c                  # after P6c
+python surrogate_decomposition.py --designs P7                   # P7's queue runs this
+```
+
 ## Full run on one L40S: `run_all.sh`
 
 No RTX 5090 was available, so stage 1 runs on a CloudRift L40S (48 GB; the smoke run there passed all 9 jobs,
@@ -1671,7 +1823,7 @@ before the run.
 
 ## Unit tests
 
-`python -m pytest -q` (311 tests, 10-15 min on a 4-core CPU; `-m "not slow"` skips the slowest). Synthetic data with
+`python -m pytest -q` (346 tests, 10-15 min on a 4-core CPU; `-m "not slow"` skips the slowest). Synthetic data with
 known parameters:
 
 - stable density against the Gaussian and Cauchy closed forms and against SciPy; ML fit recovers α ∈ {1.2, 1.5, 1.8},
@@ -1821,6 +1973,21 @@ known parameters:
   checkpoint columns unchanged); the waiter starts the P6c queue only after OLMo-7B's process has gone, its END line
   is written and no queue holds the lock, refuses when it would wait for ever, next to another waiter or with
   everything done, and its `--check` changes nothing.
+- P7 (`tests/test_p7.py`): the settings change only the optimizer (SGD, momentum 0.9, Nesterov off, weight decay
+  5 × 10⁻⁴) and every config section of the commit before P7 hashes as before; the optimizer factory; P4's smoke with
+  the file before P7 and with this one, byte for byte (slow); the Phase 0 rule (the bound per run, the lowest passing
+  test loss, a diverged run never passing, the extension at the better end, the stop with its reading); a STOP before
+  Phase 0 starts nothing; the job end to end on a smoke seed (SGD in every row, no Hessian columns, the matched rate,
+  P4's tags that h_link reads, a resume that trains nothing, a STOP before an unsaved seed; slow); the analysis on
+  synthetic tables (rises in memory and width, memory only, no effect with the detectable rises, a fall, a width
+  excess from a falling IAAFT baseline, the manipulation gate, a stopped Phase 0, incomplete seeds and diverged runs
+  left out, the slope equal to least squares with seed blocks, the permutation p, Holm, the AdamW twins); the queue
+  file and its `--dry-run`; the waiter starts P7 only after P6c's waiter, its queue process and the queue lock have
+  all gone, waits out a lost START, starts nothing after P6c's STOP, refuses when it would wait for ever, next to
+  another waiter or with everything done, and its `--check` changes nothing.
+- The surrogate decomposition (`tests/test_surrogate_decomposition.py`): paths relative to results/, one run computed
+  as the brief computed it (the same numbers), resume, the tables and `--compare`; on brief 11's 242 runs the
+  analysis gives the brief's numbers and the procedure's readings.
 - `p6_after_queue.py` (`tests/test_p6_after_queue.py`, stand-in processes): the P6 queue starts only after the
   running queue has released its lock, and p1_olmo7b's own lane wait (`gpu_locks.wait_for_lanes`, checking every 10
   ms) gets through only after the P6 queue has ended, while a plain wait-then-start lets it through the gap; a job

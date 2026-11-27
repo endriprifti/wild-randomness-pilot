@@ -375,6 +375,47 @@ CONFIG = {
         "smoke": {"models": [["EleutherAI/pythia-14m", "step143000"]], "from_p1_top_k": 0,
                   "seq_len": 60, "n_seqs": 2, "dtypes": ["float32"], "fast_math": [1, 0]},
     },
+    # ------------------------------------------------------------------ P7: P4's transformer arm under SGD (2026-11-27)
+    # Endri's proposal of 2026-11-27 (p7-proposal.md; README "P7"), fixed before any P7 run. Only the optimizer of P4's
+    # transformer arm changes: everything else is p4_clipping's "transformer" settings (FineWeb-Edu at the same pin and
+    # cached sequences, 9,155 steps of 64 x 512 tokens, warm-up over 1% of steps then a constant rate, the eight fixed
+    # directions, P4's measurements, divergence factor 3). Reported beside P4, never pooled with it.
+    "p7_transformer_sgd": {
+        "full": {
+            # torch.optim.SGD at the setting of P4's own SGD arm (ResNet-18). Not AdamW's weight decay 0.1: in torch's
+            # SGD the decay is added to the gradient, and 0.1 at a rate near 1 would shrink the weights by about a
+            # tenth per step
+            "optimizer": {"name": "sgd", "momentum": 0.9, "nesterov": False, "weight_decay": 5e-4},
+            # Phase 0, the learning rate by a rule fixed now: seed 99, unclipped, these rates; a rate passes if the run
+            # does not diverge and test loss <= L0 - capture * (L0 - adamw_test_loss), L0 = the run's first training
+            # loss, adamw_test_loss = the mean test loss of P4's five unclipped AdamW runs; the passing rate with the
+            # lowest test loss is chosen; if none passes, two more rates half a decade beyond the better end of the
+            # grid (extend_low or extend_high), same rule; if none passes again, P7 stops before Phase 1
+            "phase0": {"seed": 99, "lrs": [0.03, 0.1, 0.3, 1.0], "extend_low": [0.01, 0.003],
+                       "extend_high": [3.0, 10.0], "capture": 0.7, "adamw_test_loss": 4.460},
+            # Phase 1: P4's seeds (each SGD run shares its initial weights, data order and directions with an AdamW
+            # run of P4); arms [rule, p_clip target, matched]: unclipped, fixed 1, 10, 50% (thresholds by P4's rule
+            # from the same seed's unclipped run), and the 10% target at matched update length (P4's rule)
+            "seeds": [0, 1, 2, 3, 4],
+            "arms": [["fixed", 0.0, False], ["fixed", 0.01, False], ["fixed", 0.1, False], ["fixed", 0.5, False],
+                     ["fixed", 0.1, True]],
+            # measurements P7 does not use, left out (P4's lambda_max, Hessian trace and adaptive sharpness)
+            "skip_measures": ["hessian"],
+            # the confirmatory family (p7_stats.py): the four plain arms scored -1.5, -0.5, +0.5, +1.5; least squares
+            # with seed blocks; two-sided permutation of the arm labels within each seed; Holm over T1 and T2
+            "analysis": {"scores": {"0.0": -1.5, "0.01": -0.5, "0.1": 0.5, "0.5": 1.5}, "n_perm": 9999,
+                         "alpha": 0.05, "power": 0.8,
+                         # clipping manipulation gate: realized clipped fractions ordered over the plain arms (means
+                         # over seeds), the 10% arm clips at least min_10 of steps, the 50% arm within range_50
+                         "manipulation": {"min_10": 0.03, "range_50": [0.25, 0.75]}},
+        },
+        "smoke": {
+            # smoke: P4's smoke transformer (110 steps); a pass needs only a lower test loss than the first loss
+            "phase0": {"lrs": [0.1, 1.0], "capture": 0.0},
+            "seeds": [0, 1],
+            "analysis": {"n_perm": 199},
+        },
+    },
 }
 
 HARDWARE = {
@@ -387,6 +428,7 @@ HARDWARE = {
     "p4_clipping": (30, "Kaggle T4 (16 GB) / RTX 5090"),
     "p1_checkpoints": (45, "RTX 5090 for every default suite (OLMo 2 1B included); optional OLMo 2 7B: L40S (48 GB)"),
     "p3_fractional_memory": (65, "Kaggle T4 (16 GB) / RTX 5090"),
+    "p7_transformer_sgd": ("~30 (25 runs + up to 6 Phase 0 runs at P4's ~1 L40S hour)", "L40S (as P4's transformer)"),
 }
 
 

@@ -33,6 +33,11 @@ from its own seed (its tag), so restarts and the order of runs change nothing; b
 job shared one generator (p4_resnet18 of the first L40S run). The transformer's token IDs are cached (see
 transformer_data).
 
+P7 (2026-11-27, p7_transformer_sgd.py) reuses this file's transformer arm with one change, the optimizer: train()
+takes opt_cfg (None, the default, is P4's AdamW, unchanged) and measure() a skip set ({"hessian"} leaves out
+lambda_max, the Hessian trace and adaptive sharpness). P4's own runs call both as before, so their outputs are
+unchanged (tests/test_p7.py runs P4's smoke with this file and with the file before P7 and compares them).
+
 Commands:
   python p4_clipping.py --model transformer
   python p4_clipping.py --model resnet18
@@ -214,7 +219,22 @@ def flat_dirs(model, k, seed, device):
     return dirs
 
 
-def train(kind, cfg, data, rule, p_clip, seed, lr_scale, device, run, save_stages=None, ref_norms=None):
+def make_optimizer(params, lr: float, opt_cfg: dict):
+    """The optimizer of a P7 run (opt_cfg from config.py p7_transformer_sgd): "sgd" is torch.optim.SGD with momentum,
+    Nesterov and weight decay as given (in torch's SGD the decay is added to the gradient); "adamw" is P4's AdamW
+    (betas 0.9, 0.95), for tests."""
+    name = opt_cfg["name"]
+    if name == "sgd":
+        return torch.optim.SGD(params, lr=lr, momentum=float(opt_cfg["momentum"]),
+                               nesterov=bool(opt_cfg.get("nesterov", False)),
+                               weight_decay=float(opt_cfg["weight_decay"]))
+    if name == "adamw":
+        return torch.optim.AdamW(params, lr=lr, weight_decay=float(opt_cfg["weight_decay"]),
+                                 betas=tuple(opt_cfg.get("betas", (0.9, 0.95))))
+    raise ValueError(f"unknown optimizer {name!r}")
+
+
+def train(kind, cfg, data, rule, p_clip, seed, lr_scale, device, run, save_stages=None, ref_norms=None, opt_cfg=None):
     runtime.set_all_seeds(seed)
     is_lm = kind == "transformer"
     c = cfg["transformer"] if is_lm else cfg["resnet18"]
@@ -225,7 +245,10 @@ def train(kind, cfg, data, rule, p_clip, seed, lr_scale, device, run, save_stage
     model.train()
     lr = c["lr"] * lr_scale
     if is_lm:
-        opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=c["weight_decay"], betas=(0.9, 0.95))
+        if opt_cfg is None:      # P4
+            opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=c["weight_decay"], betas=(0.9, 0.95))
+        else:                    # P7: the optimizer swap (P4's warm-up, then a constant rate, as below)
+            opt = make_optimizer(model.parameters(), lr, opt_cfg)
         n_train = len(data["train"])
         steps = max(1, n_train // c["batch"])
     else:
@@ -281,11 +304,14 @@ def train(kind, cfg, data, rule, p_clip, seed, lr_scale, device, run, save_stage
             for st in save_stages:
                 if step + 1 == max(1, int(round(st * steps))):
                     stage_ckpts[st] = copy.deepcopy(model.state_dict())
-    return model, {"steps": steps, "warmup_steps": warm, "diverged": diverged, "p_clip_realized": clip.stats.p_clip,
-                   "mean_update_len": float(np.mean(upd)) if upd else float("nan"), "lr": lr,
-                   "final_train_loss_ema": float(np.mean(losses[-max(1, len(losses) // 20):])) if losses else float("nan"),
-                   "wall_s": time.perf_counter() - t0, "g_max": clip.g_max,
-                   "norms_post_warmup": clip.stats.norms[warm:]}, np.array(proj), stage_ckpts
+    info = {"steps": steps, "warmup_steps": warm, "diverged": diverged, "p_clip_realized": clip.stats.p_clip,
+            "mean_update_len": float(np.mean(upd)) if upd else float("nan"), "lr": lr,
+            "final_train_loss_ema": float(np.mean(losses[-max(1, len(losses) // 20):])) if losses else float("nan"),
+            "wall_s": time.perf_counter() - t0, "g_max": clip.g_max,
+            "norms_post_warmup": clip.stats.norms[warm:]}
+    if opt_cfg is not None:      # P7: its Phase 0 rule needs the first training loss (P4's rows stay as they were)
+        info.update(optimizer=opt_cfg["name"], first_train_loss=loss0, steps_run=len(losses))
+    return model, info, np.array(proj), stage_ckpts
 
 
 # ----------------------------------------------------------------------------- measurement
@@ -309,7 +335,7 @@ def mean_loss(kind, model, X, device, bs=64):
     return tot / n, err / n
 
 
-def measure(kind, model, data, cfg, run, rng, device, proj, warm):
+def measure(kind, model, data, cfg, run, rng, device, proj, warm, skip=()):
     M = cfg["measure"]
     T, S = cfg["tails"], cfg["scale"]
     out = {}
@@ -324,17 +350,18 @@ def measure(kind, model, data, cfg, run, rng, device, proj, warm):
     out["gap"] = out["test_loss"] - out["train_loss"]
     out["ood_loss"], out["ood_err"] = mean_loss(kind, model, data["ood"], device, bs=ebs)
     model.eval()
-    hb = M["hessian_batch"]
-    hbatch = data["train"][:hb].to(device).long() if is_lm else (data["train"][0][:hb].to(device), data["train"][1][:hb].to(device))
-    params = gradients.select_params(model, None)
-    hvp, p0 = gradients.hvp_fn(model, pel, hbatch, params, chunk=mb)
     gen = torch.Generator().manual_seed(run.seed)
-    vals, _ = gradients.top_eigvecs(hvp, p0, 1, M["power_iters"], gen)
-    out["lambda_max"] = vals[0]
-    out["hessian_trace"] = gradients.hutchinson_trace(hvp, p0, M["trace_samples"], gen)
-    out["adaptive_sharpness"] = gradients.adaptive_sharpness(model, pel, hbatch, M["sharp_rho"], M["sharp_steps"],
-                                                             chunk=mb)
-    del hvp, p0
+    if "hessian" not in skip:    # P7 leaves these out (skip={"hessian"}); its alpha direction is then drawn first
+        hb = M["hessian_batch"]
+        hbatch = data["train"][:hb].to(device).long() if is_lm else (data["train"][0][:hb].to(device), data["train"][1][:hb].to(device))
+        params = gradients.select_params(model, None)
+        hvp, p0 = gradients.hvp_fn(model, pel, hbatch, params, chunk=mb)
+        vals, _ = gradients.top_eigvecs(hvp, p0, 1, M["power_iters"], gen)
+        out["lambda_max"] = vals[0]
+        out["hessian_trace"] = gradients.hutchinson_trace(hvp, p0, M["trace_samples"], gen)
+        out["adaptive_sharpness"] = gradients.adaptive_sharpness(model, pel, hbatch, M["sharp_rho"], M["sharp_steps"],
+                                                                 chunk=mb)
+        del hvp, p0
     # alpha / zeta of unclipped minibatch noise at the training batch size, one random direction. The pool is drawn
     # without replacement in a fixed random order (pool_ids), so its blocks are random batches, as SGD draws them;
     # before 2026-11-17 it was the first n_pool training sequences in order (adjacent chunks of the same documents)
