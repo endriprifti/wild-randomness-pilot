@@ -473,12 +473,54 @@ def test_p7_queue_dry_run(tmp_path):
 WAITER = str(ROOT / "p7_after_p6c.py")
 P6C_JOBS = ["p6c_small_14m_s15", "p6c_small_14m_s16", "p6c_small_analysis"]
 
+# The waiter reads every process on the machine (/proc), so a real P6c queue running on the same machine (the server,
+# 2026-11-27) was taken for the test's own and the waiter tests waited for it. The tests therefore run
+# p7_after_p6c.py, unchanged, through this wrapper, which keeps only the processes whose working directory is inside
+# the test's --root; the stand-ins and the queue the waiter starts run there. Locks are read by file (the test's
+# logs/), so they need nothing.
+ISOLATE = """import os, runpy, sys
+from pathlib import Path
+repo, root = sys.argv[1], Path(sys.argv[2]).resolve()
+del sys.argv[1:3]
+sys.path.insert(0, repo)
+import p6_after_queue as aq
+_every = aq.processes
 
-def standin(tmp_path, script, *args):
+
+def processes():
+    out = {}
+    for pid, argv in _every().items():
+        try:
+            cwd = Path(os.readlink(f"/proc/{pid}/cwd")).resolve()
+        except OSError:
+            continue
+        if cwd == root or root in cwd.parents:
+            out[pid] = argv
+    return out
+
+
+aq.processes = processes
+sys.argv[0] = str(Path(repo) / "p7_after_p6c.py")
+runpy.run_path(sys.argv[0], run_name="__main__")
+"""
+
+
+def waiter_cmd(tmp_path):
+    """The command that runs p7_after_p6c.py seeing only the processes of this test (ISOLATE)."""
+    f = tmp_path / "isolate" / "isolated_p7_after_p6c.py"
+    if not f.exists():
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(ISOLATE)
+    return [PY, str(f), str(ROOT), str(tmp_path)]
+
+
+def standin(tmp_path, script, *args, cwd=None):
+    """A python process whose command line runs `script` (sleeps until killed), started in the test's root (or in
+    cwd: outside it, as a process of the machine that is not the test's)."""
     f = tmp_path / "bin" / script
     f.parent.mkdir(exist_ok=True)
     f.write_text("import time\nwhile True:\n    time.sleep(0.05)\n")
-    return subprocess.Popen([PY, str(f), *args])
+    return subprocess.Popen([PY, str(f), *args], cwd=str(cwd or tmp_path))
 
 
 def progress(logs, *lines):
@@ -501,9 +543,9 @@ def setup(tmp_path):
 
 
 def waiter(tmp_path, jf, af, *extra):
-    return subprocess.Popen([PY, WAITER, "--root", str(tmp_path), "--jobs-file", str(jf), "--after-jobs-file",
-                             str(af), "--poll", "0.2", *extra], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True)
+    return subprocess.Popen([*waiter_cmd(tmp_path), "--root", str(tmp_path), "--jobs-file", str(jf),
+                             "--after-jobs-file", str(af), "--poll", "0.2", *extra], stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True)
 
 
 def read_until(p, text, timeout=30.0):
@@ -543,6 +585,8 @@ def kill(*ps):
 def test_p7_starts_only_after_p6c_has_ended(tmp_path):
     logs, jf, af, end = setup(tmp_path)
     p6c_waiter = hold(logs / ".p6c_after_olmo.lock")                 # P6c's waiter, waiting for OLMo-7B
+    # a P6c queue of the machine outside the test's root (the server's real one) runs throughout and is not the test's
+    foreign = standin(tmp_path, "run_queue.py", "--jobs-file", "p6c_queue_small.json", cwd=ROOT)
     w = q = queue = None
     try:
         w = waiter(tmp_path, jf, af)
@@ -572,7 +616,7 @@ def test_p7_starts_only_after_p6c_has_ended(tmp_path):
         assert end.read_text() == "ran" and (logs / "p7_standin.done").exists()
         assert "P6c has ended" in out and "the P7 queue ended with exit 0" in out
     finally:
-        kill(w, q, queue, p6c_waiter)
+        kill(w, q, queue, p6c_waiter, foreign)
 
 
 def test_p6c_stopped_for_lack_of_credit_starts_nothing(tmp_path):
@@ -581,24 +625,30 @@ def test_p6c_stopped_for_lack_of_credit_starts_nothing(tmp_path):
              "2026-11-28T11:00:00Z  END    p6c_small_14m_s15  exit 0  elapsed 1.00 h  total 2.00 h  (queue)")
     (tmp_path / "results" / "p6c_small").mkdir(parents=True)
     (tmp_path / "results" / "p6c_small" / "STOP").write_text("")
-    r = subprocess.run([PY, WAITER, "--root", str(tmp_path), "--jobs-file", str(jf), "--after-jobs-file", str(af),
-                        "--poll", "0.2"], capture_output=True, text=True, timeout=120)
+    r = subprocess.run([*waiter_cmd(tmp_path), "--root", str(tmp_path), "--jobs-file", str(jf), "--after-jobs-file",
+                        str(af), "--poll", "0.2"], capture_output=True, text=True, timeout=120)
     assert r.returncode == 0 and "P7 not started" in r.stdout and not end.exists()
 
 
 def test_p7_waiter_refusals_and_check(tmp_path):
     logs, jf, af, end = setup(tmp_path)
-    run = lambda *a: subprocess.run([PY, WAITER, "--root", str(tmp_path), *a], capture_output=True, text=True,
-                                    timeout=60)
+    run = lambda *a: subprocess.run([*waiter_cmd(tmp_path), "--root", str(tmp_path), *a], capture_output=True,
+                                    text=True, timeout=60)
     r = run("--jobs-file", str(tmp_path / "none.json"), "--after-jobs-file", str(af))
     assert r.returncode == 2 and "is missing" in r.stdout
     r = run("--jobs-file", str(jf), "--after-jobs-file", str(tmp_path / "none.json"))
     assert r.returncode == 2 and "P6c's jobs file" in r.stdout
-    r = run("--jobs-file", str(jf), "--after-jobs-file", str(af))
-    assert r.returncode == 2 and "P6c is neither waiting" in r.stdout
-    p6c_waiter = hold(logs / ".p6c_after_olmo.lock")
-    w = None
+    # a P6c queue of the machine, outside the test's root (as the server's real one): the plain waiter sees it, the
+    # isolated one does not
+    foreign = standin(tmp_path, "run_queue.py", "--jobs-file", "p6c_queue_small.json", cwd=ROOT)
+    p6c_waiter = w = None
     try:
+        r = subprocess.run([PY, WAITER, "--root", str(tmp_path), "--jobs-file", str(jf), "--after-jobs-file", str(af),
+                            "--check"], capture_output=True, text=True, timeout=60)
+        assert "P6c: running" in r.stdout, r.stdout + r.stderr
+        r = run("--jobs-file", str(jf), "--after-jobs-file", str(af))
+        assert r.returncode == 2 and "P6c is neither waiting" in r.stdout
+        p6c_waiter = hold(logs / ".p6c_after_olmo.lock")
         before = sorted(p.name for p in logs.iterdir())
         r = run("--jobs-file", str(jf), "--after-jobs-file", str(af), "--check")
         assert r.returncode == 0, r.stdout + r.stderr
@@ -615,7 +665,7 @@ def test_p7_waiter_refusals_and_check(tmp_path):
         r = run("--jobs-file", str(jf), "--after-jobs-file", str(af))
         assert r.returncode == 2 and "every P7 job is done already" in r.stdout
     finally:
-        kill(w, p6c_waiter)
+        kill(w, p6c_waiter, foreign)
 
 
 def test_waiter_state(tmp_path):
