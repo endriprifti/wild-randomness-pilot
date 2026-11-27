@@ -17,8 +17,9 @@ tests at 0.05. Outcomes from h_link.py's main rows:
 Gates (fixed now):
   - Phase 0 passed (phase0.json status "chosen"); a Phase 1 run that diverged is reported and left out.
   - clipping manipulation: the realized clipped fractions are ordered (means over seeds: unclipped < 1% < 10% < 50%),
-    the 10% arm clips at least 3% of steps and the 50% arm 25 to 75%; if not, the tests that do not pass read
-    "uninformative (clipping manipulation missed)".
+    the 10% arm clips at least 3% of steps and the 50% arm 25 to 95% (amended 2026-11-27, before any P7 run, from
+    25 to 75%: under SGD clipping slows the steps, so the realized fraction exceeds the target); if not, the tests
+    that do not pass read "uninformative (clipping manipulation missed)".
   - width beyond the surrogates (T2): a T2 that passes with a rise reads as width beyond the surrogates only if the
     observed delta_h also rises (same model, slope positive, 95% t-interval above 0); otherwise "the surrogates'
     baseline moved, not the width".

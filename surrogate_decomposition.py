@@ -33,7 +33,10 @@ Analysis (from the saved units; analyse() is the brief's analyse.py with its pri
     runs whose Delta h exceeds each kind's 95% quantile. Reading: over the fixed arms with targets 1 to 50% (plain and
     matched), the width is beyond the marginal and beyond the spectrum taken one at a time if Delta h exceeds the
     shuffled and the phase-randomized 95% quantiles in at least as many runs as the IAAFT one; otherwise the kind
-    that keeps the width is named.
+    that keeps the width is named. Guard (Endri, 2026-11-27; procedure.md applies the rule to ResNet-18 and describes
+    the transformer by counts and medians): the rule is applied only where Delta h exceeds the IAAFT 95% quantile in
+    at least half of those runs; otherwise the reading is "no reading: the width exceeds the IAAFT quantile in only
+    n of N runs", with the counts and the arm medians of Delta h and of the phase-randomized mean. No number changes.
 
 Outputs (--out, default results/surrogate_decomposition/): units/<design>__<run>.json (one per run; a rerun
 computes only the missing ones), <design>_units.csv (one row per run), and from every design saved: units.csv,
@@ -313,8 +316,7 @@ def analyse(U: pd.DataFrame) -> tuple[dict[str, pd.DataFrame], str]:
                  f"{int(un.gt_iaaft.sum())}")
         L.append(f"  all runs: shuffled {int(d.gt_shuf.sum())}, phase {int(d.gt_phase.sum())}, IAAFT "
                  f"{int(d.gt_iaaft.sum())} of {len(d)}")
-        reads.append({"design": des, "reading": p4_reading(int(sel.gt_shuf.sum()), int(sel.gt_phase.sum()),
-                                                           int(sel.gt_iaaft.sum())),
+        reads.append({"design": des, "reading": p4_reading(sel),
                       "runs": len(sel), "dh_gt_shuf_q95": int(sel.gt_shuf.sum()),
                       "dh_gt_phase_q95": int(sel.gt_phase.sum()), "dh_gt_iaaft_q95": int(sel.gt_iaaft.sum())})
     T["noah_effects"] = pd.DataFrame(eff)
@@ -345,11 +347,26 @@ def p6_reading(est: dict) -> str:
     return f"not assigned: both effects as found {found}"
 
 
-def p4_reading(n_shuf: int, n_phase: int, n_iaaft: int) -> str:
-    """Over the fixed arms with targets 1 to 50% (plain and matched): beyond the marginal and beyond the spectrum,
-    one at a time, if Delta h exceeds the shuffled and the phase-randomized 95% quantiles in at least as many runs as
-    the IAAFT one."""
+ARM_ORDER = [f"fixed {x:g}%" for x in (1, 10, 50)]
+
+
+def p4_reading(sel: pd.DataFrame) -> str:
+    """The reading over the fixed arms with targets 1 to 50% (plain and matched; `sel` has arm, matched, dh,
+    phase_mean and the gt_* flags). Guard (2026-11-27): only if Delta h exceeds the IAAFT 95% quantile in at least
+    half of these runs is the rule applied: beyond the marginal and beyond the spectrum, one at a time, if Delta h
+    exceeds the shuffled and the phase-randomized 95% quantiles in at least as many runs as the IAAFT one. Otherwise
+    no reading, with the counts and the arm medians of Delta h and of the phase-randomized mean."""
+    n, n_shuf, n_phase, n_iaaft = len(sel), int(sel.gt_shuf.sum()), int(sel.gt_phase.sum()), int(sel.gt_iaaft.sum())
     counts = f"(dh > q95: shuffled {n_shuf}, phase-randomized {n_phase}, IAAFT {n_iaaft})"
+    if n == 0:
+        return "no reading: no runs at the fixed targets 1 to 50%"
+    if 2 * n_iaaft < n:
+        g = sel.groupby(["arm", "matched"])[["dh", "phase_mean"]].median()
+        keys = [(a, m) for a in ARM_ORDER for m in (False, True) if (a, m) in g.index]
+        med = "; ".join(f"{a}{' matched' if m else ''} {g.loc[(a, m), 'dh']:.4f} / {g.loc[(a, m), 'phase_mean']:.4f}"
+                        for a, m in keys)
+        return (f"no reading: the width exceeds the IAAFT quantile in only {n_iaaft} of {n} runs {counts}; "
+                f"medians by arm, dh / phase-randomized mean: {med}")
     if n_shuf >= n_iaaft and n_phase >= n_iaaft:
         return f"width beyond the marginal and beyond the spectrum taken one at a time {counts}"
     keep = [k for k, n in (("the marginal (shuffled)", n_shuf), ("the spectrum (phase-randomized)", n_phase))

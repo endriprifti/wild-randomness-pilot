@@ -1052,8 +1052,13 @@ the optimizer alone brings back ResNet-18's pattern. P7 is reported beside P4 an
 - **Gates.**
   - Phase 0 passed. A Phase 1 run that diverged is reported (`gates.csv`) and left out.
   - Clipping manipulation: the realized clipped fractions must be ordered (unclipped < 1% < 10% < 50%, means over
-    seeds), with the 10% arm clipping at least 3% of steps and the 50% arm 25 to 75%. Otherwise the tests that do
+    seeds), with the 10% arm clipping at least 3% of steps and the 50% arm 25 to 95%. Otherwise the tests that do
     not pass read "uninformative (clipping manipulation missed)".
+    **Amended 2026-11-27, before any P7 run** (Endri): the 50% arm's range was 25 to 75% and is now 25 to 95%
+    (`range_50` in `config.py`); the ordering and the 10% arm's 3% minimum stay. Under SGD, clipping slows the
+    steps, so the realized fraction exceeds the target. ResNet-18 under SGD clipped 68.9% of steps at the 50% target
+    (68.1 to 70.8% over seeds; 62.7% matched), and P7's 110-step smoke clipped 77 to 93%. The old upper bound of 75%
+    had no basis beyond "not every step" and could have turned a null into "uninformative".
   - Width beyond the surrogates (T2): a T2 that passes with a rise counts as width beyond the surrogates only if the
     observed Δh also rises (same model, trend positive, 95% interval above 0). Otherwise it reads "the surrogates'
     baseline moved, not the width".
@@ -1145,9 +1150,15 @@ within Monte Carlo error. The random numbers, the order of the draws and the war
 same series the script gives brief 11's numbers. `reference/surrogate_decomposition_brief11.csv` holds the brief's 242
 runs (P6, P6b, P4 transformer, P4 ResNet-18), and `--compare` checks a rerun against it. The analysis prints the
 brief's tables (Noah effects with seed blocks for P6, P6b and P6c; per-arm medians and counts of Δh above each
-surrogate kind's 95% quantile for P4 and P7). It then applies the procedure's reading rules. On brief 11's runs these
-give: P6 and P6b, the baseline effect sits in the marginal; P4 ResNet-18 and P4 transformer, width beyond the
-marginal and beyond the spectrum taken one at a time. It is exploratory and outside every family. CPU only, nice 19,
+surrogate kind's 95% quantile for P4 and P7). It then applies the procedure's reading rules. For P4 and P7 a guard
+comes first (Endri, 2026-11-27): procedure.md applies its rule to ResNet-18 and describes the transformer by counts
+and medians, so the rule is applied only where Δh exceeds the IAAFT 95% quantile in at least half of the runs it
+considers (the fixed arms at targets 1 to 50%, plain and matched). Otherwise the reading is "no reading: the width
+exceeds the IAAFT quantile in only n of N runs", with the counts and the arm medians of Δh and of the
+phase-randomized mean. No number changes. On brief 11's runs the readings are: P6 and P6b, the baseline effect sits
+in the marginal; P4 ResNet-18, width beyond the marginal and beyond the spectrum taken one at a time (30 of 30 runs
+beyond each kind's quantile); P4 transformer, no reading (5 of 30 runs beyond the IAAFT quantile, against 8 for the
+phase-randomized and 30 for the shuffled one). It is exploratory and outside every family. CPU only, nice 19,
 one thread per worker; units are saved one per run in `results/surrogate_decomposition/units/`, and a rerun computes
 only the missing ones.
 
@@ -1987,7 +1998,9 @@ known parameters:
   another waiter or with everything done, and its `--check` changes nothing.
 - The surrogate decomposition (`tests/test_surrogate_decomposition.py`): paths relative to results/, one run computed
   as the brief computed it (the same numbers), resume, the tables and `--compare`; on brief 11's 242 runs the
-  analysis gives the brief's numbers and the procedure's readings.
+  analysis gives the brief's numbers and the procedure's readings, with the guard that gives the transformer no
+  reading (5 of 30 runs); the guard's cases (exactly half applies the rule, fewer than half gives the counts and the
+  arm medians).
 - `p6_after_queue.py` (`tests/test_p6_after_queue.py`, stand-in processes): the P6 queue starts only after the
   running queue has released its lock, and p1_olmo7b's own lane wait (`gpu_locks.wait_for_lanes`, checking every 10
   ms) gets through only after the P6 queue has ended, while a plain wait-then-start lets it through the gap; a job

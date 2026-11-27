@@ -406,8 +406,12 @@ CONFIG = {
             "analysis": {"scores": {"0.0": -1.5, "0.01": -0.5, "0.1": 0.5, "0.5": 1.5}, "n_perm": 9999,
                          "alpha": 0.05, "power": 0.8,
                          # clipping manipulation gate: realized clipped fractions ordered over the plain arms (means
-                         # over seeds), the 10% arm clips at least min_10 of steps, the 50% arm within range_50
-                         "manipulation": {"min_10": 0.03, "range_50": [0.25, 0.75]}},
+                         # over seeds), the 10% arm clips at least min_10 of steps, the 50% arm within range_50.
+                         # Amended 2026-11-27 (Endri), before any P7 run: range_50 [0.25, 0.75] -> [0.25, 0.95].
+                         # Under SGD clipping slows the steps, so the realized fraction exceeds the target (ResNet-18
+                         # under SGD clipped 68.9% of steps at the 50% target, 68.1-70.8% over seeds, 62.7% matched;
+                         # P7's smoke 77-93%); the old 75% had no basis beyond "not every step"
+                         "manipulation": {"min_10": 0.03, "range_50": [0.25, 0.95]}},
         },
         "smoke": {
             # smoke: P4's smoke transformer (110 steps); a pass needs only a lower test loss than the first loss

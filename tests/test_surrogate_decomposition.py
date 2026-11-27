@@ -155,7 +155,13 @@ def test_the_analysis_of_the_briefs_242_runs():
     assert r["P6"].startswith("the baseline effect sits in the marginal")
     assert r["P6b"].startswith("the baseline effect sits in the marginal")
     assert r["P4R"].startswith("width beyond the marginal and beyond the spectrum")
-    assert r["P4T"].startswith("width beyond the marginal and beyond the spectrum")
+    # the guard (2026-11-27): the transformer's width exceeds the IAAFT quantile in 5 of 30 runs, so no reading
+    assert r["P4T"].startswith("no reading: the width exceeds the IAAFT quantile in only 5 of 30 runs (dh > q95: "
+                               "shuffled 30, phase-randomized 8, IAAFT 5); medians by arm, dh / phase-randomized "
+                               "mean: fixed 1% 0.0299 / 0.0277; fixed 1% matched 0.0291 / 0.0272;")
+    a = T["arms"].set_index(["design", "arm", "matched"])            # the same medians as the table
+    assert round(a.loc[("P4T", "fixed 1%", False), "dh"], 4) == 0.0299
+    assert round(a.loc[("P4T", "fixed 1%", False), "phase"], 4) == 0.0277
 
 
 def test_readings():
@@ -165,9 +171,20 @@ def test_readings():
                           "phase_mean": (0.03, 0.01, 0.05)}).startswith("the baseline effect sits in the spectrum")
     assert sd.p6_reading({"iaaft_file": (0.04, 0.01, 0.07), "shuf_mean": (0.05, 0.01, 0.08),
                           "phase_mean": (0.03, 0.01, 0.05)}).startswith("not assigned")
-    assert sd.p4_reading(30, 30, 30).startswith("width beyond")
-    assert "kept by the spectrum" in sd.p4_reading(30, 2, 5)
-    assert "the marginal (shuffled) and the spectrum" in sd.p4_reading(1, 2, 5)
+    def sel(n_shuf, n_phase, n_iaaft, n=30):
+        k = np.arange(n)
+        arm = np.array(["fixed 1%", "fixed 10%", "fixed 50%"])[k % 3]
+        return pd.DataFrame({"arm": arm, "matched": (k // 3) % 2 == 1, "dh": 0.03 + 0.001 * (k % 3),
+                             "phase_mean": 0.028, "gt_shuf": k < n_shuf, "gt_phase": k < n_phase,
+                             "gt_iaaft": k < n_iaaft})
+    assert sd.p4_reading(sel(30, 30, 30)).startswith("width beyond")
+    assert sd.p4_reading(sel(30, 30, 15)).startswith("width beyond")                 # exactly half: the rule applies
+    assert "kept by the spectrum" in sd.p4_reading(sel(30, 12, 15))
+    assert "the marginal (shuffled) and the spectrum" in sd.p4_reading(sel(14, 12, 15))
+    r = sd.p4_reading(sel(30, 8, 14))                                                # fewer than half: no reading
+    assert r.startswith("no reading: the width exceeds the IAAFT quantile in only 14 of 30 runs")
+    assert "fixed 1% 0.0300 / 0.0280; fixed 1% matched 0.0300 / 0.0280; fixed 10% 0.0310 / 0.0280" in r
+    assert sd.p4_reading(sel(0, 0, 0, n=0)).startswith("no reading: no runs")
 
 
 def test_list_and_queue_job(tmp_path, rng):
