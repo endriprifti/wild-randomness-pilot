@@ -896,6 +896,116 @@ python run_queue.py --jobs-file p6b_queue_small.json --status   # once it runs: 
 touch results/p6b_small/STOP                # lack of credit: stop after the seed that is running
 ```
 
+## P6c: a confirmatory test of Joseph's effect on α_ESD, with a replication of P6b's one link (fixed 2026-11-27, before any P6c run)
+
+Declared after P6b was analysed and fixed in this commit before any P6c run (Endri's proposal and choice of
+2026-11-27). Outside P6's family, Joseph (the data's H) lowered α_ESD at the final checkpoint in both earlier designs,
+on independent seeds: P6 −0.030 (p 0.040) and P6b −0.023 (p 0.008), in P6b also at 10 and 50% of training, with the
+sign the design predicted for Joseph → Noah on K and α (more memory in the data, heavier tails). Three checks after
+the fact (brief 9): it is not training progress (with the loss gap to the oracle as a covariate it stays, −0.021,
+p 0.013), not the power-law fits' cutoff, and it sits mostly in the attention input projections (query_key_value:
+−0.081 in P6b, −0.097 in P6). These were found by looking; P6c tests them on new seeds with the test fixed here. It
+also repeats, on new seeds, P6b's one confirmatory link (Noah → width of the gradient series beyond its IAAFT
+surrogates, opposite to P6's prediction). P6c is reported beside P6 and P6b and never pooled with them; their results
+stay as reported. P6c says nothing about natural text or larger models (as for P6).
+
+- **Design** (`--design p6c_small`): P6b's, unchanged except the seeds and H7.1. The four 14M corners (light / Zipf
+  1.0 × H 0.5 / 0.9), 2^28 tokens in 8,192 steps of 16 × 2,048, stages at steps 82, 819, 4,096 and 8,192, streams
+  built the same way (each seed builds its own), the same training and measurement code (`common/` unchanged).
+- **Seeds 15 to 34** (20 seeds, 80 runs; `P6C_SEEDS`), fixed here. Seeds 1 to 14 are used (P6, the feasibility
+  check, P6b). The seed count is not set by a timing (`--budget-hours` and `--raised` are refused with `p6c_small`).
+- **H7.1 is not measured** (no P6c outcome uses it; about 0.46 of P6b's 0.99 L40S hours per run by the proposal).
+  The condition for leaving it out holds: with H7.1 off, training is bit-identical on smoke runs
+  (`tests/test_p6c.py`, two cells, H7.1 at the 50% stage and at the end in the run with it): the same
+  `train_log.csv`, the same weights before and after every stage's measurements, the same hgrad series, the same final
+  model and AdamW state, and every other sample of every stage byte for byte. H7.1 only reads the model (its own
+  random generators; eval mode and eager attention, which every measurement pass sets and undoes anyway), so leaving
+  it out saves measurement time only. On the GPU P6 asks for deterministic kernels where they exist
+  (`runtime.set_all_seeds`), but a kernel without a deterministic version only warns, so GPU runs are not guaranteed
+  to repeat to the bit even with the same settings; what the smoke test shows is that H7.1 does not enter the
+  training. The fallback the proposal names (16 seeds, 15 to 30, with H7.1) is therefore not used.
+- **Seed by seed, and the stop**, as P6b: `p6c_queue_small.json` has one job per seed (its four corners), each after
+  the one before, into `results/p6c_small/14m_s<k>`, then the analysis into `results/p6c_small/analysis`. The only
+  early stop is a lack of credit, never the results: if the balance would fall below $40, `touch
+  results/p6c_small/STOP`; the running seed finishes, every later seed job starts no run, and the analysis uses the
+  complete seeds (P6b's rule and code; `p6c_seeds.json`).
+- **Time**: about 0.53 L40S hours per run without H7.1 (the proposal: P6b's measured 0.99 less H7.1's share), so
+  about 2.1 hours per seed and 42 hours for 20 seeds (about $29). The first seed job measures it: its END line in
+  `logs/progress.txt` gives its hours (four runs), and `run_queue.py --jobs-file p6c_queue_small.json --status` the
+  hours per job.
+
+**The confirmatory family** (final checkpoint, step 8,192; the 14M corners; fixed here). P6's model for every outcome
+(seed blocks; Noah and Joseph coded ±½ and their product), two-sided Freedman–Lane permutation tests within seed blocks
+(9,999 permutations), **Holm over the four tests at 0.05** (`p6_stats.FAMILY_P6C`):
+
+| test | outcome (column) | term | predicted sign | from |
+|---|---|---|---|---|
+| C1 | α_ESD, median over the 24 matrices, P1's and P6's measure (`alpha_esd`) | J | negative | P6 −0.030, P6b −0.023 |
+| C2 | α_ESD of the attention input projections: median over the six `query_key_value` matrices of the same fits (`alpha_esd_qkv`, from `stats/esd.json`; no new measurement) | J | negative | P6 −0.097, P6b −0.081 |
+| C3 | α_ESD, as C1 (`alpha_esd`) | N×J | positive (the Zipf law weakens Joseph's effect) | P6 +0.026, P6b +0.041 |
+| C4 | width of the gradient series beyond its IAAFT surrogates, main rows, as in P6's family (`grad_main_dh_excess`) | N | negative (P6b's direction) | P6 −0.033, P6b −0.071 |
+
+- **Gates** (manipulation checks at the final checkpoint, permutation p < 0.05): the Joseph gate for C1 to C3 is P6b's
+  positive control, Joseph's effect on the memory of the variant part; the Noah gate for C4 is Noah's effect on K. If
+  a gate misses, its tests read "uninformative" unless they pass Holm; a test that passes keeps its reading, marked
+  "<gate> missed" (as P6b marks a passing test when its positive control missed). Every stream passes its checks
+  (enforced before training); diverged runs are reported and left out (P6b's rule).
+- **Readings**: a pass with the predicted sign reads "confirmed: <effect>" (C1 "Joseph lowers alpha_ESD", C2 "Joseph
+  lowers alpha_ESD of the attention input projections", C3 "the Zipf law weakens Joseph's effect on alpha_ESD", C4
+  "P6b's link replicates (Noah lowers the width of the gradient series beyond its IAAFT surrogates)"); a pass with the
+  other sign "effect opposite to the prediction"; no pass with its gate passed "no effect detected", with the
+  estimate, its 95% interval and the effect detectable with power 0.8 at the first Holm threshold (0.05/4). C4 is
+  reported with its two parts beside it: Noah's effect on the observed width and on the IAAFT mean (`family.csv`,
+  columns `observed_*` and `iaaft_mean_*`).
+- **Outputs** (`--design p6c_small --analyse --from results/p6c_small`): `checkpoints.csv` (P6's columns plus α_ESD
+  by matrix type and by layer, the fits' median cutoff, tail count and KS distance, and C4's two parts),
+  `family.csv` (the four tests, Holm, gates, readings), `manipulation_checks.csv` (P6's), `secondary.csv` (everything
+  P6b's reports; H7.1 is not measured), `exploratory.csv`, `summary.md` (titled P6c: the seeds used, the gates, the
+  verdict) and `p6c_seeds.json`. Its random stream is its own ("p6c analysis").
+
+**Exploratory, listed here, uncorrected** (`exploratory.csv`, one row per test with a `what` column): the simple
+effects of Joseph within each Noah level (C1's and C2's outcomes); C1 to C3 at 1, 10 and 50% of training; α_ESD by
+matrix type (attention input, attention output, MLP input, MLP output) and by layer (N, J, N×J); C1 to C3 with the
+loss gap to the oracle as a covariate; the fits' cutoff, tail count and KS distance (medians over the 24 matrices;
+N, J, N×J); C4's outcome and its two parts (N, J, N×J). The decomposition of C4 into the shuffled and
+phase-randomized surrogate means (brief 9's procedure) is the step-1 decomposition script's, which covers P6c's
+folders; it is not computed here.
+
+Power (the proposal's, from P6b's seed-to-seed spread; 80% power at the first Holm threshold, 0.05/4; the ratios
+between the rows and the power figures below follow from the t quantiles and were checked here):
+
+| seeds | df | C1 | C2 | C3 | C4 | L40S hours |
+|---|---|---|---|---|---|---|
+| 16, with H7.1 (the fallback, not used) | 45 | 0.022 | 0.045 | 0.043 | 0.028 | about 63 |
+| **20, without H7.1** | 57 | **0.019** | **0.040** | **0.039** | **0.025** | **about 42** |
+
+With 20 seeds C1 has power about 0.93 if the true effect is P6b's 0.023 and about 0.84 at 0.020; C2 and C4 have power
+near 1 at the earlier estimates; C3 about 0.85 at P6b's +0.041 and about 0.40 at P6's +0.026.
+
+- **P6's and P6b's analyses are unchanged.** `--design small` and `--design p6b_small` take none of these steps
+  (`analyse_p6c` is P6c's own function). Two functions gained options that only P6c uses, with P6's model as the
+  default (`p6_stats.design` and `term_test`: a subset of the terms, covariates, and the family size for the detectable
+  effect). On the same smoke runs the old code (b1e4472) and this commit give byte-identical `checkpoints.csv`,
+  `family.csv`, `manipulation_checks.csv`, `secondary.csv`, `summary.md` and `p6b_seeds.json` for both designs, and
+  on a synthetic family with every outcome present (notes included) the same family, checks and secondary tests; the
+  smoke jobs of P6's design give the same files under both codes (timings and paths aside).
+
+**Starting P6c after OLMo-7B** (`p6c_after_olmo.py`, new; p6b_after_olmo.py's steps without its P4 condition). The
+waiter takes no lock the others look at; it reads `/proc`, `logs/progress.txt` and `/proc/locks` every 60 s and starts
+`run_queue.py --jobs-file p6c_queue_small.json` (output in `logs/run_queue_p6c.out`) only when no p1_checkpoints.py
+olmo7b process runs, p1_olmo7b's last progress line is END or SKIP (any exit code), and `logs/.run_lane.queue.lock` is
+free (no queue runs). It refuses to start if OLMo-7B is neither running (or waiting) nor ended, if a P6c queue or
+another waiter runs, or if every P6c job is done. `kill -TERM $(cat logs/p6c_after_olmo.pid)` stops the wait (nothing
+started) or, after the start, P6c (saved runs stay). If OLMo-7B has already ended when it starts, it starts P6c at
+once.
+
+```bash
+python p6c_after_olmo.py --check            # read-only: p1_olmo7b, the queue lock, what it would do
+setsid nohup nice -n 10 taskset -c 0-10 python p6c_after_olmo.py > logs/p6c_after_olmo.out 2>&1 < /dev/null &
+python run_queue.py --jobs-file p6c_queue_small.json --status   # once it runs: seeds done, hours per job
+touch results/p6c_small/STOP                # lack of credit: stop after the seed that is running
+```
+
 ## Full run on one L40S: `run_all.sh`
 
 No RTX 5090 was available, so stage 1 runs on a CloudRift L40S (48 GB; the smoke run there passed all 9 jobs,
@@ -1561,7 +1671,7 @@ before the run.
 
 ## Unit tests
 
-`python -m pytest -q` (292 tests, 10-15 min on a 4-core CPU; `-m "not slow"` skips the slowest). Synthetic data with
+`python -m pytest -q` (311 tests, 10-15 min on a 4-core CPU; `-m "not slow"` skips the slowest). Synthetic data with
 known parameters:
 
 - stable density against the Gaussian and Cauchy closed forms and against SciPy; ML fit recovers α ∈ {1.2, 1.5, 1.8},
@@ -1699,6 +1809,18 @@ known parameters:
   are missing; the waiter starts the P6b queue only after P4 has ended, its queue lock is free, OLMo-7B's process has
   gone and its END line is written (also after a failed P4 and an interrupted OLMo-7B), refuses when it would wait for
   ever, next to another waiter or with everything done, and its `--check` changes nothing.
+- P6c (`tests/test_p6c.py`): training is bit-identical with H7.1 off (two smoke cells, H7.1 at 50% and at the end
+  in the run with it: train_log.csv, weights before and after every stage's measurements, hgrad, the final model and
+  AdamW state, every other sample); the design is P6b's with seeds 15-34 and no H7.1 (the same settings otherwise; 80
+  runs seed by seed; P6b's design as it was); the queue file runs the seeds one after another with the stop file and
+  no budget rule, and passes `--dry-run`; `--budget-hours` and `--raised` are refused; the family is four tests with
+  Holm over four, df 57 at 20 seeds and the detectable effect at 0.05/4; the readings "confirmed", "effect opposite
+  to the prediction", "no effect detected" and "uninformative" with each gate (a passing test kept and marked), a
+  missing outcome keeping its place in Holm's four; C4's two parts; the columns from `stats/esd.json` and the
+  gradient series' H_link row; the exploratory list; on smoke runs the analysis end to end (no H7.1 file, P6b's
+  checkpoint columns unchanged); the waiter starts the P6c queue only after OLMo-7B's process has gone, its END line
+  is written and no queue holds the lock, refuses when it would wait for ever, next to another waiter or with
+  everything done, and its `--check` changes nothing.
 - `p6_after_queue.py` (`tests/test_p6_after_queue.py`, stand-in processes): the P6 queue starts only after the
   running queue has released its lock, and p1_olmo7b's own lane wait (`gpu_locks.wait_for_lanes`, checking every 10
   ms) gets through only after the P6 queue has ended, while a plain wait-then-start lets it through the gap; a job

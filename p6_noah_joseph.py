@@ -47,6 +47,10 @@ Commands (in the pilot folder inside the venv):
   python p6_noah_joseph.py --design p6b_small --seeds 4 --stop-file results/p6b_small/STOP \
       --out results/p6b_small/14m_s4    # one P6b job (p6b_queue_small.json runs them seed by seed)
   python p6_noah_joseph.py --design p6b_small --analyse --from results/p6b_small --out results/p6b_small/analysis
+  python p6c_after_olmo.py --check     # P6c (2026-11-27): 20 new seeds without H7.1 after OLMo-7B; its 4-test family
+  python p6_noah_joseph.py --design p6c_small --seeds 15 --stop-file results/p6c_small/STOP \
+      --out results/p6c_small/14m_s15   # one P6c job (p6c_queue_small.json runs them seed by seed)
+  python p6_noah_joseph.py --design p6c_small --analyse --from results/p6c_small --out results/p6c_small/analysis
   setsid nohup nice -n 10 taskset -c 0-10 python p6_after_queue.py > logs/p6_after_queue.out 2>&1 < /dev/null &
                                     # the L40S: the small design through run_queue.py once the running queue ends
   python p6_noah_joseph.py --smoke --out results/p6_smoke   # tiny model and streams on the CPU (minutes)
@@ -127,6 +131,17 @@ BUDGET_HOURS_RAISED = {"small": 90.0}
 P6B_DESIGN = "p6b_small"
 P6B_SEEDS = [4, 5, 7, 8, 9, 10, 11, 12, 13, 14]
 DESIGNS[P6B_DESIGN] = {**copy.deepcopy(DESIGNS["small"]), "seeds": list(P6B_SEEDS)}
+# P6c (Endri, 2026-11-27, after P6b was analysed and before any P6c run; README "P6c"): a confirmatory test of Joseph's
+# effect on alpha_ESD, seen outside the family in P6 and P6b, with a replication of P6b's one link (Noah -> width of the
+# gradient series), reported beside P6 and P6b and never pooled with them. P6b's design (seed by seed into
+# results/p6c_small/, p6c_queue_small.json; no budget rule; the stop file for lack of credit; complete seeds only) with
+# 20 new seeds, 15 to 34 (1 to 14 are used: P6, the feasibility check, P6b), and H7.1 not measured: no P6c outcome
+# uses it, and training is bit-identical without it (tests/test_p6c.py, smoke runs: the same train_log.csv, weights
+# at every stage, hgrad series and optimizer state), so only measurement time is saved. Its family of four tests,
+# gates and readings: p6_stats.FAMILY_P6C.
+P6C_DESIGN = "p6c_small"
+P6C_SEEDS = list(range(15, 35))
+DESIGNS[P6C_DESIGN] = {**copy.deepcopy(DESIGNS["small"]), "seeds": list(P6C_SEEDS), "h71_stages": []}
 
 SMOKE_STREAM = dict(copy.deepcopy(p6_streams.P6), vocab=512, K=4, R=128, block=16, p_bar=1 / 32, seq_len=128,
                     heldout_windows=400)
@@ -136,6 +151,13 @@ SMOKE_MEASURE = dict(MEASURE, surprisal_docs=4, hvp_batch=4)      # smoke hessia
 SMOKE_DESIGN = {"sizes": ["tiny"], "noah": ["light", "zipf1.0"], "joseph": ["H0.5", "H0.9"], "seeds": [1, 2],
                 "h71_stages": [1.0]}
 SMOKE_RAISED_TRAIN = {"tokens": 4 * SMOKE_TRAIN["tokens"], "batch_seqs": 4 * SMOKE_TRAIN["batch_seqs"]}  # same steps
+SMOKE_P6C_DESIGN = {**SMOKE_DESIGN, "h71_stages": []}         # P6c's smoke runs: H7.1 off, as in its design
+
+
+def smoke_design(name: str) -> dict:
+    """The design --smoke runs: P6c's without H7.1, every other design's SMOKE_DESIGN (as before P6c)."""
+    return SMOKE_P6C_DESIGN if name == P6C_DESIGN else SMOKE_DESIGN
+
 
 # GPU -> L40S speed ratio range for these small models (training and JVP passes are memory-bound: logits of 50,304
 # per token). RTX 2050: 112 GB/s, about 12 bf16 TFLOPS with float32 accumulation, 6 float32 TFLOPS; L40S: 864 GB/s,
@@ -1209,6 +1231,71 @@ def analyse(args, run, st: dict) -> None:
     run.note(text)
 
 
+def analyse_p6c(args, run, st: dict) -> None:
+    """P6c's analysis (fixed 2026-11-27, before any P6c run; README "P6c"): P6b's collection and complete-seed rule,
+    P6c's columns (p6_stats.esd_columns and c4_part_columns: no new measurement), the family of four tests with its
+    gates and readings, P6's manipulation checks, P6's secondary tests (H7.1 is not measured) and P6c's exploratory
+    list. Writes checkpoints.csv, family.csv, manipulation_checks.csv, secondary.csv, exploratory.csv, summary.md
+    and p6c_seeds.json. P6's and P6b's analyses (analyse) do not come here."""
+    src = Path(args.from_dir)
+    rows, found = [], []
+    for uj in sorted(src.glob("**/units/*.json")):
+        if uj.name == "settings.json":
+            continue
+        u = json.loads(uj.read_text())
+        rd = uj.parent.parent / "runs" / u["key"]
+        if not rd.exists():
+            continue
+        grad = p6_stats.json_load(p1_tasks.stats_path(rd / "hlink", "hlink_grad"))
+        for row in assemble_run(rd, u):
+            ck = rd / "checkpoints" / f"stage{float(row['stage']):g}"
+            row.update(p6_stats.esd_columns(p6_stats.json_load(p1_tasks.stats_path(ck, "esd"))))
+            row.update(p6_stats.c4_part_columns(grad))
+            rows.append(row)
+        found.append((u, rd))
+    if not rows:
+        raise SystemExit(f"no finished P6 runs below {src}")
+    seeds_used = p6b_seeds(found, SMOKE_P6C_DESIGN if st["smoke"] else DESIGNS[P6C_DESIGN])
+    p1_tasks.atomic_json(run.out_dir / "p6c_seeds.json", seeds_used)
+    rows = [r for r in rows if int(r["seed"]) in seeds_used["complete"]]
+    if not rows:
+        raise SystemExit(f"P6c: no complete seed below {src} ({seeds_used})")
+    df = pd.DataFrame(rows)
+    df.to_csv(run.out_dir / "checkpoints.csv", index=False)
+    rng = np.random.default_rng(np.random.SeedSequence(units_mod.seed_for(config.SEED, "p6c analysis")))
+    corners = st["stream"]["corners"]
+    size0 = "tiny" if st["smoke"] else p6_stats.SIZE_PRIMARY
+    ok = df[df["noah"].isin(corners["noah"]) & df["joseph"].isin(corners["joseph"]) & ~df["diverged"].astype(bool)]
+    prim = ok[(ok["size"] == size0) & np.isclose(ok["stage"], p6_stats.STAGE_PRIMARY)]
+    n_perm = 199 if st["smoke"] else p6_stats.N_PERM
+    fam = p6_stats.family_p6c(prim, rng, n_perm)
+    man = p6_stats.manipulation_checks(prim, rng, n_perm)
+    gates = p6_stats.p6c_gates(man)
+    fam = p6_stats.p6c_readings(fam, gates)
+    fam.to_csv(run.out_dir / "family.csv", index=False)
+    man.to_csv(run.out_dir / "manipulation_checks.csv", index=False)
+    n_sec = 199 if st["smoke"] else 999
+    sec = p6_stats.secondary_tests(df[~df["diverged"].astype(bool)], rng, n_sec)
+    sec.to_csv(run.out_dir / "secondary.csv", index=False)
+    exp = p6_stats.exploratory_p6c(ok, rng, n_sec, size=size0)
+    exp.to_csv(run.out_dir / "exploratory.csv", index=False)
+    text = p6_stats.verdict_p6c(fam, gates)
+    diverged = df.groupby("key")["diverged"].first()
+    header = (f"P6c (fixed 2026-11-27, before any P6c run; reported beside P6 and P6b, never pooled with them). "
+              f"Complete seeds used: {seeds_used['complete']} of {seeds_used['design_seeds']}"
+              + (f"; incomplete, left out: {seeds_used['incomplete']}" if seeds_used["incomplete"] else "")
+              + (f"; not run: {seeds_used['not_run']}" if seeds_used["not_run"] else "")
+              + (f"; outside the design, left out: {seeds_used['outside_the_design']}"
+                 if seeds_used["outside_the_design"] else "")
+              + ". Gates: " + "; ".join(f"{g['label']} ({g['check']}): {'passed' if g['passed'] else 'missed'}"
+                                         + (f" ({g['detail']})" if g["detail"] else "") for g in gates.values())
+              + f".\n\n{len(prim)} runs in the confirmatory set ({size0}, corners, final stage); {len(df)} checkpoint "
+              f"rows in all; diverged runs (left out): {int(diverged.sum())}"
+              + (f" ({', '.join(diverged[diverged.astype(bool)].index)})" if diverged.astype(bool).any() else ""))
+    (run.out_dir / "summary.md").write_text(p6_stats.to_markdown_p6c(fam, man, header, text))
+    run.note(text)
+
+
 # ----------------------------------------------------------------------------- main
 def main(argv=None) -> int:
     ap = runtime.base_parser(__doc__.split("\n")[0])
@@ -1249,12 +1336,15 @@ def main(argv=None) -> int:
     ap.add_argument("--analyse", action="store_true")
     ap.add_argument("--from", dest="from_dir", default=None, help="analyse: folder with the job folders")
     args = ap.parse_args(argv)
-    design = SMOKE_DESIGN if args.smoke else DESIGNS[args.design]
+    design = smoke_design(args.design) if args.smoke else DESIGNS[args.design]
     if args.raised and args.feasibility:
         raise SystemExit("--raised and --feasibility: the check runs the design as it stands")
     if args.design == P6B_DESIGN and (args.budget_hours is not None or args.raised):
         raise SystemExit("P6b: the seed count is fixed and the runs are the small design's; --budget-hours and "
                          "--raised do not apply")
+    if args.design == P6C_DESIGN and (args.budget_hours is not None or args.raised):
+        raise SystemExit("P6c: the seed count is fixed and the runs are P6b's design without H7.1; --budget-hours "
+                         "and --raised do not apply")
     st = settings(args.smoke, design, raised=args.raised)
     if args.plan:
         comp = {s: {k: [v, v] for k, v in prior_component_hours(s, st).items()} for s in SIZES}
@@ -1289,7 +1379,7 @@ def main(argv=None) -> int:
     if args.analyse:
         if not args.from_dir:
             raise SystemExit("--analyse needs --from <folder with the P6 job folders>")
-        analyse(args, run, st)
+        (analyse_p6c if args.design == P6C_DESIGN else analyse)(args, run, st)
         runtime.finish_run(run)
         return 0
     sizes = args.sizes.split(",") if args.sizes else None
